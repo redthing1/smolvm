@@ -521,7 +521,14 @@ EOF
 
 # Generate checksums
 echo "Generating checksums..."
-(cd "$DIST_DIR" && shasum -a 256 smolvm smolvm-bin lib/* > checksums.txt)
+if command -v shasum &> /dev/null; then
+    (cd "$DIST_DIR" && shasum -a 256 smolvm smolvm-bin lib/* > checksums.txt)
+elif command -v sha256sum &> /dev/null; then
+    (cd "$DIST_DIR" && sha256sum smolvm smolvm-bin lib/* > checksums.txt)
+else
+    echo "Error: shasum or sha256sum is required to generate checksums"
+    exit 1
+fi
 
 # Delete existing tarball. This is because when a new release is created, there could be 
 # tarball of the old release left in dist/, and ./install-local.sh may pick up the wrong tarball

@@ -199,6 +199,17 @@ See [`examples/headless-browser/`](examples/headless-browser/) for a working Chr
 Development
 -----------
 
+### Build from source
+
+Source builds need Rust, the matching Linux musl Rust target for the guest
+agent, `git-lfs`, `mkfs.ext4`, basic Unix build tools, and KVM/HVF access to run
+VMs.
+
+```bash
+./scripts/build.sh
+./scripts/run.sh machine run --net --image alpine -- echo hello
+```
+
 See [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
 
 [Apache-2.0](LICENSE) · made by [@binsquare](https://github.com/BinSquare) · [twitter](https://x.com/binsquares) · [github](https://github.com/smol-machines/smolvm)

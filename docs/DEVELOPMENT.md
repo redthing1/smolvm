@@ -3,18 +3,31 @@
 ## Prerequisites
 
 - Rust toolchain
+- Linux musl Rust target for the guest agent (for example: `rustup target add x86_64-unknown-linux-musl`)
 - [git-lfs](https://git-lfs.com) (required for library binaries)
-- smolvm itself (for cross-compiling the agent — builds inside a `rust:alpine` VM)
 - e2fsprogs (for storage template creation; `mkfs.ext4`; on macOS: `brew install e2fsprogs`)
 - LLVM (macOS only, for building libkrun: `brew install llvm`)
-- [cargo-make](https://github.com/sagiegurari/cargo-make): `cargo install cargo-make`
+- [cargo-make](https://github.com/sagiegurari/cargo-make) is optional
 
 ## Quick Start
 
-We use [`cargo-make`](https://github.com/sagiegurari/cargo-make) to orchestrate build tasks:
+For normal local source builds:
 
 ```bash
-# Install cargo-make (one-time)
+./scripts/build.sh
+./scripts/run.sh --version
+./scripts/run.sh machine run --net --image alpine:latest -- echo hello
+./scripts/run.sh machine ls
+```
+
+The wrappers build the local CLI and guest agent rootfs, then run `smolvm` with
+the source-tree `libkrun`/`libkrunfw` and `target/agent-rootfs` paths.
+
+You can also use [`cargo-make`](https://github.com/sagiegurari/cargo-make) if
+you prefer task aliases:
+
+```bash
+# Install cargo-make (optional)
 cargo install cargo-make
 
 # View all available tasks
@@ -41,7 +54,10 @@ DYLD_LIBRARY_PATH="./lib" SMOLVM_AGENT_ROOTFS="./target/agent-rootfs" ./target/r
 
 ```bash
 # Build distribution package
-cargo make dist
+./scripts/build-dist.sh
+
+# Install that local package
+./scripts/install-local.sh
 
 # Build using local libkrun changes from ../libkrun
 ./scripts/build-dist.sh --with-local-libkrun
