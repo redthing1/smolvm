@@ -60,17 +60,17 @@ jobs:
           file lib/*.dylib
 
       - name: Build
-        run: cargo build --release
+        run: cargo build --locked --release
         env:
           LIBRARY_PATH: ${{ github.workspace }}/lib
 
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
         env:
           LIBRARY_PATH: ${{ github.workspace }}/lib
 
       - name: Run unit tests
-        run: cargo test --lib
+        run: cargo test --locked --lib
         env:
           LIBRARY_PATH: ${{ github.workspace }}/lib
           DYLD_LIBRARY_PATH: ${{ github.workspace }}/lib
@@ -161,17 +161,17 @@ jobs:
           sudo ldconfig
 
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --locked --release --target ${{ matrix.target }}
         env:
           LIBRARY_PATH: /usr/local/lib
 
       - name: Clippy
-        run: cargo clippy --all-targets --target ${{ matrix.target }} -- -D warnings
+        run: cargo clippy --locked --all-targets --target ${{ matrix.target }} -- -D warnings
         env:
           LIBRARY_PATH: /usr/local/lib
 
       - name: Run unit tests
-        run: cargo test --lib --target ${{ matrix.target }}
+        run: cargo test --locked --lib --target ${{ matrix.target }}
         env:
           LIBRARY_PATH: /usr/local/lib
           LD_LIBRARY_PATH: /usr/local/lib
@@ -202,13 +202,13 @@ jobs:
           sudo apt-get install -y gcc-aarch64-linux-gnu
 
       - name: Build agent (x86_64)
-        run: cargo build --release --target x86_64-unknown-linux-musl -p smolvm-agent
+        run: cargo build --locked --release --target x86_64-unknown-linux-musl -p smolvm-agent
         working-directory: .
 
       - name: Build agent (aarch64)
         run: |
           export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc
-          cargo build --release --target aarch64-unknown-linux-musl -p smolvm-agent
+          cargo build --locked --release --target aarch64-unknown-linux-musl -p smolvm-agent
         working-directory: .
 
       - name: Verify static binaries

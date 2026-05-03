@@ -48,7 +48,7 @@ echo "Building smolvm-napi..."
 
 (
     cd "$REPO_ROOT"
-    LIBKRUN_BUNDLE="$LIBKRUN_BUNDLE" cargo build --release -p smolvm-napi
+    LIBKRUN_BUNDLE="$LIBKRUN_BUNDLE" cargo build --locked --release -p smolvm-napi
 )
 
 if [[ -f "$REPO_ROOT/sdks/node/package.json" ]]; then

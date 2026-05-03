@@ -40,7 +40,7 @@ info() { echo -e "${YELLOW}INFO${NC}: $1"; }
 # Build if needed.
 if [ ! -f "$SMOLVM" ]; then
     info "Building smolvm..."
-    cargo build --manifest-path "$REPO_DIR/Cargo.toml"
+    cargo build --locked --manifest-path "$REPO_DIR/Cargo.toml"
 fi
 
 # Find or create a test .smolmachine file.

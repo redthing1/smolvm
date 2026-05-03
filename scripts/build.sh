@@ -84,7 +84,7 @@ LIB_DIR="$(host_lib_dir)"
 ensure_runtime_libs "$LIB_DIR"
 
 echo "building smolvm..."
-LIBKRUN_BUNDLE="$LIB_DIR" cargo build --release --bin smolvm
+LIBKRUN_BUNDLE="$LIB_DIR" cargo build --locked --release --bin smolvm
 
 echo "building agent rootfs..."
 ./scripts/build-agent-rootfs.sh

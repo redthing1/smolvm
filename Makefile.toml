@@ -32,7 +32,7 @@ if [ -z "${LIBKRUN_BUNDLE:-}" ]; then
   fi
 fi
 
-cargo build --release
+cargo build --locked --release
 if [ "$(uname -s)" = "Darwin" ]; then
   codesign --force --sign - --entitlements smolvm.entitlements ./target/release/smolvm
   echo "✓ Codesigned ./target/release/smolvm"
@@ -54,7 +54,7 @@ script = [
 '''
 if [ ! -f ./target/release/smolvm ]; then
   echo "Binary not found, building..."
-  cargo build --release
+  cargo build --locked --release
 fi
 if [ "$(uname -s)" = "Darwin" ]; then
   codesign --force --sign - --entitlements smolvm.entitlements ./target/release/smolvm 2>/dev/null || true
@@ -83,7 +83,7 @@ exec ./target/release/smolvm "${ARGS[@]}"
 description = "Build release binary"
 category = "Build"
 command = "cargo"
-args = ["build", "--release"]
+args = ["build", "--locked", "--release"]
 
 [tasks.build-agent]
 description = "Build agent for Linux (size-optimized)"
@@ -92,9 +92,9 @@ script_runner = "bash"
 script = [
 '''
 if [ "$(uname -s)" = "Linux" ]; then
-  cargo build --profile release-small -p smolvm-agent --target x86_64-unknown-linux-musl
+  cargo build --locked --profile release-small -p smolvm-agent --target x86_64-unknown-linux-musl
 else
-  docker run --rm -v "$(pwd):/work" -w /work rust:alpine sh -c 'apk add musl-dev && cargo build --profile release-small -p smolvm-agent'
+  docker run --rm -v "$(pwd):/work" -w /work rust:alpine sh -c 'apk add musl-dev && cargo build --locked --profile release-small -p smolvm-agent'
 fi
 '''
 ]
@@ -245,7 +245,7 @@ script = [
 description = "Run unit tests (no VM required)"
 category = "Test"
 command = "cargo"
-args = ["test", "--lib"]
+args = ["test", "--locked", "--lib"]
 
 # =============================================================================
 # Install Tasks
@@ -272,7 +272,7 @@ script_runner = "bash"
 script = [
 '''
 cargo fmt --all -- --check
-cargo clippy --all-targets -- -D warnings
+cargo clippy --locked --all-targets -- -D warnings
 '''
 ]
 
@@ -283,6 +283,6 @@ script_runner = "bash"
 script = [
 '''
 cargo fmt --all
-cargo clippy --all-targets --fix --allow-dirty
+cargo clippy --locked --all-targets --fix --allow-dirty
 '''
 ]

@@ -234,7 +234,7 @@ fi
 
 # Build release binaries
 echo "Building release binaries..."
-LIBKRUN_BUNDLE="$WORK_LIB_DIR" cargo build --release --bin smolvm
+LIBKRUN_BUNDLE="$WORK_LIB_DIR" cargo build --locked --release --bin smolvm
 
 # Build smolvm-agent for Linux (size-optimized)
 if [[ "$SKIP_AGENT_BUILD" == "1" ]]; then
@@ -249,7 +249,7 @@ else
         # On Linux, build natively with musl for static linking
         if command -v cargo &> /dev/null; then
             if rustup target list --installed 2>/dev/null | grep -q musl; then
-                cargo build --profile release-small -p smolvm-agent --target x86_64-unknown-linux-musl
+                cargo build --locked --profile release-small -p smolvm-agent --target x86_64-unknown-linux-musl
                 # Copy to the non-target-triple path that the rest of the script expects
                 mkdir -p ./target/release-small
                 cp "./target/x86_64-unknown-linux-musl/release-small/smolvm-agent" \
@@ -263,7 +263,7 @@ else
         if command -v smolvm &> /dev/null; then
             echo "Building via smolvm (rust:alpine)..."
             smolvm machine run --net --mem 2048 -v "$PROJECT_ROOT:/work" --image rust:alpine \
-                -- sh -c ". /usr/local/cargo/env && apk add musl-dev && cd /work && cargo build --profile release-small -p smolvm-agent"
+                -- sh -c ". /usr/local/cargo/env && apk add musl-dev && cd /work && cargo build --locked --profile release-small -p smolvm-agent"
         else
             echo "Error: Cannot build smolvm-agent."
             echo "  Install smolvm or the musl target (rustup target add x86_64-unknown-linux-musl)"

@@ -222,7 +222,7 @@ else
     if [[ "$(uname -s)" == "Linux" ]] && command -v cargo &> /dev/null; then
         if rustup target list --installed 2>/dev/null | grep -q "$RUST_TARGET"; then
             echo "Building natively with musl target..."
-            cargo build --profile "$PROFILE" -p smolvm-agent --target "$RUST_TARGET" \
+            cargo build --locked --profile "$PROFILE" -p smolvm-agent --target "$RUST_TARGET" \
                 --manifest-path "$PROJECT_ROOT/Cargo.toml"
             AGENT_BINARY="$PROJECT_ROOT/target/$RUST_TARGET/$PROFILE/smolvm-agent"
         fi
@@ -233,7 +233,7 @@ else
         if command -v smolvm &> /dev/null; then
             echo "Building via smolvm (rust:alpine)..."
             smolvm machine run --net --mem 2048 -v "$PROJECT_ROOT:/work" --image rust:alpine \
-                -- sh -c ". /usr/local/cargo/env && apk add musl-dev && cd /work && cargo build --profile $PROFILE -p smolvm-agent"
+                -- sh -c ". /usr/local/cargo/env && apk add musl-dev && cd /work && cargo build --locked --profile $PROFILE -p smolvm-agent"
             AGENT_BINARY="$PROJECT_ROOT/target/$PROFILE/smolvm-agent"
         else
             echo "Error: Cannot build smolvm-agent"

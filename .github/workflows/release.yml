@@ -66,7 +66,7 @@ jobs:
       - name: Build agent
         run: |
           ${{ matrix.linker_env }} \
-          cargo build --profile release-small -p smolvm-agent --target ${{ matrix.target }}
+          cargo build --locked --profile release-small -p smolvm-agent --target ${{ matrix.target }}
 
       - name: Verify static binary
         run: file target/${{ matrix.target }}/release-small/smolvm-agent

@@ -33,12 +33,12 @@ if [ ! -f "$SMOLVM_BIN" ] && command -v smolvm &> /dev/null; then
     SMOLVM_BIN="smolvm"
 elif [ ! -f "$SMOLVM_BIN" ]; then
     echo "Error: smolvm is required to cross-compile the agent"
-    echo "Build with: cargo build --release"
+    echo "Build with: cargo build --locked --release"
     exit 1
 fi
 
 "$SMOLVM_BIN" machine run --net --mem 2048 -v "$PROJECT_DIR:/work" --image rust:alpine \
-    -- sh -c ". /usr/local/cargo/env && apk add musl-dev && cd /work && ${CLEAN_CMD}cargo build --release -p smolvm-agent"
+    -- sh -c ". /usr/local/cargo/env && apk add musl-dev && cd /work && ${CLEAN_CMD}cargo build --locked --release -p smolvm-agent"
 
 # Check if rootfs directory exists
 if [[ ! -d "$ROOTFS_DIR/usr/local/bin" ]]; then
