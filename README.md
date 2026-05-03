@@ -2,12 +2,6 @@
   <img src="assets/logo.png" alt="smol machines" width="80">
 </p>
 
-<p align="center">
-  <a href="https://discord.gg/E5r8rEWY9J"><img src="https://img.shields.io/badge/Discord-Join-5865F2?logo=discord&logoColor=white" alt="Discord"></a>
-  <a href="https://github.com/smol-machines/smolvm/releases"><img src="https://img.shields.io/github/v/release/smol-machines/smolvm?label=Release" alt="Release"></a>
-  <a href="https://github.com/smol-machines/smolvm/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-Apache_2.0-blue.svg" alt="License"></a>
-</p>
-
 smolvm
 ======
 
@@ -21,14 +15,17 @@ Install
 -------
 
 ```bash
-# install (macOS + Linux)
-curl -sSL https://smolmachines.com/install.sh | bash
+# build and run from the checkout
+./scripts/build.sh
+./scripts/run.sh machine run --net --image alpine -- echo hello
 
-# for coding agents — install + discover all commands
-curl -sSL https://smolmachines.com/install.sh | bash && smolvm --help
+# install this checkout's build locally
+./scripts/install.sh
+smolvm machine run --net --image alpine -- echo hello
 ```
 
-Or download from [GitHub Releases](https://github.com/smol-machines/smolvm/releases).
+The installer builds the current checkout and installs the resulting runtime
+under `~/.smolvm`, with a `smolvm` symlink in `~/.local/bin`.
 
 Quick Start
 -----------
@@ -110,7 +107,7 @@ smolvm machine create myvm -s Smolfile
 smolvm machine start --name myvm
 ```
 
-More examples: [python](https://github.com/smol-machines/smolvm/tree/main/examples/python-app) · [node](https://github.com/smol-machines/smolvm/tree/main/examples/node-app) · [doom](https://github.com/smol-machines/smolvm/tree/main/examples/doom-web)
+More examples: [python](examples/python-app) · [node](examples/node-app) · [doom](examples/doom-web)
 
 How It Works
 ------------
@@ -164,7 +161,7 @@ ANGLE (Intel, Vulkan 1.4 (Virtio-GPU Venus (Intel(R) UHD Graphics ...)), venus)
 
 ### Host requirements
 
-**macOS** — virglrenderer and MoltenVK are bundled in the smolvm distribution. No extra installs needed.
+**macOS** — virglrenderer and MoltenVK are included in the local install. No extra installs needed.
 
 **Linux** — virglrenderer and a host Vulkan driver must be installed from the system package manager:
 
@@ -212,4 +209,4 @@ VMs.
 
 See [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
 
-[Apache-2.0](LICENSE) · made by [@binsquare](https://github.com/BinSquare) · [twitter](https://x.com/binsquares) · [github](https://github.com/smol-machines/smolvm)
+[Apache-2.0](LICENSE)

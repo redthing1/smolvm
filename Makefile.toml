@@ -1,272 +1,129 @@
-# cargo-make configuration for smolvm
-# https://github.com/sagiegurari/cargo-make
-#
-# Usage:
-#   cargo make dev              # Build and codesign (macOS)
-#   cargo make smolvm <args>    # Run with env vars configured for local resources
-#   cargo make dist             # Build distribution package
-#   cargo make test             # Run all tests
-#   cargo make lint             # Clippy + fmt checks
+# cargo-make shortcuts for the repository scripts.
 
 [config]
 min_version = "0.37.0"
 default_to_workspace = false
 skip_core_tasks = true
 
-# =============================================================================
-# Development Tasks
-# =============================================================================
-
 [tasks.dev]
-description = "Build and codesign dev binary (macOS auto-signs)"
-category = "Development"
-
-script_runner = "bash"
-script = [
-'''
-if [ -z "${LIBKRUN_BUNDLE:-}" ]; then
-  if [ "$(uname -s)" = "Linux" ]; then
-    export LIBKRUN_BUNDLE="${CARGO_MAKE_WORKING_DIRECTORY}/lib/linux-$(uname -m)"
-  else
-    export LIBKRUN_BUNDLE="${CARGO_MAKE_WORKING_DIRECTORY}/lib"
-  fi
-fi
-
-cargo build --locked --release
-if [ "$(uname -s)" = "Darwin" ]; then
-  codesign --force --sign - --entitlements smolvm.entitlements ./target/release/smolvm
-  echo "✓ Codesigned ./target/release/smolvm"
-else
-  echo "✓ Linux: no codesigning needed"
-fi
-echo ""
-echo "Binary ready! Run it with:"
-echo "  cargo make smolvm --version"
-echo "  cargo make smolvm sandbox run --net alpine:latest -- echo hello"
-'''
-]
-
-[tasks.ensure-binary-signed]
-description = "Ensure binary is built and signed (macOS)"
+description = "Build the local CLI and agent rootfs"
 category = "Development"
 script_runner = "bash"
-script = [
-'''
-if [ ! -f ./target/release/smolvm ]; then
-  echo "Binary not found, building..."
-  cargo build --locked --release
-fi
-if [ "$(uname -s)" = "Darwin" ]; then
-  codesign --force --sign - --entitlements smolvm.entitlements ./target/release/smolvm 2>/dev/null || true
-fi
-'''
-]
+script = ["./scripts/build.sh"]
 
 [tasks.smolvm]
-description = "Run smolvm with environment variables set up"
+description = "Run the local smolvm build"
 category = "Development"
-dependencies = ["ensure-binary-signed"]
-env = { DYLD_LIBRARY_PATH = "${CARGO_MAKE_WORKING_DIRECTORY}/lib", SMOLVM_AGENT_ROOTFS = "${CARGO_MAKE_WORKING_DIRECTORY}/target/agent-rootfs" }
 script_runner = "bash"
 script = [
 '''
 IFS=';' read -ra ARGS <<< "${CARGO_MAKE_TASK_ARGS}"
-exec ./target/release/smolvm "${ARGS[@]}"
+exec ./scripts/run.sh "${ARGS[@]}"
 '''
 ]
 
-# =============================================================================
-# Build Tasks
-# =============================================================================
-
-[tasks.build]
-description = "Build release binary"
-category = "Build"
-command = "cargo"
-args = ["build", "--locked", "--release"]
-
-[tasks.build-agent]
-description = "Build agent for Linux (size-optimized)"
-category = "Build"
+[tasks.install]
+description = "Build from source and install locally"
+category = "Install"
 script_runner = "bash"
-script = [
-'''
-if [ "$(uname -s)" = "Linux" ]; then
-  cargo build --locked --profile release-small -p smolvm-agent --target x86_64-unknown-linux-musl
-else
-  docker run --rm -v "$(pwd):/work" -w /work rust:alpine sh -c 'apk add musl-dev && cargo build --locked --profile release-small -p smolvm-agent'
-fi
-'''
-]
+script = ["./scripts/install.sh"]
 
-# =============================================================================
-# libkrun Tasks
-# =============================================================================
+[tasks.uninstall]
+description = "Remove the local install"
+category = "Install"
+script_runner = "bash"
+script = ["./scripts/install.sh --uninstall"]
+
+[tasks.agent-rootfs]
+description = "Build the agent rootfs"
+category = "Agent"
+script_runner = "bash"
+script = ["./scripts/build-agent-rootfs.sh"]
+
+[tasks.agent-rebuild]
+description = "Rebuild the agent and update rootfs artifacts"
+category = "Agent"
+script_runner = "bash"
+script = ["./scripts/rebuild-agent.sh"]
 
 [tasks.build-libkrunfw]
-description = "Build libkrunfw guest kernel and update lib/ (slow: downloads and compiles Linux 6.x)"
+description = "Build libkrunfw and update lib/"
 category = "Build"
 script_runner = "bash"
 script = [
 '''
-set -e
+set -euo pipefail
 ARCH=$(uname -m)
 FULL_VERSION=$(grep '^FULL_VERSION' libkrunfw/Makefile | cut -d= -f2 | tr -d ' ')
 KERNEL_SRC=$(grep '^KERNEL_VERSION' libkrunfw/Makefile | cut -d= -f2 | tr -d ' ')
 
-# If the kernel source tree already exists, update its .config and force
-# kernel.c to regenerate — otherwise make skips both steps.
 if [ -d "libkrunfw/${KERNEL_SRC}" ]; then
-  cp libkrunfw/config-libkrunfw_x86_64 libkrunfw/${KERNEL_SRC}/.config
-  make -C libkrunfw/${KERNEL_SRC} olddefconfig
+  cp libkrunfw/config-libkrunfw_x86_64 "libkrunfw/${KERNEL_SRC}/.config"
+  make -C "libkrunfw/${KERNEL_SRC}" olddefconfig
   rm -f libkrunfw/kernel.c
 fi
 
 make -C libkrunfw
-mkdir -p lib/linux-${ARCH}
-cp libkrunfw/libkrunfw.so.${FULL_VERSION} lib/linux-${ARCH}/libkrunfw.so.${FULL_VERSION}
-cd lib/linux-${ARCH}
-ln -sf libkrunfw.so.${FULL_VERSION} libkrunfw.so.5
+mkdir -p "lib/linux-${ARCH}"
+cp "libkrunfw/libkrunfw.so.${FULL_VERSION}" "lib/linux-${ARCH}/libkrunfw.so.${FULL_VERSION}"
+cd "lib/linux-${ARCH}"
+ln -sf "libkrunfw.so.${FULL_VERSION}" libkrunfw.so.5
 ln -sf libkrunfw.so.5 libkrunfw.so
-echo "✓ libkrunfw ${FULL_VERSION} built and installed to lib/linux-${ARCH}/"
 '''
 ]
 
 [tasks.build-libkrun]
-description = "Build libkrun with BLK and GPU support and copy into lib/ (run build-libkrunfw first if kernel config changed)"
+description = "Build libkrun and update lib/"
 category = "Build"
 script_runner = "bash"
 script = [
 '''
-set -e
+set -euo pipefail
 ARCH=$(uname -m)
 make -C libkrun BLK=1 GPU=1
-mkdir -p lib/linux-${ARCH}
-cp libkrun/target/release/libkrun.so lib/linux-${ARCH}/libkrun.so
-echo "✓ libkrun built and copied to lib/linux-${ARCH}/libkrun.so"
+mkdir -p "lib/linux-${ARCH}"
+cp libkrun/target/release/libkrun.so "lib/linux-${ARCH}/libkrun.so"
 '''
 ]
-
-# =============================================================================
-# Distribution Tasks
-# =============================================================================
-
-[tasks.dist]
-description = "Build distribution package"
-category = "Distribution"
-script_runner = "bash"
-script = [
-'''
-./scripts/build-dist.sh "$@"
-'''
-]
-
-# =============================================================================
-# Agent Tasks
-# =============================================================================
-
-[tasks.agent-rootfs]
-description = "Build agent rootfs"
-category = "Agent"
-script_runner = "bash"
-script = [
-'''
-./scripts/build-agent-rootfs.sh
-'''
-]
-
-[tasks.agent-rebuild]
-description = "Rebuild agent and update rootfs"
-category = "Agent"
-dependencies = ["build-agent", "agent-rootfs"]
-script_runner = "bash"
-script = [
-'''
-./scripts/rebuild-agent.sh
-'''
-]
-
-# =============================================================================
-# Test Tasks
-# =============================================================================
 
 [tasks.test]
-description = "Run all tests, including cargo tests"
+description = "Run all tests"
 category = "Test"
-dependencies = ["test-lib"]
 script_runner = "bash"
-script = [
-'''
-./tests/run_all.sh
-'''
-]
+script = ["./tests/run_all.sh"]
 
 [tasks.test-cli]
-description = "Run CLI tests only"
+description = "Run CLI tests"
 category = "Test"
 script_runner = "bash"
-script = [
-'''
-./tests/run_all.sh cli
-'''
-]
+script = ["./tests/run_all.sh cli"]
 
 [tasks.test-sandbox]
-description = "Run sandbox tests only"
+description = "Run sandbox tests"
 category = "Test"
 script_runner = "bash"
-script = [
-'''
-./tests/run_all.sh sandbox
-'''
-]
+script = ["./tests/run_all.sh sandbox"]
 
 [tasks.test-microvm]
-description = "Run microVM tests only"
+description = "Run microVM tests"
 category = "Test"
 script_runner = "bash"
-script = [
-'''
-./tests/run_all.sh microvm
-'''
-]
+script = ["./tests/run_all.sh microvm"]
 
 [tasks.test-pack]
-description = "Run pack tests only"
+description = "Run pack tests"
 category = "Test"
 script_runner = "bash"
-script = [
-'''
-./tests/run_all.sh pack
-'''
-]
+script = ["./tests/run_all.sh pack"]
 
 [tasks.test-lib]
-description = "Run unit tests (no VM required)"
+description = "Run unit tests"
 category = "Test"
 command = "cargo"
 args = ["test", "--locked", "--lib"]
 
-# =============================================================================
-# Install Tasks
-# =============================================================================
-
-[tasks.install]
-description = "Install locally from dist package"
-category = "Install"
-script_runner = "bash"
-script = [
-'''
-./scripts/install-local.sh
-'''
-]
-
-# =============================================================================
-# Code Quality Tasks
-# =============================================================================
-
 [tasks.lint]
-description = "Run clippy and fmt checks"
+description = "Run format and clippy checks"
 category = "Quality"
 script_runner = "bash"
 script = [
@@ -277,7 +134,7 @@ cargo clippy --locked --all-targets -- -D warnings
 ]
 
 [tasks.fix-lints]
-description = "Auto-fix linting issues"
+description = "Apply format and clippy fixes"
 category = "Quality"
 script_runner = "bash"
 script = [

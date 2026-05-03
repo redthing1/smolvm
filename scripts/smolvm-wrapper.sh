@@ -30,14 +30,14 @@ SMOLVM_LIB="$SCRIPT_DIR/lib"
 # Check if binary exists
 if [[ ! -x "$SMOLVM_BIN" ]]; then
     echo "Error: smolvm binary not found at $SMOLVM_BIN" >&2
-    echo "Make sure you extracted the full distribution." >&2
+    echo "Make sure you installed from source with ./scripts/install.sh." >&2
     exit 1
 fi
 
 # Check if libraries exist
 if [[ ! -d "$SMOLVM_LIB" ]]; then
     echo "Error: library directory not found at $SMOLVM_LIB" >&2
-    echo "Make sure you extracted the full distribution." >&2
+    echo "Make sure you installed from source with ./scripts/install.sh." >&2
     exit 1
 fi
 

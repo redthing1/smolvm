@@ -1085,7 +1085,7 @@ where
         // Build crane command
         let mut crane_cmd = Command::new("crane");
         crane_cmd.arg("blob");
-        crane_cmd.arg(format!("{}@{}", image, layer_digest));
+        crane_cmd.arg(format!("{}@{}", blob_image_reference(image), layer_digest));
         if let Some(p) = oci_platform {
             crane_cmd.arg("--platform").arg(p);
         }
@@ -2642,6 +2642,10 @@ fn docker_config_registry_key(registry: &str) -> &str {
     }
 }
 
+fn blob_image_reference(image: &str) -> &str {
+    image.split_once('@').map_or(image, |(name, _)| name)
+}
+
 /// Simple base64 encoding for auth string.
 fn base64_encode(input: &str) -> String {
     const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -2935,6 +2939,16 @@ mod tests {
             sanitize_image_name("ghcr.io/owner/repo@sha256:abc123"),
             "ghcr.io_owner_repo_sha256_abc123"
         );
+    }
+
+    #[test]
+    fn test_blob_image_reference_strips_manifest_digest() {
+        assert_eq!(blob_image_reference("alpine@sha256:abc123"), "alpine");
+        assert_eq!(
+            blob_image_reference("alpine:3.19@sha256:abc123"),
+            "alpine:3.19"
+        );
+        assert_eq!(blob_image_reference("alpine:3.19"), "alpine:3.19");
     }
 
     #[test]

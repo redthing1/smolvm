@@ -52,7 +52,7 @@ fi
 
 if [ -z "$TEST_SMOLMACHINE" ] || [ ! -f "$TEST_SMOLMACHINE" ]; then
     info "No .smolmachine file found. Skipping integration test."
-    info "To run: smolvm pack create --image alpine:latest -o /tmp/test-alpine"
+    info "To run: smolvm pack create --image alpine -o /tmp/test-alpine"
     info "Then:   $0 /tmp/test-alpine.smolmachine"
     exit 0
 fi

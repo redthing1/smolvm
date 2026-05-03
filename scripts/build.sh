@@ -15,6 +15,14 @@ have() {
   command -v "$1" >/dev/null 2>&1
 }
 
+host_rust_target() {
+  case "$(uname -m)" in
+    arm64|aarch64) echo "aarch64-unknown-linux-musl" ;;
+    amd64|x86_64) echo "x86_64-unknown-linux-musl" ;;
+    *) die "unsupported host architecture: $(uname -m)" ;;
+  esac
+}
+
 is_lfs_pointer() {
   local path="$1"
   if [[ -f "$path" ]] && head -n 1 "$path" 2>/dev/null | grep -aq '^version https://git-lfs.github.com/spec/v1$'; then
@@ -74,8 +82,9 @@ require_cmd tar
 
 if [[ "$(uname -s)" == "Linux" ]]; then
   require_cmd mkfs.ext4
-  if ! have rustup || ! rustup target list --installed | grep -q '^x86_64-unknown-linux-musl$'; then
-    die "Rust musl target not installed; run: rustup target add x86_64-unknown-linux-musl"
+  RUST_TARGET="$(host_rust_target)"
+  if ! have rustup || ! rustup target list --installed | grep -q "^${RUST_TARGET}$"; then
+    die "Rust musl target not installed; run: rustup target add ${RUST_TARGET}"
   fi
   [[ -e /dev/kvm ]] || echo "warning: /dev/kvm not found; build can finish, but VMs will not run" >&2
 fi

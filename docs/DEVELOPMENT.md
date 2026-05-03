@@ -16,7 +16,7 @@ For normal local source builds:
 ```bash
 ./scripts/build.sh
 ./scripts/run.sh --version
-./scripts/run.sh machine run --net --image alpine:latest -- echo hello
+./scripts/run.sh machine run --net --image alpine -- echo hello
 ./scripts/run.sh machine ls
 ```
 
@@ -24,7 +24,7 @@ The wrappers build the local CLI and guest agent rootfs, then run `smolvm` with
 the source-tree `libkrun`/`libkrunfw` and `target/agent-rootfs` paths.
 
 You can also use [`cargo-make`](https://github.com/sagiegurari/cargo-make) if
-you prefer task aliases:
+you prefer task aliases. The tasks delegate to the repository scripts:
 
 ```bash
 # Install cargo-make (optional)
@@ -33,35 +33,36 @@ cargo install cargo-make
 # View all available tasks
 cargo make --list-all-steps
 
-# Build and codesign (macOS) - binary ready at ./target/release/smolvm
+# Build local artifacts
 cargo make dev
 
-# Run smolvm with environment variables set up automatically
+# Run the local build
 cargo make smolvm --version
-cargo make smolvm machine run --net --image alpine:latest -- echo hello
+cargo make smolvm machine run --net --image alpine -- echo hello
 cargo make smolvm machine ls
-
-# Or run the binary directly with environment variables:
-DYLD_LIBRARY_PATH="./lib" SMOLVM_AGENT_ROOTFS="./target/agent-rootfs" ./target/release/smolvm <command>
 ```
 
 **How it works:**
-- `cargo make dev` builds + codesigns (macOS only), binary ready at `./target/release/smolvm`
-- `cargo make smolvm <args>` runs smolvm with `DYLD_LIBRARY_PATH` and `SMOLVM_AGENT_ROOTFS` set up
+- `cargo make dev` runs `./scripts/build.sh`
+- `cargo make smolvm <args>` runs `./scripts/run.sh <args>`
 - On macOS, binary is automatically signed with hypervisor entitlements
 
-## Building Distribution Packages
+## Installing From Source
 
 ```bash
-# Build distribution package
-./scripts/build-dist.sh
+# Build the current checkout and install it locally
+./scripts/install.sh
 
-# Install that local package
-./scripts/install-local.sh
+# Install existing build artifacts without rebuilding
+./scripts/install.sh --no-build
 
-# Build using local libkrun changes from ../libkrun
-./scripts/build-dist.sh --with-local-libkrun
+# Remove the local install
+./scripts/install.sh --uninstall
 ```
+
+The installer writes runtime files to `~/.smolvm`, installs the agent rootfs
+under the platform data directory, and links `smolvm` into `~/.local/bin` by
+default. Use `--prefix` and `--bin-dir` to override those paths.
 
 ## Running Tests
 
@@ -72,7 +73,7 @@ cargo make test
 # Run specific test suites
 cargo make test-cli        # CLI tests only
 cargo make test-sandbox    # Sandbox tests only
-cargo make test-machine    # MicroVM tests only
+cargo make test-microvm    # MicroVM tests only
 cargo make test-pack       # Pack tests only
 cargo make test-lib        # Unit tests (no VM required)
 ```
@@ -84,15 +85,18 @@ The agent rootfs resolution order is:
 2. `./target/agent-rootfs` (local development)
 3. Platform data directory (`~/.local/share/smolvm/` on Linux, `~/Library/Application Support/smolvm/` on macOS)
 
-```bash
-# Build agent for Linux (size-optimized)
-cargo make build-agent
+The rootfs builder uses pinned inputs and verifies downloaded asset checksums
+before extraction. Direct Alpine package constraints are versioned in
+`scripts/build-agent-rootfs.sh`; update them intentionally when changing the
+guest rootfs contents. Each built rootfs includes
+`/etc/smolvm-rootfs-build.txt` with the input versions and checksums used.
 
+```bash
 # Build agent rootfs
-cargo make agent-rootfs
+./scripts/build-agent-rootfs.sh
 
 # Rebuild agent and update rootfs
-cargo make agent-rebuild
+./scripts/rebuild-agent.sh
 ```
 
 ## Code Quality
@@ -108,16 +112,15 @@ cargo make fix-lints
 ## Other Tasks
 
 ```bash
-# Install locally from dist package
+# Install locally from source
 cargo make install
 ```
 
-The `cargo make dist` task wraps `scripts/build-dist.sh`. Other scripts:
+Other scripts:
 
 ```bash
-./scripts/build-dist.sh
 ./scripts/build-agent-rootfs.sh
-./scripts/install-local.sh
+./scripts/install.sh
 ```
 
 ## Troubleshooting

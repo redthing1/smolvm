@@ -41,11 +41,6 @@ fi
 echo "Using embedded lib bundle: $LIBKRUN_BUNDLE"
 echo "Building smolvm-napi..."
 
-# TODO(release): add CI/release automation for publishing the public package
-#   and internal platform packages.
-# TODO(multi-language): add the python/go/c embedded SDK workspaces that reuse
-#   the same bundled lib staging model.
-
 (
     cd "$REPO_ROOT"
     LIBKRUN_BUNDLE="$LIBKRUN_BUNDLE" cargo build --locked --release -p smolvm-napi
