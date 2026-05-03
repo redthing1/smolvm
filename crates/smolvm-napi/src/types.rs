@@ -64,6 +64,10 @@ pub struct VmResourcesConfig {
     pub storage_gib: Option<f64>,
     /// Overlay disk size in GiB (default: 10).
     pub overlay_gib: Option<f64>,
+    /// Enable GPU acceleration (default: false).
+    pub gpu: Option<bool>,
+    /// GPU shared-memory region size in MiB (default: smolvm default).
+    pub gpu_vram_mib: Option<u32>,
 }
 
 /// Options for executing a command.
@@ -167,6 +171,8 @@ impl VmResourcesConfig {
             network_backend: None,
             storage_gib: self.storage_gib.map(|g| g as u64),
             overlay_gib: self.overlay_gib.map(|g| g as u64),
+            gpu: self.gpu.unwrap_or(false),
+            gpu_vram_mib: self.gpu_vram_mib,
             allowed_cidrs: None,
         }
     }
@@ -237,5 +243,28 @@ pub fn parse_exec_options(
             (env, opts.workdir, timeout)
         }
         None => (Vec::new(), None, None),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vm_resources_config_maps_gpu_fields() {
+        let config = VmResourcesConfig {
+            cpus: None,
+            memory_mib: None,
+            network: None,
+            storage_gib: None,
+            overlay_gib: None,
+            gpu: Some(true),
+            gpu_vram_mib: Some(2048),
+        };
+
+        let resources = config.to_vm_resources();
+
+        assert!(resources.gpu);
+        assert_eq!(resources.gpu_vram_mib, Some(2048));
     }
 }
