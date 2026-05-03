@@ -775,13 +775,13 @@ impl RunCmd {
 }
 
 // ============================================================================
-// Exec Command (Persistent) - Direct VM Execution
+// Exec Command (Persistent)
 // ============================================================================
 
-/// Execute a command directly in the VM's Alpine rootfs.
+/// Execute a command in a persistent machine.
 ///
-/// This runs commands at the VM level, not inside a container. Useful for
-/// debugging, inspecting the VM environment, or running VM-level operations.
+/// Image-backed machines run through the image rootfs. Bare machines run
+/// directly in the VM rootfs.
 ///
 /// Examples:
 ///   smolvm machine exec -- uname -a
@@ -822,6 +822,23 @@ pub struct ExecCmd {
     pub stream: bool,
 }
 
+fn print_exec_event(event: smolvm::agent::ExecEvent) {
+    match event {
+        smolvm::agent::ExecEvent::Stdout(data) => {
+            let _ = std::io::stdout().write_all(&data);
+            let _ = std::io::stdout().flush();
+        }
+        smolvm::agent::ExecEvent::Stderr(data) => {
+            let _ = std::io::stderr().write_all(&data);
+            let _ = std::io::stderr().flush();
+        }
+        smolvm::agent::ExecEvent::Exit(_) => {}
+        smolvm::agent::ExecEvent::Error(msg) => {
+            eprintln!("error: {}", msg);
+        }
+    }
+}
+
 impl ExecCmd {
     pub fn run(self) -> smolvm::Result<()> {
         let (manager, mut client) = vm_common::ensure_running_and_connect(&self.name)?;
@@ -845,37 +862,6 @@ impl ExecCmd {
             .clone()
             .or_else(|| record.as_ref().and_then(|r| r.workdir.clone()));
         let record_image = record.as_ref().and_then(|r| r.image.clone());
-
-        // Streaming mode — print output as it arrives, no buffering
-        if self.stream {
-            let events = client.vm_exec_streaming(
-                self.command.clone(),
-                env.clone(),
-                workdir.clone(),
-                self.timeout,
-            )?;
-            let mut exit_code = 0;
-            for event in events {
-                match event {
-                    smolvm::agent::ExecEvent::Stdout(data) => {
-                        let _ = std::io::stdout().write_all(&data);
-                        let _ = std::io::stdout().flush();
-                    }
-                    smolvm::agent::ExecEvent::Stderr(data) => {
-                        let _ = std::io::stderr().write_all(&data);
-                        let _ = std::io::stderr().flush();
-                    }
-                    smolvm::agent::ExecEvent::Exit(code) => {
-                        exit_code = code;
-                    }
-                    smolvm::agent::ExecEvent::Error(msg) => {
-                        eprintln!("error: {}", msg);
-                        exit_code = 1;
-                    }
-                }
-            }
-            std::process::exit(exit_code);
-        }
 
         // Check if this machine has an image — if so, exec inside the image's
         // rootfs via client.run_interactive()/run_non_interactive() instead of bare vm_exec().
@@ -909,6 +895,21 @@ impl ExecCmd {
             // Use machine name as persistent overlay ID so filesystem changes
             // (e.g. package installs) survive across exec sessions.
             let machine_name = name.clone();
+            if self.stream {
+                let config = smolvm::agent::RunConfig::new(image, self.command.clone())
+                    .with_env(defaults.env.clone())
+                    .with_workdir(defaults.workdir.clone())
+                    .with_user(defaults.user.clone())
+                    .with_mounts(mount_bindings.clone())
+                    .with_timeout(self.timeout)
+                    .with_persistent_overlay(Some(machine_name.clone()));
+                let exit_code = client.run_streaming_with(config, |event| {
+                    print_exec_event(event);
+                    Ok(())
+                })?;
+                std::process::exit(exit_code);
+            }
+
             if self.interactive || self.tty {
                 let config = smolvm::agent::RunConfig::new(image, self.command.clone())
                     .with_env(defaults.env.clone())
@@ -933,6 +934,20 @@ impl ExecCmd {
             vm_common::print_output_and_exit(&manager, exit_code, &stdout, &stderr);
         } else {
             // Bare VM: exec directly in the VM rootfs.
+            if self.stream {
+                let exit_code = client.vm_exec_streaming_with(
+                    self.command.clone(),
+                    env.clone(),
+                    workdir.clone(),
+                    self.timeout,
+                    |event| {
+                        print_exec_event(event);
+                        Ok(())
+                    },
+                )?;
+                std::process::exit(exit_code);
+            }
+
             if self.interactive || self.tty {
                 let exit_code = client.vm_exec_interactive(
                     self.command.clone(),

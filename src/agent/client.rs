@@ -1113,6 +1113,31 @@ impl AgentClient {
         )
     }
 
+    /// Run a command in an image's rootfs and handle output as it arrives.
+    pub fn run_streaming_with<F>(&mut self, config: RunConfig, on_event: F) -> Result<i32>
+    where
+        F: FnMut(ExecEvent) -> Result<()>,
+    {
+        let _timeout_guard = self.set_exec_timeout(config.timeout)?;
+        let timeout_ms = config.timeout.map(|t| t.as_millis() as u64);
+
+        self.send(&AgentRequest::Run {
+            image: config.image,
+            command: config.command,
+            env: config.env,
+            workdir: config.workdir,
+            user: config.user,
+            mounts: config.mounts,
+            timeout_ms,
+            interactive: true,
+            tty: false,
+            persistent_overlay_id: config.persistent_overlay_id,
+            background: false,
+        })?;
+
+        self.forward_exec_events("run streaming", on_event)
+    }
+
     /// Send stdin data to a running interactive command.
     pub fn send_stdin(&mut self, data: &[u8]) -> Result<()> {
         self.send(&AgentRequest::Stdin {
@@ -1414,11 +1439,28 @@ impl AgentClient {
         workdir: Option<String>,
         timeout: Option<Duration>,
     ) -> Result<Vec<ExecEvent>> {
-        let timeout_ms = timeout.map(|t| t.as_millis() as u64);
+        let mut events = Vec::new();
+        self.vm_exec_streaming_with(command, env, workdir, timeout, |event| {
+            events.push(event);
+            Ok(())
+        })?;
+        Ok(events)
+    }
 
-        self.stream
-            .set_read_timeout(None)
-            .map_err(|e| Error::agent("set read timeout", e.to_string()))?;
+    /// Execute a VM-rootfs command and handle output as it arrives.
+    pub fn vm_exec_streaming_with<F>(
+        &mut self,
+        command: Vec<String>,
+        env: Vec<(String, String)>,
+        workdir: Option<String>,
+        timeout: Option<Duration>,
+        on_event: F,
+    ) -> Result<i32>
+    where
+        F: FnMut(ExecEvent) -> Result<()>,
+    {
+        let _timeout_guard = self.set_exec_timeout(timeout)?;
+        let timeout_ms = timeout.map(|t| t.as_millis() as u64);
 
         self.send(&AgentRequest::VmExec {
             command,
@@ -1430,42 +1472,45 @@ impl AgentClient {
             background: false,
         })?;
 
+        self.forward_exec_events("streaming exec", on_event)
+    }
+
+    fn forward_exec_events<F>(&mut self, op: &str, mut on_event: F) -> Result<i32>
+    where
+        F: FnMut(ExecEvent) -> Result<()>,
+    {
         // Wait for Started
         match self.receive()? {
             AgentResponse::Started => {}
             AgentResponse::Error { message, .. } => {
-                return Err(Error::agent("streaming exec", message));
+                return Err(Error::agent(op, message));
             }
-            _ => return Err(Error::agent("streaming exec", "expected Started")),
+            _ => return Err(Error::agent(op, "expected Started")),
         }
-
-        let mut events = Vec::new();
 
         loop {
             match self.receive() {
                 Ok(AgentResponse::Stdout { data }) => {
-                    events.push(ExecEvent::Stdout(data));
+                    on_event(ExecEvent::Stdout(data))?;
                 }
                 Ok(AgentResponse::Stderr { data }) => {
-                    events.push(ExecEvent::Stderr(data));
+                    on_event(ExecEvent::Stderr(data))?;
                 }
                 Ok(AgentResponse::Exited { exit_code }) => {
-                    events.push(ExecEvent::Exit(exit_code));
-                    break;
+                    on_event(ExecEvent::Exit(exit_code))?;
+                    return Ok(exit_code);
                 }
                 Ok(AgentResponse::Error { message, .. }) => {
-                    events.push(ExecEvent::Error(message));
-                    break;
+                    on_event(ExecEvent::Error(message))?;
+                    return Ok(1);
                 }
                 Ok(_) => {}
                 Err(e) => {
-                    events.push(ExecEvent::Error(e.to_string()));
-                    break;
+                    on_event(ExecEvent::Error(e.to_string()))?;
+                    return Ok(1);
                 }
             }
         }
-
-        Ok(events)
     }
 
     /// Low-level send without waiting for response (public).
@@ -1906,5 +1951,123 @@ mod run_background_tests {
             err
         );
         server.join().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod streaming_run_tests {
+    use super::*;
+    use smolvm_protocol::{encode_message, AgentRequest, AgentResponse, Envelope};
+    use std::io::{Read, Write};
+    use std::thread;
+
+    fn read_request(stream: &mut UnixStream) -> AgentRequest {
+        let mut len_buf = [0u8; 4];
+        stream.read_exact(&mut len_buf).unwrap();
+        let len = u32::from_be_bytes(len_buf) as usize;
+
+        let mut payload = vec![0u8; len];
+        stream.read_exact(&mut payload).unwrap();
+
+        let envelope: Envelope<AgentRequest> =
+            serde_json::from_slice(&payload).expect("valid Envelope<AgentRequest>");
+        envelope.body
+    }
+
+    fn write_response(stream: &mut UnixStream, response: AgentResponse) {
+        let encoded = encode_message(&response).expect("encode response");
+        stream.write_all(&encoded).expect("write response");
+    }
+
+    #[test]
+    fn run_streaming_sends_run_request_for_image_rootfs() {
+        let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+
+        let server = thread::spawn(move || {
+            match read_request(&mut server_stream) {
+                AgentRequest::Run {
+                    image,
+                    command,
+                    env,
+                    workdir,
+                    user,
+                    mounts,
+                    timeout_ms,
+                    interactive,
+                    tty,
+                    persistent_overlay_id,
+                    background,
+                } => {
+                    assert_eq!(image, "python:3.12-alpine");
+                    assert_eq!(command, vec!["python3", "-c", "print('ok')"]);
+                    assert_eq!(env, vec![("A".to_string(), "B".to_string())]);
+                    assert_eq!(workdir.as_deref(), Some("/app"));
+                    assert_eq!(user.as_deref(), Some("1000:1000"));
+                    assert_eq!(
+                        mounts,
+                        vec![("smolvm0".to_string(), "/app".to_string(), false)]
+                    );
+                    assert_eq!(timeout_ms, Some(1500));
+                    assert!(
+                        interactive,
+                        "streaming output uses the interactive protocol"
+                    );
+                    assert!(!tty, "streaming exec does not allocate a TTY");
+                    assert_eq!(persistent_overlay_id.as_deref(), Some("myvm"));
+                    assert!(!background);
+                }
+                other => panic!("expected image streaming to send Run, got {:?}", other),
+            }
+
+            write_response(&mut server_stream, AgentResponse::Started);
+            write_response(
+                &mut server_stream,
+                AgentResponse::Stdout {
+                    data: b"ok\n".to_vec(),
+                },
+            );
+            write_response(
+                &mut server_stream,
+                AgentResponse::Stderr {
+                    data: b"warn\n".to_vec(),
+                },
+            );
+            write_response(&mut server_stream, AgentResponse::Exited { exit_code: 0 });
+        });
+
+        let mut client = AgentClient::from_stream(client_stream);
+        let config = RunConfig::new(
+            "python:3.12-alpine",
+            vec![
+                "python3".to_string(),
+                "-c".to_string(),
+                "print('ok')".to_string(),
+            ],
+        )
+        .with_env(vec![("A".to_string(), "B".to_string())])
+        .with_workdir(Some("/app".to_string()))
+        .with_user(Some("1000:1000".to_string()))
+        .with_mounts(vec![("smolvm0".to_string(), "/app".to_string(), false)])
+        .with_timeout(Some(Duration::from_millis(1500)))
+        .with_persistent_overlay(Some("myvm".to_string()));
+
+        let mut events = Vec::new();
+        let exit_code = client
+            .run_streaming_with(config, |event| {
+                events.push(event);
+                Ok(())
+            })
+            .expect("run_streaming_with should collect streamed events");
+
+        assert_eq!(exit_code, 0);
+        assert!(matches!(
+            events.as_slice(),
+            [
+                ExecEvent::Stdout(stdout),
+                ExecEvent::Stderr(stderr),
+                ExecEvent::Exit(0)
+            ] if stdout == b"ok\n" && stderr == b"warn\n"
+        ));
+        server.join().expect("server thread joined cleanly");
     }
 }

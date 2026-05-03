@@ -5,12 +5,15 @@ use axum::{
     response::sse::{Event, KeepAlive, Sse},
     Json,
 };
+use futures_util::StreamExt;
 use std::convert::Infallible;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio_stream::wrappers::ReceiverStream;
 
+use crate::agent::ExecEvent;
 use crate::api::error::{classify_ensure_running_error, ApiError};
 use crate::api::state::{ensure_running_and_persist, with_machine_client_traced, ApiState};
 use crate::api::types::{
@@ -112,34 +115,49 @@ pub async fn exec_stream(
     let workdir = req.workdir.clone();
     let timeout = req.timeout_secs.map(Duration::from_secs);
 
-    // Run streaming exec via the machine client (vsock is synchronous)
-    let start = std::time::Instant::now();
-    let events = with_machine_client_traced(&entry, tid, move |c| {
-        c.vm_exec_streaming(command, env, workdir, timeout)
-    })
-    .await?;
-    metrics::histogram!("smolvm_exec_seconds").record(start.elapsed().as_secs_f64());
+    let (tx, rx) = tokio::sync::mpsc::channel::<ExecEvent>(32);
+    let entry_for_task = entry.clone();
 
-    // Convert events to SSE stream
-    let stream = futures_util::stream::iter(events.into_iter().map(|event| {
-        let sse_event = match event {
-            crate::agent::ExecEvent::Stdout(data) => Event::default()
-                .event("stdout")
-                .data(String::from_utf8_lossy(&data)),
-            crate::agent::ExecEvent::Stderr(data) => Event::default()
-                .event("stderr")
-                .data(String::from_utf8_lossy(&data)),
-            crate::agent::ExecEvent::Exit(code) => Event::default()
-                .event("exit")
-                .data(format!("{{\"exitCode\":{}}}", code)),
-            crate::agent::ExecEvent::Error(msg) => Event::default()
-                .event("error")
-                .data(format!("{{\"message\":\"{}\"}}", msg)),
-        };
-        Ok(sse_event)
-    }));
+    tokio::task::spawn_blocking(move || {
+        let start = std::time::Instant::now();
+        let result = (|| {
+            let entry = entry_for_task.lock();
+            let mut client = entry.manager.connect()?;
+            if let Some(tid) = tid {
+                client.set_trace_id(tid);
+            }
+            client.vm_exec_streaming_with(command, env, workdir, timeout, |event| {
+                tx.blocking_send(event)
+                    .map_err(|_| crate::Error::agent("streaming exec", "client disconnected"))
+            })
+        })();
+        metrics::histogram!("smolvm_exec_seconds").record(start.elapsed().as_secs_f64());
+
+        if let Err(e) = result {
+            let _ = tx.blocking_send(ExecEvent::Error(e.to_string()));
+        }
+    });
+
+    let stream = ReceiverStream::new(rx).map(|event| Ok(exec_event_to_sse(event)));
 
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+}
+
+fn exec_event_to_sse(event: ExecEvent) -> Event {
+    match event {
+        ExecEvent::Stdout(data) => Event::default()
+            .event("stdout")
+            .data(String::from_utf8_lossy(&data)),
+        ExecEvent::Stderr(data) => Event::default()
+            .event("stderr")
+            .data(String::from_utf8_lossy(&data)),
+        ExecEvent::Exit(code) => Event::default()
+            .event("exit")
+            .data(serde_json::json!({ "exitCode": code }).to_string()),
+        ExecEvent::Error(msg) => Event::default()
+            .event("error")
+            .data(serde_json::json!({ "message": msg }).to_string()),
+    }
 }
 
 /// Run a command in an image.
