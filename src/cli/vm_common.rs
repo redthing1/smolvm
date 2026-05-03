@@ -404,8 +404,8 @@ pub struct CreateVmParams {
     pub gpu: bool,
     /// GPU VRAM size in MiB (None = default). Ignored when gpu is false.
     pub gpu_vram_mib: Option<u32>,
-    /// Hostnames for DNS filtering (from --allow-host / [network].allow_hosts).
-    pub dns_filter_hosts: Option<Vec<String>>,
+    /// Hostnames from --allow-host / [network].allow_hosts for egress refresh.
+    pub egress_policy_hosts: Option<Vec<String>>,
     /// Absolute path to .smolmachine sidecar (for machines created with --from).
     pub source_smolmachine: Option<String>,
 }
@@ -481,7 +481,7 @@ pub fn create_vm(params: CreateVmParams) -> smolvm::Result<()> {
     record.health_retries = params.health_retries;
     record.health_startup_grace_secs = params.health_startup_grace_secs;
     record.ssh_agent = params.ssh_agent;
-    record.dns_filter_hosts = params.dns_filter_hosts.clone();
+    record.egress_policy_hosts = params.egress_policy_hosts.clone();
     record.source_smolmachine = params.source_smolmachine.clone();
 
     // Store in config (persisted immediately to database)
@@ -558,13 +558,13 @@ pub fn start_vm_named(name: &str) -> smolvm::Result<()> {
     // current DNS, then merge with any explicit allow_cidrs stored in the DB.
     //
     // IMPORTANT: always initialize allowed_cidrs (even to an empty Vec) when
-    // dns_filter_hosts is set. This ensures launcher.rs always calls
+    // hostname policy hosts are set. This ensures launcher.rs always calls
     // krun_set_egress_policy, even when every hostname fails to resolve.
     // Without this, a DNS outage at start time causes the VM to boot with no
     // egress restriction at all (fail-open). With it, the policy starts as
     // deny-all and launcher.rs's ensure_dns_in_cidrs adds 1.1.1.1/32 as the
     // minimum (fail-closed: only DNS reachable until resolution succeeds).
-    if let Some(ref hosts) = record.dns_filter_hosts {
+    if let Some(ref hosts) = record.egress_policy_hosts {
         if !hosts.is_empty() {
             let existing = resources.allowed_cidrs.get_or_insert_with(Vec::new);
             for host in hosts {
@@ -617,7 +617,7 @@ pub fn start_vm_named(name: &str) -> smolvm::Result<()> {
 
     let mut features = smolvm::agent::LaunchFeatures {
         ssh_agent_socket,
-        dns_filter_hosts: record.dns_filter_hosts.clone(),
+        egress_policy_hosts: record.egress_policy_hosts.clone(),
         packed_layers_dir: None,
         extra_disks: Vec::new(),
     };
@@ -786,7 +786,7 @@ pub fn persist_default_running(
                 r.entrypoint = o.entrypoint.clone();
                 r.cmd = o.cmd.clone();
                 r.ssh_agent = o.ssh_agent;
-                r.dns_filter_hosts = o.dns_filter_hosts.clone();
+                r.egress_policy_hosts = o.egress_policy_hosts.clone();
             }
         })
         .is_none()
@@ -813,7 +813,7 @@ pub struct DefaultVmOverrides {
     pub entrypoint: Vec<String>,
     pub cmd: Vec<String>,
     pub ssh_agent: bool,
-    pub dns_filter_hosts: Option<Vec<String>>,
+    pub egress_policy_hosts: Option<Vec<String>>,
 }
 
 /// Check if any running VM already binds to the same host ports.

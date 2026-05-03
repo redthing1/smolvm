@@ -666,10 +666,11 @@ test_machine_egress_allow_host_port_rejected() {
     [[ $exit_code -ne 0 ]] && [[ "$output" == *"port suffixes are not supported"* ]]
 }
 
-# DNS filtering end-to-end: when --allow-host is used with a new agent that
-# has the DNS proxy, queries for non-allowed domains should fail.
-test_machine_dns_filter_blocks_resolution() {
-    local vm_name="dns-filter-test-$$"
+# Hostname allowlists are enforced at the egress-policy layer, not by filtering
+# DNS answers. DNS remains available so normal resolvers keep working, but
+# connecting to a non-allowed destination should fail.
+test_machine_allow_host_allows_dns_but_blocks_egress() {
+    local vm_name="allow-host-egress-test-$$"
 
     $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
     $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
@@ -678,20 +679,19 @@ test_machine_dns_filter_blocks_resolution() {
     $SMOLVM machine create "$vm_name" --allow-host one.one.one.one 2>&1 || return 1
     $SMOLVM machine start --name "$vm_name" 2>&1 || { $SMOLVM machine delete "$vm_name" -f 2>/dev/null; return 1; }
 
-    # Resolving an allowed domain should work
-    local exit_code_allowed=0
-    $SMOLVM machine exec --name "$vm_name" -- nslookup one.one.one.one 1.1.1.1 2>&1 || exit_code_allowed=$?
+    # Resolving a non-allowed name should still work via the default resolver.
+    local exit_code_resolve=0
+    $SMOLVM machine exec --name "$vm_name" -- nslookup example.com 2>&1 || exit_code_resolve=$?
 
-    # Resolving a non-allowed domain should fail (DNS proxy returns NXDOMAIN,
-    # or if agent doesn't have DNS proxy, TSI still blocks the IP)
-    local exit_code_blocked=0
-    $SMOLVM machine exec --name "$vm_name" -- nslookup attacker-test.example 2>&1 || exit_code_blocked=$?
+    # But opening a connection to that non-allowed destination should fail.
+    local exit_code_connect=0
+    $SMOLVM machine exec --name "$vm_name" -- wget -q -T 5 -O - http://example.com 2>&1 || exit_code_connect=$?
 
     $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
     $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
     ensure_data_dir_deleted "$vm_name"
 
-    [[ $exit_code_allowed -eq 0 ]] && [[ $exit_code_blocked -ne 0 ]]
+    [[ $exit_code_resolve -eq 0 ]] && [[ $exit_code_connect -ne 0 ]]
 }
 
 test_machine_allow_host_persists_across_restart() {
@@ -853,10 +853,10 @@ EOF
 # Stability smoke test for the egress refresh thread.
 #
 # Why we can't do a full e2e regression test for the refresh thread:
-#   `dns_filter_hosts` in VmRecord drives BOTH start-time re-resolution (in
-#   start_vm_named) AND the refresh thread. If dns_filter_hosts is set, start
+#   `egress_policy_hosts` in VmRecord drives BOTH start-time re-resolution (in
+#   start_vm_named) AND the refresh thread. If egress_policy_hosts is set, start
 #   time already resolves both 1.1.1.1 and 1.0.0.1 into the policy — leaving
-#   nothing for the refresh thread to newly add. If dns_filter_hosts is null,
+#   nothing for the refresh thread to newly add. If egress_policy_hosts is null,
 #   the refresh thread also has no hosts to resolve. There is no external
 #   interface to inject stale state into the running muxer's Arc.
 #
@@ -1581,8 +1581,8 @@ run_test "Egress: allow-host permits matching traffic" test_machine_egress_allow
 run_test "Egress: allow-host blocks non-matching traffic" test_machine_egress_allow_host_blocked || true
 run_test "Egress: invalid hostname rejected at create" test_machine_egress_allow_host_invalid_rejected || true
 run_test "Egress: host:port syntax rejected" test_machine_egress_allow_host_port_rejected || true
-run_test "DNS filter: blocks resolution of non-allowed domains" test_machine_dns_filter_blocks_resolution || true
-run_test "DNS filter: allow-host persists across restart" test_machine_allow_host_persists_across_restart || true
+run_test "Egress: allow-host allows DNS but blocks connections" test_machine_allow_host_allows_dns_but_blocks_egress || true
+run_test "Egress: allow-host persists across restart" test_machine_allow_host_persists_across_restart || true
 run_test "Smolfile: allow_hosts basic egress permitted/blocked" test_smolfile_allow_hosts_egress_basic || true
 run_test "Smolfile: allow_hosts re-resolves stale CIDRs on start (issue #124)" test_smolfile_allow_hosts_stale_cidr_regression || true
 run_test "Egress refresh thread: stability across refresh cycles" test_egress_refresh_thread_stability || true

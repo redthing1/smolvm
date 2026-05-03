@@ -213,7 +213,7 @@ fn run_bridge() -> io::Result<()> {
 fn relay_to_host(local: std::os::unix::net::UnixStream) -> io::Result<()> {
     use std::os::unix::io::AsRawFd;
 
-    let mut vsock_conn = vsock_connect(ports::SSH_AGENT)?;
+    let mut vsock_conn = crate::vsock::connect(ports::SSH_AGENT)?;
     let mut local = local;
 
     let local_fd = local.as_raw_fd();
@@ -277,96 +277,3 @@ fn relay_to_host(_local: std::os::unix::net::UnixStream) -> io::Result<()> {
 // ============================================================================
 // vsock client connect (guest → host)
 // ============================================================================
-
-/// Wrapper around a vsock file descriptor that implements Read + Write.
-#[cfg(target_os = "linux")]
-struct VsockStream {
-    fd: std::os::unix::io::OwnedFd,
-}
-
-#[cfg(target_os = "linux")]
-impl std::os::unix::io::AsRawFd for VsockStream {
-    fn as_raw_fd(&self) -> std::os::unix::io::RawFd {
-        self.fd.as_raw_fd()
-    }
-}
-
-#[cfg(target_os = "linux")]
-impl io::Read for VsockStream {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        use std::os::fd::AsRawFd;
-        unsafe {
-            let n = libc::read(self.fd.as_raw_fd(), buf.as_mut_ptr() as *mut _, buf.len());
-            if n < 0 {
-                Err(io::Error::last_os_error())
-            } else {
-                Ok(n as usize)
-            }
-        }
-    }
-}
-
-#[cfg(target_os = "linux")]
-impl io::Write for VsockStream {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        use std::os::fd::AsRawFd;
-        unsafe {
-            let n = libc::write(self.fd.as_raw_fd(), buf.as_ptr() as *const _, buf.len());
-            if n < 0 {
-                Err(io::Error::last_os_error())
-            } else {
-                Ok(n as usize)
-            }
-        }
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-/// Connect to a vsock port on the host (CID 2).
-#[cfg(target_os = "linux")]
-fn vsock_connect(port: u32) -> io::Result<VsockStream> {
-    use std::mem;
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-
-    const AF_VSOCK: libc::c_int = 40;
-    const HOST_CID: u32 = 2;
-
-    #[repr(C)]
-    struct sockaddr_vm {
-        svm_family: libc::sa_family_t,
-        svm_reserved1: u16,
-        svm_port: u32,
-        svm_cid: u32,
-        svm_zero: [u8; 4],
-    }
-
-    unsafe {
-        let fd = libc::socket(AF_VSOCK, libc::SOCK_STREAM, 0);
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let fd = OwnedFd::from_raw_fd(fd);
-
-        let addr = sockaddr_vm {
-            svm_family: AF_VSOCK as u16,
-            svm_reserved1: 0,
-            svm_port: port,
-            svm_cid: HOST_CID,
-            svm_zero: [0; 4],
-        };
-
-        if libc::connect(
-            fd.as_raw_fd(),
-            &addr as *const sockaddr_vm as *const libc::sockaddr,
-            mem::size_of::<sockaddr_vm>() as libc::socklen_t,
-        ) < 0
-        {
-            return Err(io::Error::last_os_error());
-        }
-
-        Ok(VsockStream { fd })
-    }
-}

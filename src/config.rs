@@ -445,10 +445,9 @@ pub struct VmRecord {
     #[serde(default)]
     pub ssh_agent: bool,
 
-    /// Hostnames for DNS filtering. When set, the guest DNS proxy filters
-    /// queries against this allowlist.
+    /// Hostnames from `--allow-host`, re-resolved to refresh the egress policy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub dns_filter_hosts: Option<Vec<String>>,
+    pub egress_policy_hosts: Option<Vec<String>>,
 
     /// True for `machine run` VMs. Auto-deleted on exit or cleanup sweep.
     #[serde(default)]
@@ -510,7 +509,7 @@ impl VmRecord {
             health_retries: None,
             health_startup_grace_secs: None,
             ssh_agent: false,
-            dns_filter_hosts: None,
+            egress_policy_hosts: None,
             ephemeral: false,
             source_smolmachine: None,
         }
@@ -557,7 +556,7 @@ impl VmRecord {
             health_retries: None,
             health_startup_grace_secs: None,
             ssh_agent: false,
-            dns_filter_hosts: None,
+            egress_policy_hosts: None,
             ephemeral: false,
             source_smolmachine: None,
         }

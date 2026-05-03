@@ -72,7 +72,6 @@ fn boot_log(level: &str, msg: &str) {
         }
     }
 }
-mod dns_proxy;
 mod network;
 mod oci;
 mod paths;
@@ -264,12 +263,6 @@ fn main() {
         ssh_agent::start();
         // Set env so all child processes (git, ssh, etc.) find the agent socket
         std::env::set_var("SSH_AUTH_SOCK", ssh_agent::GUEST_SSH_AUTH_SOCK);
-    }
-
-    // Start DNS filtering proxy if enabled by host (when --allow-host is used)
-    if dns_proxy::is_enabled() {
-        info!("DNS filtering enabled, starting guest proxy");
-        dns_proxy::start();
     }
 
     // If the host started us with --gpu, sanity-check that the guest

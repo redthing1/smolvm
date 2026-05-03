@@ -27,7 +27,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 /// Resolve `--allow-cidr`, `--allow-host`, and `--outbound-localhost-only` into a CIDR list,
-/// net flag, and the original hostname list (for DNS filtering).
+/// net flag, and the original hostname list for egress-policy refresh.
 ///
 /// Resolution failure for `--allow-host` is a hard error — a typo or DNS outage
 /// should not silently weaken the security policy.
@@ -51,14 +51,14 @@ fn resolve_egress_flags(
     }
     let net = net || !allow_cidr.is_empty();
 
-    // Preserve original hostnames for DNS filtering (None if no --allow-host was used)
-    let dns_filter_hosts = if allow_host.is_empty() {
+    // Preserve original hostnames so long-running VMs can refresh their egress policy.
+    let egress_policy_hosts = if allow_host.is_empty() {
         None
     } else {
         Some(allow_host)
     };
 
-    Ok((allow_cidr, net, dns_filter_hosts))
+    Ok((allow_cidr, net, egress_policy_hosts))
 }
 
 /// Manage machines
@@ -301,7 +301,7 @@ impl RunCmd {
     pub fn run(self) -> smolvm::Result<()> {
         use smolvm::Error;
 
-        let (cli_allow_cidrs, net, cli_dns_filter_hosts) = resolve_egress_flags(
+        let (cli_allow_cidrs, net, cli_egress_policy_hosts) = resolve_egress_flags(
             self.allow_cidr,
             self.allow_host,
             self.outbound_localhost_only,
@@ -329,14 +329,15 @@ impl RunCmd {
         )?;
 
         let mut params = params;
-        params.dns_filter_hosts = match (params.dns_filter_hosts.take(), cli_dns_filter_hosts) {
-            (Some(mut from_smolfile), Some(mut from_cli)) => {
-                from_smolfile.append(&mut from_cli);
-                Some(from_smolfile)
-            }
-            (Some(from_smolfile), None) => Some(from_smolfile),
-            (None, some) => some,
-        };
+        params.egress_policy_hosts =
+            match (params.egress_policy_hosts.take(), cli_egress_policy_hosts) {
+                (Some(mut from_smolfile), Some(mut from_cli)) => {
+                    from_smolfile.append(&mut from_cli);
+                    Some(from_smolfile)
+                }
+                (Some(from_smolfile), None) => Some(from_smolfile),
+                (None, some) => some,
+            };
         let mut mounts = HostMount::parse(&params.volume)?;
         let ports = params.port.clone();
         PortMapping::check_duplicates(&ports)
@@ -386,7 +387,7 @@ impl RunCmd {
         };
         validate_requested_network_backend(
             &resources,
-            params.dns_filter_hosts.as_deref(),
+            params.egress_policy_hosts.as_deref(),
             params.port.len(),
         )?;
 
@@ -416,7 +417,7 @@ impl RunCmd {
 
         let features = smolvm::agent::LaunchFeatures {
             ssh_agent_socket,
-            dns_filter_hosts: params.dns_filter_hosts.clone(),
+            egress_policy_hosts: params.egress_policy_hosts.clone(),
             packed_layers_dir: None,
             extra_disks: Vec::new(),
         };
@@ -616,7 +617,7 @@ impl RunCmd {
                                 entrypoint: params.entrypoint.clone(),
                                 cmd: params.cmd.clone(),
                                 ssh_agent: self.ssh_agent || params.ssh_agent,
-                                dns_filter_hosts: params.dns_filter_hosts.clone(),
+                                egress_policy_hosts: params.egress_policy_hosts.clone(),
                             }),
                         );
                     }
@@ -727,7 +728,7 @@ impl RunCmd {
                                 entrypoint: params.entrypoint.clone(),
                                 cmd: params.cmd.clone(),
                                 ssh_agent: self.ssh_agent || params.ssh_agent,
-                                dns_filter_hosts: params.dns_filter_hosts.clone(),
+                                egress_policy_hosts: params.egress_policy_hosts.clone(),
                             }),
                         );
                     }
@@ -1079,7 +1080,7 @@ impl CreateCmd {
             return self.run_from_smolmachine(sidecar_path);
         }
 
-        let (cli_allow_cidrs, net, cli_dns_filter_hosts) = resolve_egress_flags(
+        let (cli_allow_cidrs, net, cli_egress_policy_hosts) = resolve_egress_flags(
             self.allow_cidr,
             self.allow_host,
             self.outbound_localhost_only,
@@ -1110,14 +1111,15 @@ impl CreateCmd {
             cli_allow_cidrs,
         )?;
         let mut params = params;
-        params.dns_filter_hosts = match (params.dns_filter_hosts.take(), cli_dns_filter_hosts) {
-            (Some(mut from_smolfile), Some(mut from_cli)) => {
-                from_smolfile.append(&mut from_cli);
-                Some(from_smolfile)
-            }
-            (Some(from_smolfile), None) => Some(from_smolfile),
-            (None, some) => some,
-        };
+        params.egress_policy_hosts =
+            match (params.egress_policy_hosts.take(), cli_egress_policy_hosts) {
+                (Some(mut from_smolfile), Some(mut from_cli)) => {
+                    from_smolfile.append(&mut from_cli);
+                    Some(from_smolfile)
+                }
+                (Some(from_smolfile), None) => Some(from_smolfile),
+                (None, some) => some,
+            };
         let resources = VmResources {
             cpus: params.cpus,
             memory_mib: params.mem,
@@ -1131,7 +1133,7 @@ impl CreateCmd {
         };
         validate_requested_network_backend(
             &resources,
-            params.dns_filter_hosts.as_deref(),
+            params.egress_policy_hosts.as_deref(),
             params.port.len(),
         )?;
         if self.ssh_agent {
@@ -1227,7 +1229,7 @@ impl CreateCmd {
             health_retries: None,
             health_startup_grace_secs: None,
             ssh_agent: self.ssh_agent,
-            dns_filter_hosts: None,
+            egress_policy_hosts: None,
             gpu: manifest.gpu,
             gpu_vram_mib: None,
             source_smolmachine: Some(canonical_path),

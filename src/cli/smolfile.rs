@@ -84,7 +84,7 @@ pub fn build_create_params(
                 ssh_agent: false,
                 gpu: false,
                 gpu_vram_mib: None,
-                dns_filter_hosts: None,
+                egress_policy_hosts: None,
                 source_smolmachine: None,
             });
         }
@@ -178,7 +178,7 @@ pub fn build_create_params(
     // Merge network policy: [network] section, then CLI extends
     let network = sf.network.unwrap_or_default();
 
-    // Preserve original hostnames for DNS filtering.
+    // Preserve original hostnames for egress-policy refresh.
     // Do NOT resolve these to CIDRs here — CDN-backed hosts rotate IPs and the
     // resolved addresses would be stale by the time the machine is started.
     // Re-resolution happens at `machine start` time (see start_vm_named).
@@ -273,7 +273,7 @@ pub fn build_create_params(
         ssh_agent: sf.auth.as_ref().and_then(|a| a.ssh_agent).unwrap_or(false),
         gpu,
         gpu_vram_mib: sf.gpu_vram,
-        dns_filter_hosts: if sf_allow_hosts.is_empty() {
+        egress_policy_hosts: if sf_allow_hosts.is_empty() {
             None
         } else {
             Some(sf_allow_hosts)

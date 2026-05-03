@@ -88,7 +88,7 @@ pub fn find_lib_dir() -> Option<PathBuf> {
 /// It should be called in the child process after fork, where
 /// DYLD_LIBRARY_PATH is still available for dlopen to find libkrunfw.
 ///
-/// Optional features for VM launch (SSH agent, DNS filtering, etc.).
+/// Optional features for VM launch (SSH agent, packed layers, etc.).
 ///
 /// Groups optional capabilities that don't affect core VM operation.
 /// New features should be added here rather than as additional parameters
@@ -97,9 +97,8 @@ pub fn find_lib_dir() -> Option<PathBuf> {
 pub struct LaunchFeatures {
     /// Host SSH agent socket path for forwarding into the guest.
     pub ssh_agent_socket: Option<std::path::PathBuf>,
-    /// Hostnames for DNS filtering. When set, the host starts a DNS filter
-    /// listener and the guest agent proxies DNS queries through it.
-    pub dns_filter_hosts: Option<Vec<String>>,
+    /// Hostnames from `--allow-host` to periodically re-resolve for egress policy.
+    pub egress_policy_hosts: Option<Vec<String>>,
     /// Pre-extracted OCI layer directory for machines created from .smolmachine.
     /// When set, the launcher mounts this directory via virtiofs so the agent
     /// can use pre-extracted layers instead of pulling from a registry.
@@ -127,17 +126,11 @@ pub struct LaunchConfig<'a> {
     pub resources: VmResources,
     /// Host SSH agent socket path for forwarding into the guest.
     pub ssh_agent_socket: Option<&'a Path>,
-    /// Host DNS filter socket path. When set, the guest DNS proxy forwards
-    /// queries over vsock to this socket for filtering.
-    pub dns_filter_socket: Option<&'a Path>,
     /// Pre-extracted OCI layers directory for .smolmachine-sourced machines.
     /// Mounted via virtiofs as "smolvm_layers" so the agent uses packed layers.
     pub packed_layers_dir: Option<&'a Path>,
     /// Additional disk images (path, read_only). Appear as /dev/vdc, /dev/vdd, ...
     pub extra_disks: &'a [(std::path::PathBuf, bool)],
-    /// Whether DNS filtering was configured for this launch, even if the
-    /// host-side proxy socket could not be created.
-    pub dns_filter_enabled: bool,
     /// Hostnames to periodically re-resolve for the live egress policy.
     /// When set, a background thread re-resolves these every 5 minutes and
     /// atomically replaces the CIDR list via the Arc handle obtained from
@@ -159,14 +152,17 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         port_mappings,
         resources,
         ssh_agent_socket,
-        dns_filter_socket,
         packed_layers_dir,
         extra_disks,
-        dns_filter_enabled,
         egress_refresh_hosts,
     } = config;
 
-    crate::network::validate_requested_network_backend(resources, None, port_mappings.len())?;
+    let hostname_policy_hosts = egress_refresh_hosts.as_deref();
+    crate::network::validate_requested_network_backend(
+        resources,
+        hostname_policy_hosts,
+        port_mappings.len(),
+    )?;
 
     // Raise file descriptor limits
     raise_fd_limits();
@@ -279,7 +275,8 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             return Err(Error::agent("set rootfs", "krun_set_root failed"));
         }
 
-        let network_plan = select_network_plan(resources, *dns_filter_enabled, port_mappings.len());
+        let network_plan =
+            plan_launch_network(resources, hostname_policy_hosts, port_mappings.len());
         if let Some(reason) = network_plan.fallback_reason {
             tracing::warn!(reason = %reason.user_message(), "network backend fell back to TSI");
         }
@@ -511,21 +508,6 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             }
         }
 
-        // Add vsock port for DNS filter proxy (optional)
-        if let Some(dns_socket) = dns_filter_socket {
-            let dns_path = try_or_free_ctx!(
-                path_to_cstring(dns_socket),
-                "add dns filter vsock port",
-                "path contains null byte"
-            );
-            // listen=false: guest connects out to this port, host listens via Unix socket
-            if krun_add_vsock_port2(ctx, ports::DNS_FILTER, dns_path.as_ptr(), false) < 0 {
-                tracing::warn!("failed to add DNS filter vsock port — DNS filtering disabled");
-            } else {
-                tracing::info!("DNS filtering enabled on vsock port {}", ports::DNS_FILTER);
-            }
-        }
-
         // Set console output if specified
         if let Some(log_path) = console_log {
             let console_path = try_or_free_ctx!(
@@ -644,11 +626,6 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             }
         }
 
-        // Tell the agent to start DNS filtering proxy
-        if dns_filter_socket.is_some() {
-            env_strings.push(cstr(&format!("{}=1", guest_env::DNS_FILTER)));
-        }
-
         if let Some(network) = guest_network {
             env_strings.push(cstr(&format!(
                 "{}={}",
@@ -699,7 +676,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
 
         // Egress CIDR live-refresh thread.
         //
-        // Re-resolves DNS filter hostnames every SMOLVM_EGRESS_REFRESH_SECS
+        // Re-resolves hostname egress policy targets every SMOLVM_EGRESS_REFRESH_SECS
         // (default 5 min) and atomically replaces the Arc<RwLock<Vec<...>>>
         // that the vsock muxer reads on every packet. The Arc is borrowed from
         // libkrun via `krun_get_egress_handle` — see libkrun/src/libkrun/src/lib.rs.
@@ -804,16 +781,6 @@ fn create_unix_stream_pair() -> std::io::Result<(RawFd, RawFd)> {
         return Err(std::io::Error::last_os_error());
     }
     Ok((fds[0], fds[1]))
-}
-
-fn select_network_plan(
-    resources: &VmResources,
-    dns_filter_enabled: bool,
-    port_count: usize,
-) -> crate::network::LaunchNetworkPlan {
-    let dns_filter_placeholder = [String::from("configured")];
-    let dns_filter_hosts = dns_filter_enabled.then_some(dns_filter_placeholder.as_slice());
-    plan_launch_network(resources, dns_filter_hosts, port_count)
 }
 
 fn format_mac(mac: [u8; 6]) -> String {

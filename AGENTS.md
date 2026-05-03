@@ -194,7 +194,7 @@ cpus/mem:   CLI flag > Smolfile > defaults (4 CPU, 8192 MiB)
 
 - **Off by default** — VMs have no outbound access unless `--net` is specified
 - `--net` enables full outbound (TCP/UDP, DNS)
-- `--allow-host api.stripe.com` enables egress only to resolved IPs of that hostname (implies `--net`). Also enables DNS filtering — only allowed hostnames can be resolved.
+- `--allow-host api.stripe.com` enables egress only to resolved IPs of that hostname (implies `--net`). DNS remains available so names can resolve, but outbound connections are still blocked unless their destination IP is allowed.
 - `--allow-cidr 10.0.0.0/8` enables egress only to specified IP ranges (implies `--net`)
 - `--allow-host` and `--allow-cidr` can be combined and used multiple times
 - `--outbound-localhost-only` restricts to 127.0.0.0/8 and ::1 (implies `--net`)
