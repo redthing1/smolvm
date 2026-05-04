@@ -35,9 +35,13 @@ done
 export INSTALL_ROOTFS
 
 OUTPUT_DIR="${POSITIONAL_ARGS[0]:-$PROJECT_ROOT/target/agent-rootfs}"
+CACHE_DIR="${SMOLVM_ROOTFS_CACHE:-$PROJECT_ROOT/target/rootfs-cache}"
 
-# Alpine version
-ALPINE_VERSION="3.19"
+# Pinned rootfs bootstrap inputs.
+ALPINE_VERSION="3.23"
+ALPINE_PATCH_VERSION="4"
+APK_TOOLS_STATIC_VERSION="3.0.6-r0"
+CRANE_VERSION="0.19.0"
 
 # Detect or override architecture
 DETECTED_ARCH="${OVERRIDE_ARCH:-$(uname -m)}"
@@ -59,17 +63,82 @@ case "$DETECTED_ARCH" in
 esac
 
 ALPINE_MIRROR="https://dl-cdn.alpinelinux.org/alpine"
-ALPINE_MINIROOTFS="alpine-minirootfs-${ALPINE_VERSION}.0-${ALPINE_ARCH}.tar.gz"
+ALPINE_MINIROOTFS="alpine-minirootfs-${ALPINE_VERSION}.${ALPINE_PATCH_VERSION}-${ALPINE_ARCH}.tar.gz"
 ALPINE_URL="${ALPINE_MIRROR}/v${ALPINE_VERSION}/releases/${ALPINE_ARCH}/${ALPINE_MINIROOTFS}"
 
-# Crane version
-CRANE_VERSION="0.19.0"
 CRANE_URL="https://github.com/google/go-containerregistry/releases/download/v${CRANE_VERSION}/go-containerregistry_Linux_${CRANE_ARCH}.tar.gz"
+
+pinned_alpine_minirootfs_sha256() {
+    case "$ALPINE_ARCH" in
+        x86_64)  echo "85498865362aa7ebececa0d725a2f2e4db7ac4e4b2850b8df21645afa0d03ee3" ;;
+        aarch64) echo "9250667a8affac8f1e98086392f80f43f086626701e9bce33398eb9b6c0bd64c" ;;
+        *) echo "unsupported Alpine arch for minirootfs checksum: $ALPINE_ARCH" >&2; exit 1 ;;
+    esac
+}
+
+pinned_crane_sha256() {
+    case "$CRANE_ARCH" in
+        x86_64) echo "daa629648e1d1d10fc8bde5e6ce4176cbc0cd48a32211b28c3fd806e0fa5f29b" ;;
+        arm64)  echo "d439957c1a9d6bc0870be921e25753a7fa67bf2b2691b77ce48a6fc25bc719a0" ;;
+        *) echo "unsupported crane arch for checksum: $CRANE_ARCH" >&2; exit 1 ;;
+    esac
+}
+
+pinned_apk_static_sha256() {
+    case "$1" in
+        x86_64)  echo "a51144e51387e60900e1cad6b4e4ae04d48c8d87ac83c9a4190d2f113a07ce72" ;;
+        aarch64) echo "1f3de9109eaba4a271c1b3a5fedee3b6442e6b3bf5695d5e5f8286aeece0461f" ;;
+        *) echo "unsupported host arch for apk.static checksum: $1" >&2; exit 1 ;;
+    esac
+}
+
+sha256_file() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | awk '{print $1}'
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$1" | awk '{print $1}'
+    else
+        echo "Error: sha256sum or shasum is required" >&2
+        exit 1
+    fi
+}
+
+verify_sha256() {
+    local path="$1"
+    local expected="$2"
+    local actual
+    actual="$(sha256_file "$path")"
+    if [[ "$actual" != "$expected" ]]; then
+        echo "Error: checksum mismatch for $path" >&2
+        echo "  expected: $expected" >&2
+        echo "  actual:   $actual" >&2
+        exit 1
+    fi
+}
+
+download_pinned() {
+    local url="$1"
+    local path="$2"
+    local expected_sha="$3"
+
+    mkdir -p "$(dirname "$path")"
+    if [[ -f "$path" ]]; then
+        verify_sha256 "$path" "$expected_sha"
+        return
+    fi
+
+    local tmp="${path}.tmp.$$"
+    rm -f "$tmp"
+    curl -fsSL -o "$tmp" "$url"
+    verify_sha256 "$tmp" "$expected_sha"
+    mv "$tmp" "$path"
+}
 
 echo "Building agent rootfs..."
 echo "  Alpine: ${ALPINE_VERSION} (${ALPINE_ARCH})"
 echo "  Crane: ${CRANE_VERSION}"
 echo "  Output: ${OUTPUT_DIR}"
+echo "  Cache: ${CACHE_DIR}"
 
 # Create output directory
 rm -rf "$OUTPUT_DIR"
@@ -77,10 +146,8 @@ mkdir -p "$OUTPUT_DIR"
 
 # Download Alpine minirootfs
 echo "Downloading Alpine minirootfs..."
-ALPINE_TAR="/tmp/${ALPINE_MINIROOTFS}"
-if [ ! -f "$ALPINE_TAR" ]; then
-    curl -fsSL -o "$ALPINE_TAR" "$ALPINE_URL"
-fi
+ALPINE_TAR="${CACHE_DIR}/${ALPINE_MINIROOTFS}"
+download_pinned "$ALPINE_URL" "$ALPINE_TAR" "$(pinned_alpine_minirootfs_sha256)"
 
 # Extract Alpine
 echo "Extracting Alpine..."
@@ -88,10 +155,8 @@ tar -xzf "$ALPINE_TAR" -C "$OUTPUT_DIR"
 
 # Download crane
 echo "Downloading crane..."
-CRANE_TAR="/tmp/crane-${CRANE_VERSION}-${CRANE_ARCH}.tar.gz"
-if [ ! -f "$CRANE_TAR" ]; then
-    curl -fsSL -o "$CRANE_TAR" "$CRANE_URL"
-fi
+CRANE_TAR="${CACHE_DIR}/go-containerregistry_Linux_${CRANE_ARCH}-${CRANE_VERSION}.tar.gz"
+download_pinned "$CRANE_URL" "$CRANE_TAR" "$(pinned_crane_sha256)"
 
 # Extract crane to rootfs
 echo "Installing crane..."
@@ -99,17 +164,21 @@ mkdir -p "$OUTPUT_DIR/usr/local/bin"
 tar -xzf "$CRANE_TAR" -C "$OUTPUT_DIR/usr/local/bin" crane
 
 # Install additional Alpine packages into the rootfs.
-# Strategies:
-#   1. apk.static (Linux only) — runs natively, supports cross-arch via --arch
-#   2. smolvm (any host) — only for native-arch builds (pulls host-arch image)
 echo "Installing additional packages..."
-APK_PACKAGES="jq e2fsprogs e2fsprogs-extra crun util-linux libcap"
+APK_PACKAGES=(
+    "jq"
+    "e2fsprogs"
+    "e2fsprogs-extra"
+    "crun"
+    "util-linux"
+    "libcap"
+)
 
 # Determine if this is a cross-arch build
 HOST_ARCH="$(uname -m)"
 case "$HOST_ARCH" in
-    arm64) HOST_ALPINE_ARCH="aarch64" ;;
-    amd64) HOST_ALPINE_ARCH="x86_64" ;;
+    arm64|aarch64) HOST_ALPINE_ARCH="aarch64" ;;
+    amd64|x86_64)  HOST_ALPINE_ARCH="x86_64" ;;
     *)     HOST_ALPINE_ARCH="$HOST_ARCH" ;;
 esac
 CROSS_ARCH=0
@@ -119,30 +188,44 @@ fi
 
 install_packages_apk_static() {
     echo "  Using apk.static..."
-    # Download Alpine's static apk binary — runs natively on Linux,
-    # can install packages for any target architecture via --arch.
-    APK_STATIC_MIRROR="${ALPINE_MIRROR}/v${ALPINE_VERSION}/main/${HOST_ARCH}"
-    APK_STATIC_PKG=$(curl -fsSL "$APK_STATIC_MIRROR/" | grep -o 'apk-tools-static-[^"]*\.apk' | head -1)
-    if [[ -z "$APK_STATIC_PKG" ]]; then
-        echo "Error: could not find apk-tools-static package at $APK_STATIC_MIRROR"
-        exit 1
+    local apk_static_pkg="apk-tools-static-${APK_TOOLS_STATIC_VERSION}.apk"
+    local apk_static_url="${ALPINE_MIRROR}/v${ALPINE_VERSION}/main/${HOST_ALPINE_ARCH}/${apk_static_pkg}"
+    local apk_static_apk="${CACHE_DIR}/${HOST_ALPINE_ARCH}-${apk_static_pkg}"
+    local apk_static_dir="${CACHE_DIR}/apk-static-${HOST_ALPINE_ARCH}-${APK_TOOLS_STATIC_VERSION}"
+
+    download_pinned "$apk_static_url" "$apk_static_apk" "$(pinned_apk_static_sha256 "$HOST_ALPINE_ARCH")"
+    rm -rf "$apk_static_dir"
+    mkdir -p "$apk_static_dir"
+    if tar --version 2>/dev/null | grep -q "GNU tar"; then
+        tar --warning=no-unknown-keyword -xzf "$apk_static_apk" -C "$apk_static_dir" sbin/apk.static
+    else
+        tar -xzf "$apk_static_apk" -C "$apk_static_dir" sbin/apk.static
     fi
-    curl -fsSL -o /tmp/apk-static.apk "${APK_STATIC_MIRROR}/${APK_STATIC_PKG}"
-    mkdir -p /tmp/apk-static
-    tar -xzf /tmp/apk-static.apk -C /tmp/apk-static 2>/dev/null || true
 
     # Set up apk repositories in the rootfs
     mkdir -p "$OUTPUT_DIR/etc/apk"
     echo "${ALPINE_MIRROR}/v${ALPINE_VERSION}/main" > "$OUTPUT_DIR/etc/apk/repositories"
     echo "${ALPINE_MIRROR}/v${ALPINE_VERSION}/community" >> "$OUTPUT_DIR/etc/apk/repositories"
 
-    /tmp/apk-static/sbin/apk.static \
+    local apk_cmd=("$apk_static_dir/sbin/apk.static")
+    if command -v unshare >/dev/null 2>&1 && unshare -r true >/dev/null 2>&1; then
+        apk_cmd=(unshare -r "$apk_static_dir/sbin/apk.static")
+    fi
+
+    local rootfs_world=()
+    local package
+    while IFS= read -r package; do
+        if [[ -n "$package" ]]; then
+            rootfs_world+=("$package")
+        fi
+    done < "$OUTPUT_DIR/etc/apk/world"
+
+    "${apk_cmd[@]}" \
         --root "$OUTPUT_DIR" \
-        --initdb \
         --no-cache \
-        --allow-untrusted \
+        --no-scripts \
         --arch "$ALPINE_ARCH" \
-        add $APK_PACKAGES
+        add --upgrade --no-chown "${rootfs_world[@]}" "${APK_PACKAGES[@]}"
     echo "Packages installed successfully"
 }
 
@@ -174,6 +257,69 @@ repair_executable_modes() {
     done
 }
 
+print_words() {
+    local sep=""
+    local word
+    for word in "$@"; do
+        printf "%s%s" "$sep" "$word"
+        sep=" "
+    done
+}
+
+print_file_lines() {
+    local path="$1"
+    local sep=""
+    local line
+
+    if [[ ! -f "$path" ]]; then
+        return
+    fi
+
+    while IFS= read -r line; do
+        if [[ -z "$line" ]]; then
+            continue
+        fi
+        printf "%s%s" "$sep" "$line"
+        sep=" "
+    done < "$path"
+}
+
+print_installed_apk_packages() {
+    local db="$OUTPUT_DIR/lib/apk/db/installed"
+    if [[ ! -f "$db" ]]; then
+        return
+    fi
+
+    awk -F: '/^P:/ { package = $2 } /^V:/ { if (package != "") { print package "=" $2; package = "" } }' "$db" \
+        | sort \
+        | awk 'BEGIN { sep = "" } { printf "%s%s", sep, $0; sep = " " }'
+}
+
+write_build_manifest() {
+    local manifest="$OUTPUT_DIR/etc/smolvm-rootfs-build.txt"
+    {
+        echo "alpine_version=${ALPINE_VERSION}.${ALPINE_PATCH_VERSION}"
+        echo "alpine_arch=${ALPINE_ARCH}"
+        echo "alpine_minirootfs=${ALPINE_MINIROOTFS}"
+        echo "alpine_minirootfs_sha256=$(pinned_alpine_minirootfs_sha256)"
+        echo "apk_tools_static_version=${APK_TOOLS_STATIC_VERSION}"
+        echo "apk_tools_static_host_arch=${HOST_ALPINE_ARCH}"
+        echo "apk_tools_static_sha256=$(pinned_apk_static_sha256 "$HOST_ALPINE_ARCH")"
+        echo "crane_version=${CRANE_VERSION}"
+        echo "crane_arch=${CRANE_ARCH}"
+        echo "crane_sha256=$(pinned_crane_sha256)"
+        printf "apk_requested_packages="
+        print_words "${APK_PACKAGES[@]}"
+        echo
+        printf "apk_world_packages="
+        print_file_lines "$OUTPUT_DIR/etc/apk/world"
+        echo
+        printf "apk_installed_packages="
+        print_installed_apk_packages
+        echo
+    } > "$manifest"
+}
+
 if [[ "$(uname -s)" == "Linux" ]]; then
     # On Linux, apk.static is preferred — it handles cross-arch correctly
     install_packages_apk_static
@@ -185,15 +331,17 @@ elif [[ "$CROSS_ARCH" == "1" ]]; then
 elif command -v smolvm &> /dev/null; then
     echo "  Using smolvm..."
     smolvm machine run --net -v "$OUTPUT_DIR:/rootfs" --image "alpine:${ALPINE_VERSION}" \
-        -- sh -c "apk add --root /rootfs --initdb --no-cache $APK_PACKAGES"
+        -- sh -c 'apk add --root /rootfs --no-cache --no-scripts --upgrade --no-chown $(cat /rootfs/etc/apk/world) "$@"' \
+        sh "${APK_PACKAGES[@]}"
     echo "Packages installed successfully"
 else
     echo "Error: smolvm is required to build the agent rootfs on macOS"
-    echo "Install smolvm first: https://github.com/smolvm/smolvm"
+    echo "Build and install this checkout first with: ./scripts/install.sh"
     exit 1
 fi
 
 repair_executable_modes "$OUTPUT_DIR"
+write_build_manifest
 
 # Create necessary directories
 mkdir -p "$OUTPUT_DIR/storage"
@@ -212,35 +360,24 @@ echo "nameserver 1.1.1.1" > "$OUTPUT_DIR/etc/resolv.conf"
 PROFILE="release-small"
 
 if [[ -n "${AGENT_BINARY:-}" ]] && [[ -f "${AGENT_BINARY}" ]]; then
-    echo "Using pre-built agent binary: $AGENT_BINARY"
+    echo "Using agent binary: $AGENT_BINARY"
 elif [[ "$NO_BUILD_AGENT" == "1" ]]; then
     echo "Skipping agent build (--no-build-agent)"
 else
     AGENT_BINARY=""
 
-    # Strategy 1: Native build on Linux with musl target installed
-    if [[ "$(uname -s)" == "Linux" ]] && command -v cargo &> /dev/null; then
-        if rustup target list --installed 2>/dev/null | grep -q "$RUST_TARGET"; then
-            echo "Building natively with musl target..."
-            cargo build --locked --profile "$PROFILE" -p smolvm-agent --target "$RUST_TARGET" \
-                --manifest-path "$PROJECT_ROOT/Cargo.toml"
-            AGENT_BINARY="$PROJECT_ROOT/target/$RUST_TARGET/$PROFILE/smolvm-agent"
-        fi
+    if command -v cargo &> /dev/null && rustup target list --installed 2>/dev/null | grep -q "$RUST_TARGET"; then
+        echo "Building smolvm-agent for $RUST_TARGET..."
+        cargo build --locked --profile "$PROFILE" -p smolvm-agent --target "$RUST_TARGET" \
+            --manifest-path "$PROJECT_ROOT/Cargo.toml"
+        AGENT_BINARY="$PROJECT_ROOT/target/$RUST_TARGET/$PROFILE/smolvm-agent"
     fi
 
-    # Strategy 2: smolvm with rust:alpine (dogfooding)
     if [[ -z "$AGENT_BINARY" ]] || [[ ! -f "$AGENT_BINARY" ]]; then
-        if command -v smolvm &> /dev/null; then
-            echo "Building via smolvm (rust:alpine)..."
-            smolvm machine run --net --mem 2048 -v "$PROJECT_ROOT:/work" --image rust:alpine \
-                -- sh -c ". /usr/local/cargo/env && apk add musl-dev && cd /work && cargo build --locked --profile $PROFILE -p smolvm-agent"
-            AGENT_BINARY="$PROJECT_ROOT/target/$PROFILE/smolvm-agent"
-        else
-            echo "Error: Cannot build smolvm-agent"
-            echo "  Either install the musl target: rustup target add $RUST_TARGET"
-            echo "  Or install smolvm for cross-compilation"
-            exit 1
-        fi
+        echo "Error: Cannot build smolvm-agent"
+        echo "Install the target with: rustup target add $RUST_TARGET"
+        echo "Or set AGENT_BINARY=/path/to/smolvm-agent"
+        exit 1
     fi
 fi
 

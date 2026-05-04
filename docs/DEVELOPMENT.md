@@ -85,11 +85,11 @@ The agent rootfs resolution order is:
 2. `./target/agent-rootfs` (local development)
 3. Platform data directory (`~/.local/share/smolvm/` on Linux, `~/Library/Application Support/smolvm/` on macOS)
 
-The rootfs builder uses pinned inputs and verifies downloaded asset checksums
-before extraction. Direct Alpine package constraints are versioned in
-`scripts/build-agent-rootfs.sh`; update them intentionally when changing the
-guest rootfs contents. Each built rootfs includes
-`/etc/smolvm-rootfs-build.txt` with the input versions and checksums used.
+The rootfs builder verifies raw bootstrap asset checksums before extraction.
+Alpine packages are resolved through the selected stable repository branch so
+normal package updates are picked up on rebuild. Each built rootfs includes
+`/etc/smolvm-rootfs-build.txt` with the bootstrap inputs and actual installed
+APK package versions.
 
 ```bash
 # Build agent rootfs
