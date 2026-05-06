@@ -14,6 +14,7 @@ pub mod extract;
 pub mod format;
 #[cfg(target_os = "macos")]
 pub mod macho;
+pub mod oci_archive;
 pub mod packer;
 pub mod signing;
 
@@ -72,6 +73,14 @@ pub enum PackError {
     /// Tar archive error.
     #[error("tar error: {0}")]
     Tar(String),
+
+    /// Invalid OCI archive.
+    #[error("invalid OCI archive: {0}")]
+    InvalidOciArchive(String),
+
+    /// Unsupported OCI layer media type.
+    #[error("unsupported OCI layer media type: {0}")]
+    UnsupportedLayer(String),
 }
 
 /// Result type for pack operations.

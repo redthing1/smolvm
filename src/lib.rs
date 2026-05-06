@@ -70,6 +70,7 @@ pub mod db;
 mod disk_utils;
 /// Language-neutral embedded runtime support shared by SDK adapters.
 pub mod embedded;
+pub mod image_store;
 pub mod log_rotation;
 pub mod network;
 pub mod platform;

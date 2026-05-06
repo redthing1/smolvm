@@ -35,6 +35,10 @@ enum Commands {
     #[command(subcommand)]
     Pack(cli::pack::PackCmd),
 
+    /// Manage imported local images
+    #[command(subcommand)]
+    Image(cli::image::ImageCmd),
+
     /// Manage smolvm configuration (registries, defaults)
     #[command(subcommand)]
     Config(cli::config::ConfigCmd),
@@ -68,6 +72,7 @@ fn main() {
         Commands::Machine(cmd) => cmd.run(),
         Commands::Serve(cmd) => cmd.run(),
         Commands::Pack(cmd) => cmd.run(),
+        Commands::Image(cmd) => cmd.run(),
         Commands::Config(cmd) => cmd.run(),
         Commands::BootVm { config } => cli::internal_boot::run(config),
     };

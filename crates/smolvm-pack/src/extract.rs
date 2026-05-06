@@ -13,106 +13,197 @@ use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
 
-/// Safely unpack a tar archive, rejecting symlinks, hardlinks, and entries
-/// that resolve outside `dest`.
+/// Safely unpack a tar archive, rejecting entries that resolve outside `dest`.
 ///
 /// The standard `tar::Archive::unpack()` strips `..` components but does
 /// **not** reject symlinks. A crafted archive could create
 /// `lib/libkrun.dylib → /tmp/evil.so`, and subsequent `dlopen()` would
-/// load the attacker's library. This function rejects any entry that is
-/// not a regular file or directory.
+/// load the attacker's library. Links are allowed only after their resolved
+/// targets are validated to remain under `dest`.
 fn safe_unpack<R: Read>(archive: &mut tar::Archive<R>, dest: &Path) -> std::io::Result<()> {
     let canonical_dest = dest.canonicalize().unwrap_or_else(|_| dest.to_path_buf());
+    let mut directory_permissions = DirectoryPermissions::default();
 
-    for entry_result in archive.entries()? {
-        let mut entry = entry_result?;
-        let entry_type = entry.header().entry_type();
-        let entry_path = entry.path()?.to_path_buf();
+    let result = (|| {
+        for entry_result in archive.entries()? {
+            let mut entry = entry_result?;
+            let entry_type = entry.header().entry_type();
+            let entry_path = entry.path()?.to_path_buf();
 
-        match entry_type {
-            tar::EntryType::Regular | tar::EntryType::GNUSparse | tar::EntryType::Directory => {}
-            tar::EntryType::Symlink => {
-                // Allow symlinks but validate the target stays within dest.
-                if let Some(link_target) = entry.link_name()? {
-                    let link_target = link_target.to_path_buf();
-                    // Resolve relative symlinks against the entry's parent dir
-                    let resolved = if link_target.is_absolute() {
-                        // Absolute symlinks: jail to dest (e.g., /lib/foo → dest/lib/foo)
-                        dest.join(link_target.strip_prefix("/").unwrap_or(&link_target))
-                    } else {
-                        let parent = entry_path.parent().unwrap_or(Path::new(""));
-                        dest.join(parent).join(&link_target)
-                    };
-                    // Normalize the path by resolving .. components
-                    let normalized = normalize_path(&resolved);
-                    if !normalized.starts_with(&canonical_dest) {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            format!(
-                                "tar symlink '{}' -> '{}' escapes destination directory",
-                                entry_path.display(),
-                                link_target.display()
-                            ),
-                        ));
+            match entry_type {
+                tar::EntryType::Regular | tar::EntryType::GNUSparse | tar::EntryType::Directory => {
+                }
+                tar::EntryType::Symlink => {
+                    // Allow symlinks but validate the target stays within dest.
+                    if let Some(link_target) = entry.link_name()? {
+                        let link_target = link_target.to_path_buf();
+                        // Resolve relative symlinks against the entry's parent dir
+                        let resolved = if link_target.is_absolute() {
+                            // Absolute symlinks: jail to dest (e.g., /lib/foo -> dest/lib/foo)
+                            dest.join(link_target.strip_prefix("/").unwrap_or(&link_target))
+                        } else {
+                            let parent = entry_path.parent().unwrap_or(Path::new(""));
+                            dest.join(parent).join(&link_target)
+                        };
+                        // Normalize the path by resolving .. components
+                        let normalized = normalize_path(&resolved);
+                        if !normalized.starts_with(&canonical_dest) {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                format!(
+                                    "tar symlink '{}' -> '{}' escapes destination directory",
+                                    entry_path.display(),
+                                    link_target.display()
+                                ),
+                            ));
+                        }
                     }
                 }
-            }
-            tar::EntryType::Link => {
-                // Allow hardlinks but validate the target stays within dest.
-                if let Some(link_target) = entry.link_name()? {
-                    let full_target = dest.join(link_target.as_ref());
-                    let normalized = normalize_path(&full_target);
-                    if !normalized.starts_with(&canonical_dest) {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            format!(
-                                "tar hardlink '{}' escapes destination directory",
-                                entry_path.display()
-                            ),
-                        ));
+                tar::EntryType::Link => {
+                    // Allow hardlinks but validate the target stays within dest.
+                    if let Some(link_target) = entry.link_name()? {
+                        let full_target = dest.join(link_target.as_ref());
+                        let normalized = normalize_path(&full_target);
+                        if !normalized.starts_with(&canonical_dest) {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                format!(
+                                    "tar hardlink '{}' escapes destination directory",
+                                    entry_path.display()
+                                ),
+                            ));
+                        }
                     }
                 }
+                other => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "tar entry '{}' has disallowed type {:?}",
+                            entry_path.display(),
+                            other
+                        ),
+                    ));
+                }
             }
-            other => {
+
+            // Validate that the unpacked path stays within dest.
+            let full_path = dest.join(&entry_path);
+            let normalized = normalize_path(&full_path);
+            if !normalized.starts_with(&canonical_dest) {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     format!(
-                        "tar entry '{}' has disallowed type {:?}",
-                        entry_path.display(),
-                        other
+                        "tar entry '{}' escapes destination directory",
+                        entry_path.display()
                     ),
                 ));
             }
-        }
 
-        // Validate that the unpacked path stays within dest.
-        let full_path = dest.join(&entry_path);
-        let normalized = normalize_path(&full_path);
-        if !normalized.starts_with(&canonical_dest) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!(
-                    "tar entry '{}' escapes destination directory",
-                    entry_path.display()
-                ),
-            ));
-        }
-
-        // Unpack the individual entry.
-        // Ensure parent directories are writable before extracting. OCI layer
-        // tars may set restrictive directory modes (e.g., dr-xr-xr-x) before
-        // child entries, which prevents creating files under them on macOS
-        // where we're not root.
-        if entry_type != tar::EntryType::Directory {
             if let Some(parent) = full_path.parent() {
-                if parent.is_dir() {
-                    let _ =
-                        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o755));
+                directory_permissions.make_writable(parent)?;
+            }
+            entry.unpack_in(dest)?;
+            if entry_type == tar::EntryType::Directory {
+                directory_permissions.make_writable(&full_path)?;
+            }
+        }
+        Ok(())
+    })();
+
+    let restore_result = directory_permissions.restore();
+    result?;
+    restore_result
+}
+
+#[derive(Default)]
+struct DirectoryPermissions {
+    #[cfg(unix)]
+    modes: std::collections::BTreeMap<PathBuf, u32>,
+}
+
+impl DirectoryPermissions {
+    fn make_writable(&mut self, path: &Path) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            let Ok(metadata) = fs::symlink_metadata(path) else {
+                return Ok(());
+            };
+            if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                return Ok(());
+            }
+
+            let mode = metadata.permissions().mode();
+            if mode & 0o700 == 0o700 {
+                return Ok(());
+            }
+
+            self.modes.entry(path.to_path_buf()).or_insert(mode);
+            fs::set_permissions(path, fs::Permissions::from_mode(mode | 0o700))?;
+        }
+
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+        }
+
+        Ok(())
+    }
+
+    fn restore(self) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            for (path, mode) in self.modes.into_iter().rev() {
+                match fs::symlink_metadata(&path) {
+                    Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+                        fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
+                    }
+                    Ok(_) => {}
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(err) => return Err(err),
                 }
             }
         }
-        entry.unpack_in(dest)?;
+
+        Ok(())
     }
+}
+
+fn remove_dir_all_writable(path: &Path) -> std::io::Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    make_tree_writable(path)?;
+    fs::remove_dir_all(path)
+}
+
+fn make_tree_writable(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let metadata = fs::symlink_metadata(path)?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Ok(());
+        }
+
+        let mode = metadata.permissions().mode();
+        if mode & 0o700 != 0o700 {
+            fs::set_permissions(path, fs::Permissions::from_mode(mode | 0o700))?;
+        }
+
+        for entry in fs::read_dir(path)? {
+            let child = entry?.path();
+            let child_metadata = fs::symlink_metadata(&child)?;
+            if child_metadata.is_dir() && !child_metadata.file_type().is_symlink() {
+                make_tree_writable(&child)?;
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+
     Ok(())
 }
 
@@ -276,11 +367,11 @@ pub fn extract_sidecar(
         return Ok(());
     }
 
-    // If force-extracting over an existing cache, detach any mounted
-    // case-sensitive volume first, then remove for a clean slate.
-    if force && cache_dir.exists() {
+    // Rebuild the cache when forcing or when the marker is absent, so
+    // post-processing never reuses a half-extracted layer directory.
+    if cache_dir.exists() {
         force_detach_layers_volume(cache_dir);
-        let _ = fs::remove_dir_all(cache_dir);
+        remove_dir_all_writable(cache_dir)?;
     }
 
     extract_sidecar_inner(sidecar_path, cache_dir, footer, debug)
@@ -1181,6 +1272,23 @@ mod tests {
         fs::write(temp_dir.path().join("lib/libkrun.dylib"), "partial").unwrap();
 
         assert!(!is_extracted(temp_dir.path()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_remove_dir_all_writable_removes_restrictive_tree() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let cache_dir = temp_dir.path().join("cache");
+        let locked_dir = cache_dir.join("layer/usr/lib");
+        fs::create_dir_all(&locked_dir).unwrap();
+        fs::write(locked_dir.join("file"), "data").unwrap();
+        fs::set_permissions(&locked_dir, fs::Permissions::from_mode(0o555)).unwrap();
+
+        remove_dir_all_writable(&cache_dir).unwrap();
+
+        assert!(!cache_dir.exists());
     }
 
     #[test]

@@ -351,8 +351,12 @@ impl RunCmd {
             }
         }
 
-        // Require an explicit command, -it flag, or Smolfile entrypoint/cmd.
-        // Without any of these, /bin/sh hangs waiting for input — confusing UX.
+        // Resolve image: CLI > Smolfile > None (bare VM)
+        let image = self.image.clone().or(params.image.clone());
+
+        // Require an explicit command, image default, -it flag, or Smolfile
+        // entrypoint/cmd. Bare non-interactive VMs would otherwise start a
+        // shell with no useful input path.
         if self.detach && (self.interactive || self.tty) {
             eprintln!("warning: -i/-t flags are ignored in detached mode (-d)");
         }
@@ -363,6 +367,7 @@ impl RunCmd {
             && !self.detach
             && self.command.is_empty()
             && !has_smolfile_command
+            && image.is_none()
         {
             return Err(smolvm::Error::config(
                 "machine run",
@@ -401,6 +406,12 @@ impl RunCmd {
         };
         println!("Starting {} machine...", mode);
 
+        let imported_image = vm_common::resolve_imported_image(image.as_deref())?;
+        let imported_layers_dir = imported_image
+            .as_ref()
+            .map(|image| smolvm::image_store::ImageStore::open().map(|s| s.layers_dir(&image.key)))
+            .transpose()?;
+
         let ssh_agent_socket = if self.ssh_agent || params.ssh_agent {
             match std::env::var("SSH_AUTH_SOCK") {
                 Ok(path) => Some(std::path::PathBuf::from(path)),
@@ -418,7 +429,7 @@ impl RunCmd {
         let features = smolvm::agent::LaunchFeatures {
             ssh_agent_socket,
             egress_policy_hosts: params.egress_policy_hosts.clone(),
-            packed_layers_dir: None,
+            packed_layers_dir: imported_layers_dir,
             extra_disks: Vec::new(),
         };
 
@@ -444,14 +455,16 @@ impl RunCmd {
         // exec (which has its own SIGINT handling).
         let sigint_guard = manager.child_pid().map(smolvm::process::SigintGuard::new);
 
-        // Resolve image: CLI > Smolfile > None (bare VM)
-        let image = self.image.clone().or(params.image.clone());
-
         // Pull image if one is specified
         let image_info = if let Some(ref img) = image {
-            match crate::cli::pull_with_progress(&mut client, img, self.oci_platform.as_deref()) {
+            match vm_common::load_image_info(
+                &mut client,
+                img,
+                self.oci_platform.as_deref(),
+                imported_image.is_some(),
+            ) {
                 Ok(info) => Some(info),
-                Err(e) if !params.net => {
+                Err(e) if !params.net && imported_image.is_none() => {
                     // Add a hint when pull fails and networking is disabled —
                     // this is the most common user error.
                     return Err(smolvm::Error::agent(
@@ -533,8 +546,17 @@ impl RunCmd {
             if cmd.is_empty() {
                 if self.detach {
                     DEFAULT_IDLE_CMD.iter().map(|s| s.to_string()).collect()
-                } else {
+                } else if interactive || tty {
                     vec![DEFAULT_SHELL_CMD.to_string()]
+                } else {
+                    let image_name = image.as_deref().unwrap_or("image");
+                    return Err(smolvm::Error::config(
+                        "machine run",
+                        format!(
+                            "image '{}' has no default command. Use 'smolvm machine run --image {} -- <command>' or 'smolvm machine run -it --image {}'.",
+                            image_name, image_name, image_name
+                        ),
+                    ));
                 }
             } else {
                 cmd
@@ -556,13 +578,10 @@ impl RunCmd {
                 params.workdir.as_deref(),
             );
             if self.detach {
-                // Detach mode: pull the image, kick the command off in the
-                // background inside the image's overlay rootfs, and persist
-                // the record so subsequent `machine exec` sessions see the
-                // same filesystem (same overlay ID as the exec path below).
-                crate::cli::pull_with_progress(&mut client, img, self.oci_platform.as_deref())?;
-
-                // Run the resolved command in the background inside the image.
+                // Detach mode: kick the resolved command off in the background
+                // inside the image's overlay rootfs, and persist the record so
+                // subsequent `machine exec` sessions see the same filesystem
+                // (same overlay ID as the exec path below).
                 // Skip when the command is just the idle default — there's
                 // nothing useful to dispatch.
                 let is_idle = command.is_empty()
@@ -614,10 +633,16 @@ impl RunCmd {
                                 env: env.clone(),
                                 workdir: params.workdir.clone(),
                                 image: Some(img.clone()),
+                                image_user: defaults.user.clone().or_else(|| {
+                                    imported_image.as_ref().and_then(|image| image.user.clone())
+                                }),
                                 entrypoint: params.entrypoint.clone(),
                                 cmd: params.cmd.clone(),
                                 ssh_agent: self.ssh_agent || params.ssh_agent,
                                 egress_policy_hosts: params.egress_policy_hosts.clone(),
+                                source_imported_image: imported_image
+                                    .as_ref()
+                                    .map(|image| image.key.clone()),
                             }),
                         );
                     }
@@ -725,10 +750,12 @@ impl RunCmd {
                                 env: parse_env_list(&params.env),
                                 workdir: params.workdir.clone(),
                                 image: None,
+                                image_user: None,
                                 entrypoint: params.entrypoint.clone(),
                                 cmd: params.cmd.clone(),
                                 ssh_agent: self.ssh_agent || params.ssh_agent,
                                 egress_policy_hosts: params.egress_policy_hosts.clone(),
+                                source_imported_image: None,
                             }),
                         );
                     }
@@ -892,6 +919,10 @@ impl ExecCmd {
                 &configured_env,
                 workdir.as_deref(),
             );
+            let user = defaults
+                .user
+                .clone()
+                .or_else(|| record.as_ref().and_then(|r| r.image_user.clone()));
             // Image-based machine: exec inside the image's rootfs via crun.
             // Use machine name as persistent overlay ID so filesystem changes
             // (e.g. package installs) survive across exec sessions.
@@ -900,7 +931,7 @@ impl ExecCmd {
                 let config = smolvm::agent::RunConfig::new(image, self.command.clone())
                     .with_env(defaults.env.clone())
                     .with_workdir(defaults.workdir.clone())
-                    .with_user(defaults.user.clone())
+                    .with_user(user.clone())
                     .with_mounts(mount_bindings.clone())
                     .with_timeout(self.timeout)
                     .with_persistent_overlay(Some(machine_name.clone()));
@@ -915,7 +946,7 @@ impl ExecCmd {
                 let config = smolvm::agent::RunConfig::new(image, self.command.clone())
                     .with_env(defaults.env.clone())
                     .with_workdir(defaults.workdir.clone())
-                    .with_user(defaults.user.clone())
+                    .with_user(user.clone())
                     .with_mounts(mount_bindings)
                     .with_timeout(self.timeout)
                     .with_tty(self.tty)
@@ -927,7 +958,7 @@ impl ExecCmd {
             let config = smolvm::agent::RunConfig::new(image, self.command.clone())
                 .with_env(defaults.env)
                 .with_workdir(defaults.workdir)
-                .with_user(defaults.user)
+                .with_user(user)
                 .with_mounts(mount_bindings)
                 .with_timeout(self.timeout)
                 .with_persistent_overlay(Some(machine_name));
@@ -1233,6 +1264,7 @@ impl CreateCmd {
             gpu: manifest.gpu,
             gpu_vram_mib: None,
             source_smolmachine: Some(canonical_path),
+            image_user: manifest.user,
         };
 
         vm_common::create_vm(params)

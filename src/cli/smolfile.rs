@@ -86,6 +86,7 @@ pub fn build_create_params(
                 gpu_vram_mib: None,
                 egress_policy_hosts: None,
                 source_smolmachine: None,
+                image_user: None,
             });
         }
     };
@@ -279,6 +280,7 @@ pub fn build_create_params(
             Some(sf_allow_hosts)
         },
         source_smolmachine: None,
+        image_user: None,
     })
 }
 

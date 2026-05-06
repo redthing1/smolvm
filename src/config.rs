@@ -413,6 +413,10 @@ pub struct VmRecord {
     #[serde(default)]
     pub image: Option<String>,
 
+    /// Default image user, usually from OCI image config.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_user: Option<String>,
+
     /// Entrypoint for the container.
     #[serde(default)]
     pub entrypoint: Vec<String>,
@@ -458,6 +462,12 @@ pub struct VmRecord {
     /// them via virtiofs instead of pulling the image from a registry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_smolmachine: Option<String>,
+
+    /// Imported-image store key this machine was created from.
+    /// When set, `machine start` mounts that local image entry instead of
+    /// pulling the image from a registry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_imported_image: Option<String>,
 }
 
 fn default_cpus() -> u8 {
@@ -501,6 +511,7 @@ impl VmRecord {
             allowed_cidrs: None,
             network_backend: None,
             image: None,
+            image_user: None,
             entrypoint: Vec::new(),
             cmd: Vec::new(),
             health_cmd: None,
@@ -512,6 +523,7 @@ impl VmRecord {
             egress_policy_hosts: None,
             ephemeral: false,
             source_smolmachine: None,
+            source_imported_image: None,
         }
     }
 
@@ -548,6 +560,7 @@ impl VmRecord {
             allowed_cidrs: None,
             network_backend: None,
             image: None,
+            image_user: None,
             entrypoint: Vec::new(),
             cmd: Vec::new(),
             health_cmd: None,
@@ -559,6 +572,7 @@ impl VmRecord {
             egress_policy_hosts: None,
             ephemeral: false,
             source_smolmachine: None,
+            source_imported_image: None,
         }
     }
 

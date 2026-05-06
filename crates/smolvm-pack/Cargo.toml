@@ -12,6 +12,7 @@ thiserror = { workspace = true }
 tar = "0.4"
 zstd = "0.13"
 crc32fast = "1.4"
+flate2 = "1"
 tempfile = "3"
 sha2 = "0.10"
 dirs = "5"

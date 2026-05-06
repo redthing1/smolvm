@@ -136,7 +136,9 @@ pub struct SignatureInfo {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "macos")]
     use super::*;
+    #[cfg(target_os = "macos")]
     use std::io::Write;
 
     #[test]

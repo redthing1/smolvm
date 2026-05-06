@@ -19,6 +19,7 @@ use smolvm::platform::{Arch, Os, Platform, VmExecutor};
 use smolvm::Error;
 use smolvm_pack::assets::AssetCollector;
 use smolvm_pack::format::{PackManifest, PackMode};
+use smolvm_pack::oci_archive::import_oci_archive;
 use smolvm_pack::packer::Packer;
 use smolvm_pack::signing::sign_with_hypervisor_entitlements;
 use smolvm_protocol::AgentResponse;
@@ -81,14 +82,25 @@ pub struct PackCreateCmd {
         long,
         short = 'I',
         value_name = "IMAGE",
-        required_unless_present_any = ["from_vm", "smolfile"],
-        conflicts_with = "from_vm"
+        required_unless_present_any = ["from_vm", "smolfile", "oci_archive"],
+        conflicts_with_all = ["from_vm", "oci_archive"]
     )]
     pub image: Option<String>,
 
     /// Pack from a stopped VM snapshot instead of an OCI image
-    #[arg(long = "from-vm", value_name = "VM_NAME")]
+    #[arg(
+        long = "from-vm",
+        value_name = "VM_NAME",
+        conflicts_with = "oci_archive"
+    )]
     pub from_vm: Option<String>,
+
+    /// Pack from a local OCI image archive.
+    ///
+    /// For local Podman images, create one with:
+    /// `podman save --format oci-archive --uncompressed -o image.oci.tar IMAGE`
+    #[arg(long = "oci-archive", value_name = "PATH")]
+    pub oci_archive: Option<PathBuf>,
 
     /// Output file path for the packed binary
     #[arg(short = 'o', long, value_name = "PATH")]
@@ -158,9 +170,13 @@ impl PackCreateCmd {
             info!(vm = %vm_name, output = %self.output.display(), "packing from VM");
             return self.pack_from_vm(vm_name);
         }
+        if let Some(ref archive_path) = self.oci_archive {
+            info!(archive = %archive_path.display(), output = %self.output.display(), "packing OCI archive");
+            return self.pack_from_oci_archive(archive_path);
+        }
 
         // Resolve config from Smolfile + CLI
-        let pack_config = crate::cli::smolfile::resolve_pack_config(
+        let mut pack_config = crate::cli::smolfile::resolve_pack_config(
             self.image.clone(),
             self.entrypoint.clone(),
             self.cpus,
@@ -170,7 +186,7 @@ impl PackCreateCmd {
             self.smolfile.clone(),
         )?;
 
-        let image = pack_config.image.ok_or_else(|| {
+        let image = pack_config.image.take().ok_or_else(|| {
             Error::config(
                 "pack create",
                 "no image specified. Provide IMAGE argument or set 'image' in Smolfile",
@@ -415,34 +431,72 @@ impl PackCreateCmd {
         manifest.cmd = image_info.cmd.clone();
         manifest.env = image_info.env.clone();
         manifest.workdir = image_info.workdir.clone();
+        manifest.user = image_info.user.clone();
 
-        // Layer Smolfile top-level env on top of image env
-        if !pack_config.env.is_empty() {
-            for e in &pack_config.env {
-                if let Some((key, _)) = e.split_once('=') {
-                    // Remove any existing image env with the same key
-                    manifest
-                        .env
-                        .retain(|existing| !existing.starts_with(&format!("{}=", key)));
-                }
-                manifest.env.push(e.clone());
-            }
+        apply_pack_config_overrides(&mut manifest, pack_config);
+
+        self.finalize_pack(manifest, collector, staging_dir)
+    }
+
+    /// Pack from a local OCI archive.
+    fn pack_from_oci_archive(&self, archive_path: &std::path::Path) -> smolvm::Result<()> {
+        if !archive_path.is_file() {
+            return Err(Error::config(
+                "pack OCI archive",
+                format!("file not found: {}", archive_path.display()),
+            ));
         }
 
-        // Smolfile workdir overrides image workdir
-        if pack_config.workdir.is_some() {
-            manifest.workdir = pack_config.workdir;
-        }
+        let pack_config = crate::cli::smolfile::resolve_pack_config(
+            None,
+            self.entrypoint.clone(),
+            self.cpus,
+            self.mem,
+            self.oci_platform.clone(),
+            self.gpu,
+            self.smolfile.clone(),
+        )?;
 
-        // Override entrypoint from Smolfile or CLI
-        if !pack_config.entrypoint.is_empty() {
-            manifest.entrypoint = pack_config.entrypoint;
-        }
+        let temp_dir = tempfile::tempdir()
+            .map_err(|e| Error::agent("create temp directory", e.to_string()))?;
+        let staging_dir = temp_dir.path().join("staging");
+        let archive_work_dir = temp_dir.path().join("oci-work");
 
-        // Override cmd from Smolfile
-        if !pack_config.cmd.is_empty() {
-            manifest.cmd = pack_config.cmd;
-        }
+        let image = import_oci_archive(
+            archive_path,
+            &archive_work_dir,
+            pack_config.oci_platform.as_deref(),
+        )
+        .map_err(|e| Error::agent("import OCI archive", e.to_string()))?;
+
+        println!(
+            "Image: {} (merged layer, {} bytes)",
+            image.reference, image.size
+        );
+
+        let mut collector = AssetCollector::new(staging_dir.clone())
+            .map_err(|e| Error::agent("collect assets", e.to_string()))?;
+        self.collect_base_assets(&mut collector)?;
+        collector
+            .add_layer_from_file(&image.layer_digest, &image.layer_path)
+            .map_err(|e| Error::agent("collect layers", e.to_string()))?;
+
+        let platform = format!("{}/{}", image.os, image.architecture);
+        let host_platform = Platform::current().host_oci_platform().to_string();
+        let mut manifest =
+            PackManifest::new(image.reference, image.digest, platform, host_platform);
+        manifest.image_size = image.size;
+        manifest.cpus = pack_config.cpus;
+        manifest.mem = pack_config.mem;
+        manifest.network = pack_config.net.unwrap_or(false);
+        manifest.gpu = pack_config.gpu;
+        manifest.entrypoint = image.entrypoint;
+        manifest.cmd = image.cmd;
+        manifest.env = image.env;
+        manifest.workdir = image.workdir;
+        manifest.user = image.user;
+
+        apply_pack_config_overrides(&mut manifest, pack_config);
 
         self.finalize_pack(manifest, collector, staging_dir)
     }
@@ -701,33 +755,9 @@ impl PackCreateCmd {
         // Start with VmRecord env/workdir as baseline
         manifest.env = vm.env.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
         manifest.workdir = vm.workdir.clone();
+        manifest.user = vm.image_user.clone();
 
-        // Layer Smolfile env on top of VmRecord env
-        if !pack_config.env.is_empty() {
-            for e in &pack_config.env {
-                if let Some((key, _)) = e.split_once('=') {
-                    manifest
-                        .env
-                        .retain(|existing| !existing.starts_with(&format!("{}=", key)));
-                }
-                manifest.env.push(e.clone());
-            }
-        }
-
-        // Smolfile workdir overrides VmRecord workdir
-        if pack_config.workdir.is_some() {
-            manifest.workdir = pack_config.workdir;
-        }
-
-        // Override entrypoint from Smolfile/[artifact] or CLI
-        if !pack_config.entrypoint.is_empty() {
-            manifest.entrypoint = pack_config.entrypoint;
-        }
-
-        // Override cmd from Smolfile/[artifact]
-        if !pack_config.cmd.is_empty() {
-            manifest.cmd = pack_config.cmd;
-        }
+        apply_pack_config_overrides(&mut manifest, pack_config);
 
         self.finalize_pack(manifest, collector, staging_dir)
     }
@@ -860,6 +890,7 @@ impl PackCreateCmd {
             // Source tree dev builds: <exe_dir>/../../lib/linux-<arch>/
             std::env::current_exe().ok().and_then(|p| {
                 p.parent()
+                    .and_then(|d| d.parent())
                     .and_then(|d| d.parent())
                     .map(|d| d.join(&platform_lib))
             }),
@@ -1252,6 +1283,31 @@ impl PackPruneCmd {
         }
 
         Ok((freed, removed))
+    }
+}
+
+fn apply_pack_config_overrides(
+    manifest: &mut PackManifest,
+    pack_config: crate::cli::smolfile::PackConfig,
+) {
+    for env in pack_config.env {
+        if let Some((key, _)) = env.split_once('=') {
+            let prefix = format!("{}=", key);
+            manifest
+                .env
+                .retain(|existing| !existing.starts_with(&prefix));
+        }
+        manifest.env.push(env);
+    }
+
+    if let Some(workdir) = pack_config.workdir {
+        manifest.workdir = Some(workdir);
+    }
+    if !pack_config.entrypoint.is_empty() {
+        manifest.entrypoint = pack_config.entrypoint;
+    }
+    if !pack_config.cmd.is_empty() {
+        manifest.cmd = pack_config.cmd;
     }
 }
 

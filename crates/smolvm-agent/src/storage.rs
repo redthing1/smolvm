@@ -14,6 +14,7 @@ use crate::paths;
 use crate::process::{WaitResult, TIMEOUT_EXIT_CODE};
 use smolvm_network::guest_env;
 use smolvm_protocol::{ImageInfo, OverlayInfo, RegistryAuth, StorageStatus};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
@@ -27,6 +28,7 @@ const LAYERS_DIR: &str = "layers";
 const CONFIGS_DIR: &str = "configs";
 const MANIFESTS_DIR: &str = "manifests";
 const OVERLAYS_DIR: &str = "overlays";
+const PACKED_IMAGE_METADATA: &str = ".smolvm-image.json";
 const WORKSPACE_DIR: &str = "workspace";
 const DOCKER_HUB_AUTH_CONFIG_KEY: &str = "https://index.docker.io/v1/";
 const DOCKER_HUB_REGISTRY_ALIASES: &[&str] = &["docker.io", "index.docker.io"];
@@ -90,6 +92,25 @@ fn validate_storage_id(value: &str, context: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+pub(crate) fn ensure_shared_workspace_permissions(path: &Path) -> Result<()> {
+    let metadata = std::fs::metadata(path).map_err(|e| StorageError::ReadFile {
+        path: path.display().to_string(),
+        cause: e.to_string(),
+    })?;
+    let current_mode = metadata.permissions().mode() & 0o7777;
+    let desired_mode = 0o1777;
+    if current_mode == desired_mode {
+        return Ok(());
+    }
+
+    let mut permissions = metadata.permissions();
+    permissions.set_mode(desired_mode);
+    std::fs::set_permissions(path, permissions).map_err(|e| StorageError::WriteFile {
+        path: path.display().to_string(),
+        cause: e.to_string(),
+    })
 }
 
 fn overlay_root_for_workload(workload_id: &str) -> Result<PathBuf> {
@@ -359,6 +380,11 @@ pub fn init_volume_mounts() -> &'static [(String, String, bool)] {
 /// Create a synthetic ImageInfo from packed layers.
 /// This is used when running from a packed binary where layers are pre-extracted.
 fn create_packed_image_info(image: &str, packed_dir: &Path) -> Result<ImageInfo> {
+    if let Some(mut info) = read_packed_image_metadata(packed_dir)? {
+        info.reference = image.to_string();
+        return Ok(info);
+    }
+
     // Find all layer directories in packed_dir
     let mut layer_dirs: Vec<String> = Vec::new();
 
@@ -415,6 +441,18 @@ fn create_packed_image_info(image: &str, packed_dir: &Path) -> Result<ImageInfo>
         workdir: None,
         user: None,
     })
+}
+
+fn read_packed_image_metadata(packed_dir: &Path) -> Result<Option<ImageInfo>> {
+    let metadata_path = packed_dir.join(PACKED_IMAGE_METADATA);
+    if !metadata_path.is_file() {
+        return Ok(None);
+    }
+    let text = std::fs::read_to_string(&metadata_path)
+        .map_err(|e| StorageError::read_error(metadata_path.display().to_string(), e))?;
+    let info = serde_json::from_str(&text)
+        .map_err(|e| StorageError::parse_error(PACKED_IMAGE_METADATA, e))?;
+    Ok(Some(info))
 }
 
 /// Error type for storage operations.
@@ -775,6 +813,20 @@ pub fn init() -> Result<()> {
         }
     }
 
+    let workspace_path = root.join(WORKSPACE_DIR);
+    if !workspace_path.exists() {
+        std::fs::create_dir_all(&workspace_path).map_err(|e| {
+            StorageError::new(format!(
+                "failed to create shared workspace directory '{}': {}",
+                workspace_path.display(),
+                e
+            ))
+        })?;
+        debug!(path = %workspace_path.display(), "created shared workspace directory");
+        created_count += 1;
+    }
+    ensure_shared_workspace_permissions(&workspace_path)?;
+
     // Check for marker file to see if formatted
     let marker = root.join(".smolvm_formatted");
     if !marker.exists() {
@@ -788,10 +840,6 @@ pub fn init() -> Result<()> {
         (CONFIGS_DIR, "image configurations"),
         (MANIFESTS_DIR, "image manifests"),
         (OVERLAYS_DIR, "overlay filesystems"),
-        (
-            WORKSPACE_DIR,
-            "shared workspace (visible inside containers)",
-        ),
     ];
 
     for (dir, description) in &required_dirs {
@@ -842,6 +890,7 @@ pub fn format() -> Result<()> {
         (root.join(CONFIGS_DIR), "configs"),
         (root.join(MANIFESTS_DIR), "manifests"),
         (root.join(OVERLAYS_DIR), "overlays"),
+        (root.join(WORKSPACE_DIR), "workspace"),
         (PathBuf::from(paths::CONTAINERS_RUN_DIR), "container run"),
         (PathBuf::from(paths::CONTAINERS_LOGS_DIR), "container logs"),
         (PathBuf::from(paths::CONTAINERS_EXIT_DIR), "container exit"),
@@ -858,6 +907,7 @@ pub fn format() -> Result<()> {
             ))
         })?;
     }
+    ensure_shared_workspace_permissions(&root.join(WORKSPACE_DIR))?;
 
     // Create marker file
     let marker = root.join(".smolvm_formatted");
@@ -1211,6 +1261,11 @@ where
 
 /// Query if an image exists locally.
 pub fn query_image(image: &str) -> Result<Option<ImageInfo>> {
+    if let Some(packed_dir) = get_packed_layers_dir() {
+        info!(image = %image, "using packed layers for image query");
+        return create_packed_image_info(image, packed_dir).map(Some);
+    }
+
     let root = Path::new(STORAGE_ROOT);
     let manifest_path = root
         .join(MANIFESTS_DIR)
@@ -1813,24 +1868,7 @@ fn prepare_overlay_from_packed(
     workload_id: &str,
     packed_dir: &Path,
 ) -> Result<OverlayInfo> {
-    // Find layer directories in packed_dir
-    // Packed layers are named by short digest (first 12 chars of sha256)
-    let mut layer_dirs: Vec<PathBuf> = Vec::new();
-
-    let entries = std::fs::read_dir(packed_dir)
-        .map_err(|e| StorageError::read_error(packed_dir.display().to_string(), e))?;
-
-    for entry in entries {
-        let entry: std::fs::DirEntry = entry?;
-        let path = entry.path();
-        if path.is_dir() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            // Skip .tar files, only use directories
-            if !name.ends_with(".tar") {
-                layer_dirs.push(path);
-            }
-        }
-    }
+    let layer_dirs = packed_layer_dirs(packed_dir)?;
 
     if layer_dirs.is_empty() {
         return Err(StorageError::new(format!(
@@ -1845,10 +1883,6 @@ fn prepare_overlay_from_packed(
         layers = ?layer_dirs.iter().map(|p| p.file_name().unwrap_or_default().to_string_lossy().to_string()).collect::<Vec<_>>(),
         "found packed layers"
     );
-
-    // Sort layer directories by name for consistent ordering
-    // The stub creates layers in order, so alphabetical sort should work
-    layer_dirs.sort();
 
     // Build lowerdir from layers (reversed for overlay order - top layer first)
     let lowerdirs: Vec<String> = layer_dirs
@@ -1880,6 +1914,37 @@ fn get_image_lowerdirs(image: &str) -> Result<Vec<String>> {
 
 /// Build lowerdir list from pre-packed layer directories.
 fn get_packed_lowerdirs(packed_dir: &Path) -> Result<Vec<String>> {
+    let layer_dirs = packed_layer_dirs(packed_dir)?;
+    if layer_dirs.is_empty() {
+        return Err(StorageError::new(format!(
+            "no layer directories found in {}",
+            packed_dir.display()
+        )));
+    }
+
+    Ok(layer_dirs
+        .iter()
+        .rev()
+        .map(|path| path.display().to_string())
+        .collect())
+}
+
+fn packed_layer_dirs(packed_dir: &Path) -> Result<Vec<PathBuf>> {
+    if let Some(info) = read_packed_image_metadata(packed_dir)? {
+        let dirs = info
+            .layers
+            .iter()
+            .map(|digest| {
+                let id = digest.strip_prefix("sha256:").unwrap_or(digest);
+                packed_dir.join(id)
+            })
+            .filter(|path| path.is_dir())
+            .collect::<Vec<_>>();
+        if !dirs.is_empty() {
+            return Ok(dirs);
+        }
+    }
+
     let mut layer_dirs: Vec<PathBuf> = Vec::new();
 
     let entries = std::fs::read_dir(packed_dir)
@@ -1896,19 +1961,8 @@ fn get_packed_lowerdirs(packed_dir: &Path) -> Result<Vec<String>> {
         }
     }
 
-    if layer_dirs.is_empty() {
-        return Err(StorageError::new(format!(
-            "no layer directories found in {}",
-            packed_dir.display()
-        )));
-    }
-
     layer_dirs.sort();
-    Ok(layer_dirs
-        .iter()
-        .rev()
-        .map(|path| path.display().to_string())
-        .collect())
+    Ok(layer_dirs)
 }
 
 /// Clean up an overlay filesystem.
@@ -3011,6 +3065,19 @@ mod tests {
     fn test_validate_storage_id_rejects_traversal() {
         assert!(validate_storage_id("../escape", "workload_id").is_err());
         assert!(validate_storage_id("foo/bar", "workload_id").is_err());
+    }
+
+    #[test]
+    fn test_shared_workspace_permissions_are_world_writable_sticky() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::set_permissions(&workspace, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        ensure_shared_workspace_permissions(&workspace).unwrap();
+
+        let mode = std::fs::metadata(&workspace).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o1777);
     }
 
     #[test]

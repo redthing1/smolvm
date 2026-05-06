@@ -1128,6 +1128,7 @@ fn is_mounted_at(mount_point: &str) -> bool {
 
 /// Create required subdirectories under the storage mount point.
 fn create_storage_dirs(mount_point: &str) {
+    let mount_point = std::path::Path::new(mount_point);
     let dirs = [
         "layers",
         "configs",
@@ -1140,7 +1141,10 @@ fn create_storage_dirs(mount_point: &str) {
         "containers/crun",
     ];
     for dir in dirs {
-        let _ = std::fs::create_dir_all(std::path::Path::new(mount_point).join(dir));
+        let _ = std::fs::create_dir_all(mount_point.join(dir));
+    }
+    if let Err(err) = storage::ensure_shared_workspace_permissions(&mount_point.join("workspace")) {
+        warn!(error = %err, "failed to set shared workspace permissions");
     }
 }
 

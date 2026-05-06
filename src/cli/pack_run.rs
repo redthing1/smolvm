@@ -747,6 +747,7 @@ fn execute_packed_command(
                 let config = RunConfig::new(&manifest.image, command)
                     .with_env(env)
                     .with_workdir(workdir)
+                    .with_user(manifest.user.clone())
                     .with_mounts(mount_bindings)
                     .with_timeout(timeout)
                     .with_tty(tty)
@@ -756,6 +757,7 @@ fn execute_packed_command(
                 let config = RunConfig::new(&manifest.image, command)
                     .with_env(env)
                     .with_workdir(workdir)
+                    .with_user(manifest.user.clone())
                     .with_mounts(mount_bindings)
                     .with_timeout(timeout)
                     .with_persistent_overlay(persistent_overlay_id);

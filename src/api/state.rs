@@ -54,6 +54,8 @@ pub struct MachineRegistration {
     pub network: bool,
     /// OCI image reference (e.g., "alpine:latest").
     pub image: Option<String>,
+    /// Default image user from OCI image config.
+    pub image_user: Option<String>,
     /// Path to .smolmachine sidecar this machine was created from.
     pub source_smolmachine: Option<String>,
     /// Container entrypoint (from manifest).
@@ -468,6 +470,7 @@ impl ApiState {
         record.storage_gb = reg.resources.storage_gb;
         record.overlay_gb = reg.resources.overlay_gb;
         record.image = reg.image;
+        record.image_user = reg.image_user;
         record.source_smolmachine = reg.source_smolmachine;
         record.entrypoint = reg.entrypoint;
         record.cmd = reg.cmd;

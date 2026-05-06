@@ -349,6 +349,10 @@ pub struct PackManifest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workdir: Option<String>,
 
+    /// Default user from image config.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+
     /// Default number of vCPUs.
     pub cpus: u8,
 
@@ -448,6 +452,7 @@ impl PackManifest {
             cmd: Vec::new(),
             env: Vec::new(),
             workdir: None,
+            user: None,
             cpus: 1,
             mem: 256,
             image_size: 0,

@@ -12,6 +12,7 @@ use smolvm::data::resources::{DEFAULT_MICROVM_CPU_COUNT, DEFAULT_MICROVM_MEMORY_
 use smolvm::data::storage::HostMount;
 use smolvm::data::validate_vm_name;
 use smolvm::db::SmolvmDb;
+use smolvm::image_store::{ImageStore, ImportedImageRecord};
 use smolvm::network::NetworkBackend;
 use smolvm::storage::{DEFAULT_OVERLAY_SIZE_GIB, DEFAULT_STORAGE_SIZE_GIB};
 use smolvm_protocol::ImageInfo;
@@ -50,6 +51,60 @@ pub fn get_vm_manager(name: &Option<String>) -> smolvm::Result<AgentManager> {
     } else {
         AgentManager::new_default()
     }
+}
+
+/// Resolve an image reference against the host-local imported-image store.
+pub(crate) fn resolve_imported_image(
+    image: Option<&str>,
+) -> smolvm::Result<Option<ImportedImageRecord>> {
+    match image {
+        Some(image) => ImageStore::open()?.resolve(image),
+        None => Ok(None),
+    }
+}
+
+fn resolve_imported_image_for_record(
+    image: &Option<String>,
+    source_smolmachine: &Option<String>,
+) -> smolvm::Result<Option<ImportedImageRecord>> {
+    if source_smolmachine.is_some() {
+        return Ok(None);
+    }
+    resolve_imported_image(image.as_deref())
+}
+
+/// Load image metadata, pulling only when the image is not already mounted as
+/// pre-extracted local layers.
+pub(crate) fn load_image_info(
+    client: &mut smolvm::agent::AgentClient,
+    image: &str,
+    oci_platform: Option<&str>,
+    preloaded: bool,
+) -> smolvm::Result<ImageInfo> {
+    if preloaded {
+        return client.query(image)?.ok_or_else(|| {
+            smolvm::Error::agent(
+                "query image",
+                format!("preloaded image metadata not found: {}", image),
+            )
+        });
+    }
+    crate::cli::pull_with_progress(client, image, oci_platform)
+}
+
+fn load_record_image_info(
+    client: &mut smolvm::agent::AgentClient,
+    record: &VmRecord,
+) -> smolvm::Result<Option<ImageInfo>> {
+    let Some(image) = record.image.as_deref() else {
+        return Ok(None);
+    };
+    let preloaded = record.source_smolmachine.is_some() || record.source_imported_image.is_some();
+    let mut info = load_image_info(client, image, None, preloaded)?;
+    if info.user.is_none() {
+        info.user = record.image_user.clone();
+    }
+    Ok(Some(info))
 }
 
 /// Return the display label for an optional VM name.
@@ -408,6 +463,8 @@ pub struct CreateVmParams {
     pub egress_policy_hosts: Option<Vec<String>>,
     /// Absolute path to .smolmachine sidecar (for machines created with --from).
     pub source_smolmachine: Option<String>,
+    /// Default image user from OCI image config or .smolmachine manifest.
+    pub image_user: Option<String>,
 }
 
 /// Create a named machine configuration (does not start it).
@@ -450,6 +507,8 @@ pub fn create_vm(params: CreateVmParams) -> smolvm::Result<()> {
         max_backoff_secs: params.restart_max_backoff_secs.unwrap_or(0),
         ..Default::default()
     };
+    let imported_image =
+        resolve_imported_image_for_record(&params.image, &params.source_smolmachine)?;
     let mut record = VmRecord::new_with_restart(
         params.name.clone(),
         params.cpus,
@@ -473,8 +532,26 @@ pub fn create_vm(params: CreateVmParams) -> smolvm::Result<()> {
     record.gpu_vram_mib = smolvm::data::resources::validate_gpu_vram_mib(params.gpu_vram_mib)
         .map_err(|e| smolvm::Error::config("create machine", format!("gpu_vram: {}", e)))?;
     record.image = params.image.clone();
-    record.entrypoint = params.entrypoint.clone();
-    record.cmd = params.cmd.clone();
+    record.image_user = params
+        .image_user
+        .clone()
+        .or_else(|| imported_image.as_ref().and_then(|image| image.user.clone()));
+    record.entrypoint = if params.entrypoint.is_empty() {
+        imported_image
+            .as_ref()
+            .map(|image| image.entrypoint.clone())
+            .unwrap_or_default()
+    } else {
+        params.entrypoint.clone()
+    };
+    record.cmd = if params.cmd.is_empty() {
+        imported_image
+            .as_ref()
+            .map(|image| image.cmd.clone())
+            .unwrap_or_default()
+    } else {
+        params.cmd.clone()
+    };
     record.health_cmd = params.health_cmd.clone();
     record.health_interval_secs = params.health_interval_secs;
     record.health_timeout_secs = params.health_timeout_secs;
@@ -483,6 +560,7 @@ pub fn create_vm(params: CreateVmParams) -> smolvm::Result<()> {
     record.ssh_agent = params.ssh_agent;
     record.egress_policy_hosts = params.egress_policy_hosts.clone();
     record.source_smolmachine = params.source_smolmachine.clone();
+    record.source_imported_image = imported_image.map(|image| image.key);
 
     // Store in config (persisted immediately to database)
     config.insert_vm(params.name.clone(), record)?;
@@ -622,9 +700,7 @@ pub fn start_vm_named(name: &str) -> smolvm::Result<()> {
         extra_disks: Vec::new(),
     };
 
-    // If machine was created from .smolmachine, extract layers to cache and
-    // mount via virtiofs so the agent uses pre-extracted layers instead of
-    // pulling from a registry.
+    // Mount pre-extracted layers for machines created from local artifacts.
     if let Some(ref sidecar_path) = record.source_smolmachine {
         let sidecar = std::path::Path::new(sidecar_path);
         if !sidecar.exists() {
@@ -648,6 +724,19 @@ pub fn start_vm_named(name: &str) -> smolvm::Result<()> {
         // Leak the lease — the volume must stay mounted while the VM runs.
         // Cleanup happens via `pack prune` or on next `machine start`.
         std::mem::forget(layers_lease);
+    } else if let Some(ref key) = record.source_imported_image {
+        let store = ImageStore::open()?;
+        let layers_dir = store.layers_dir(key);
+        if !layers_dir.is_dir() {
+            return Err(Error::agent(
+                "start machine",
+                format!(
+                    "imported image data not found: {}\nRe-import the image or recreate the machine.",
+                    key
+                ),
+            ));
+        }
+        features.packed_layers_dir = Some(layers_dir);
     }
 
     let _ = manager
@@ -669,15 +758,7 @@ pub fn start_vm_named(name: &str) -> smolvm::Result<()> {
     // would hit the bare Alpine agent and fail with "not found".
     let mut client = smolvm::agent::AgentClient::connect_with_retry(manager.vsock_socket())?;
 
-    let image_info = if record.source_smolmachine.is_some() {
-        // Layers already mounted via virtiofs — no pull needed.
-        None
-    } else if let Some(ref image) = record.image {
-        println!("Pulling {}...", image);
-        Some(crate::cli::pull_with_progress(&mut client, image, None)?)
-    } else {
-        None
-    };
+    let image_info = load_record_image_info(&mut client, &record)?;
 
     // Run init commands if configured (before reporting success).
     // `run_init_commands` branches on image: container path for
@@ -783,10 +864,12 @@ pub fn persist_default_running(
                 r.env = o.env.clone();
                 r.workdir = o.workdir.clone();
                 r.image = o.image.clone();
+                r.image_user = o.image_user.clone();
                 r.entrypoint = o.entrypoint.clone();
                 r.cmd = o.cmd.clone();
                 r.ssh_agent = o.ssh_agent;
                 r.egress_policy_hosts = o.egress_policy_hosts.clone();
+                r.source_imported_image = o.source_imported_image.clone();
             }
         })
         .is_none()
@@ -810,10 +893,12 @@ pub struct DefaultVmOverrides {
     pub env: Vec<(String, String)>,
     pub workdir: Option<String>,
     pub image: Option<String>,
+    pub image_user: Option<String>,
     pub entrypoint: Vec<String>,
     pub cmd: Vec<String>,
     pub ssh_agent: bool,
     pub egress_policy_hosts: Option<Vec<String>>,
+    pub source_imported_image: Option<String>,
 }
 
 /// Check if any running VM already binds to the same host ports.
@@ -891,12 +976,7 @@ pub fn start_vm_default() -> smolvm::Result<()> {
             let mut client =
                 smolvm::agent::AgentClient::connect_with_retry(manager.vsock_socket())?;
 
-            let image_info = if let Some(ref image) = record.image {
-                println!("Pulling {}...", image);
-                Some(crate::cli::pull_with_progress(&mut client, image, None)?)
-            } else {
-                None
-            };
+            let image_info = load_record_image_info(&mut client, &record)?;
 
             if let Err(e) = run_init_commands(
                 &mut client,
