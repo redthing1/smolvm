@@ -5,5 +5,8 @@
 //! prepared paths and platform-specific enforcement behind this boundary.
 
 pub mod audit;
+pub mod hardening;
+#[cfg(target_os = "linux")]
+mod linux;
 pub mod policy;
 pub mod prepare;

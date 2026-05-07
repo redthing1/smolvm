@@ -80,6 +80,21 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
         smolvm::process::exit_child(1);
     }
 
+    let hardening_report = match smolvm::security::hardening::apply_runner_baseline() {
+        Ok(report) => report,
+        Err(e) => {
+            let _ = std::fs::write(
+                &prepared.policy.startup_error_log,
+                format!("failed to apply runner hardening: {}", e),
+            );
+            smolvm::process::exit_child(1);
+        }
+    };
+    tracing::debug!(
+        hardening = %hardening_report.render_text(),
+        "applied runner hardening baseline"
+    );
+
     // Open storage and overlay disks
     let storage_disk = match smolvm::storage::StorageDisk::open_or_create_at(
         &prepared.policy.storage_disk_path,
