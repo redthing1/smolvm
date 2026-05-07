@@ -1351,7 +1351,7 @@ impl DeleteCmd {
             &self.name,
             self.force,
             DeleteVmOptions {
-                stop_if_running: false,
+                stop_if_running: true,
             },
         )
     }
