@@ -543,6 +543,39 @@ pub enum ForkResult {
     Child,
 }
 
+/// Close inherited file descriptors from `start` upward.
+///
+/// VM launcher children must not keep parent database handles, sockets, pipes,
+/// or directory descriptors alive. Keep the start descriptor explicit so call
+/// sites document which descriptors are intentionally preserved.
+pub fn close_inherited_fds_from(start: i32) -> std::io::Result<()> {
+    if start < 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "start fd must be non-negative",
+        ));
+    }
+
+    unsafe {
+        #[cfg(target_os = "linux")]
+        {
+            // Linux 5.9+: close the range in one syscall. Fall back to the
+            // portable loop for older kernels or constrained environments.
+            let ret = libc::syscall(libc::SYS_close_range, start as u32, u32::MAX, 0u32);
+            if ret == 0 {
+                return Ok(());
+            }
+        }
+
+        let max_fd = libc::getdtablesize();
+        for fd in start..max_fd {
+            libc::close(fd);
+        }
+    }
+
+    Ok(())
+}
+
 /// Fork a child process that becomes a session leader.
 ///
 /// This function provides a safe interface to fork a child process and
@@ -603,30 +636,7 @@ where
             // database locks, sockets, and other resources. Keep stdin(0),
             // stdout(1), stderr(2) for error output during child setup.
             // The child opens fresh fds for everything it needs.
-            unsafe {
-                #[cfg(target_os = "linux")]
-                {
-                    // Use close_range() (Linux 5.9+) for O(1) fd closure instead
-                    // of iterating through potentially 500K+ fds one at a time.
-                    let ret = libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, 0u32);
-                    if ret != 0 {
-                        // Fallback for older kernels
-                        let max_fd = libc::getdtablesize();
-                        for fd in 3..max_fd {
-                            libc::close(fd);
-                        }
-                    }
-                }
-                #[cfg(not(target_os = "linux"))]
-                {
-                    // macOS: no close_range syscall, but getdtablesize() is
-                    // typically small (e.g. 1024) so iteration is fast.
-                    let max_fd = libc::getdtablesize();
-                    for fd in 3..max_fd {
-                        libc::close(fd);
-                    }
-                }
-            }
+            let _ = close_inherited_fds_from(3);
 
             // Run the user-provided closure
             child_fn();
@@ -901,6 +911,18 @@ mod tests {
     fn test_is_alive_nonexistent() {
         // PID 99999999 is unlikely to exist
         assert!(!is_alive(99999999));
+    }
+
+    #[test]
+    fn close_inherited_fds_rejects_negative_start() {
+        let err = close_inherited_fds_from(-1).expect_err("negative start fd must fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn close_inherited_fds_allows_empty_range() {
+        let max_fd = unsafe { libc::getdtablesize() };
+        close_inherited_fds_from(max_fd).expect("empty fd range should be a no-op");
     }
 
     #[test]

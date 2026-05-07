@@ -8,10 +8,12 @@ use crate::error::{Error, Result};
 use crate::process::{self, ChildProcess};
 use crate::storage::{OverlayDisk, StorageDisk};
 use parking_lot::Mutex;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use super::boot_config::BootConfig;
 use super::launcher;
 use super::{HostMount, PortMapping, VmResources};
 
@@ -27,6 +29,10 @@ const AGENT_READY_TIMEOUT: Duration = Duration::from_secs(30);
 /// of the vsock socket to avoid the race where the socket appears (created
 /// by libkrun's muxer thread) before the agent is ready to handle requests.
 const READY_MARKER_FILENAME: &str = ".smolvm-ready";
+
+const BOOT_CONFIG_FILENAME_PREFIX: &str = "boot-config-";
+const BOOT_CONFIG_FILENAME_SUFFIX: &str = ".json";
+const BOOT_CONFIG_CREATE_ATTEMPTS: usize = 16;
 
 // Re-use shared polling constants from process module.
 use crate::process::FAST_POLL_INTERVAL;
@@ -259,6 +265,83 @@ pub fn ensure_vm_dir_at(dir: &std::path::Path, name: &str) -> std::io::Result<Pa
         Err(e) => return Err(e),
     }
     Ok(dir.to_path_buf())
+}
+
+fn boot_config_dir_for_storage_path(storage_path: &Path) -> &Path {
+    storage_path.parent().unwrap_or_else(|| Path::new("/tmp"))
+}
+
+fn write_boot_config_file(dir: &Path, config: &BootConfig) -> Result<PathBuf> {
+    std::fs::create_dir_all(dir).map_err(|e| {
+        Error::agent(
+            "write boot config",
+            format!("create {}: {}", dir.display(), e),
+        )
+    })?;
+
+    let config_json = serde_json::to_vec(config)
+        .map_err(|e| Error::agent("serialize boot config", e.to_string()))?;
+
+    for _ in 0..BOOT_CONFIG_CREATE_ATTEMPTS {
+        let path = dir.join(format!(
+            "{}{}{}",
+            BOOT_CONFIG_FILENAME_PREFIX,
+            crate::util::generate_short_id(),
+            BOOT_CONFIG_FILENAME_SUFFIX
+        ));
+
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+
+        let mut file = match options.open(&path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                return Err(Error::agent(
+                    "write boot config",
+                    format!("{}: {}", path.display(), e),
+                ));
+            }
+        };
+
+        #[cfg(unix)]
+        if let Err(e) = set_owner_only_file_permissions(&file) {
+            let _ = std::fs::remove_file(&path);
+            return Err(Error::agent(
+                "write boot config",
+                format!("chmod {}: {}", path.display(), e),
+            ));
+        }
+
+        if let Err(e) = file.write_all(&config_json) {
+            let _ = std::fs::remove_file(&path);
+            return Err(Error::agent(
+                "write boot config",
+                format!("{}: {}", path.display(), e),
+            ));
+        }
+
+        return Ok(path);
+    }
+
+    Err(Error::agent(
+        "write boot config",
+        format!(
+            "could not allocate a unique boot config filename after {} attempts",
+            BOOT_CONFIG_CREATE_ATTEMPTS
+        ),
+    ))
+}
+
+#[cfg(unix)]
+fn set_owner_only_file_permissions(file: &std::fs::File) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))
 }
 
 /// Agent VM manager.
@@ -1066,8 +1149,6 @@ impl AgentManager {
         resources: VmResources,
         features: launcher::LaunchFeatures,
     ) -> Result<()> {
-        use super::boot_config::BootConfig;
-
         let resources_for_config = resources.clone();
         self.prepare_for_launch(&mounts, &ports, resources)?;
 
@@ -1096,32 +1177,37 @@ impl AgentManager {
             preloaded_image_dir: features.preloaded_image_dir,
             extra_disks: features.extra_disks,
         };
-        let config_path = self
-            .storage_disk
-            .path()
-            .parent()
-            .unwrap_or_else(|| std::path::Path::new("/tmp"))
-            .join("boot-config.json");
-        let config_json = serde_json::to_vec(&config)
-            .map_err(|e| Error::agent("serialize boot config", e.to_string()))?;
-        std::fs::write(&config_path, &config_json)
-            .map_err(|e| Error::agent("write boot config", e.to_string()))?;
+        let config_path = write_boot_config_file(
+            boot_config_dir_for_storage_path(self.storage_disk.path()),
+            &config,
+        )?;
 
         // Spawn fresh subprocess (posix_spawn on macOS — safe for multi-threaded parents)
         let exe = std::env::current_exe()
             .map_err(|e| Error::agent("find smolvm binary", e.to_string()))?;
-        let child = std::process::Command::new(&exe)
-            .args(["_boot-vm", &config_path.to_string_lossy()])
+        let child = match std::process::Command::new(&exe)
+            .arg("_boot-vm")
+            .arg(&config_path)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()
-            .map_err(|e| Error::agent("spawn boot subprocess", e.to_string()))?;
+        {
+            Ok(child) => child,
+            Err(e) => {
+                let _ = std::fs::remove_file(&config_path);
+                return Err(Error::agent("spawn boot subprocess", e.to_string()));
+            }
+        };
 
         let child_pid = child.id() as i32;
         tracing::debug!(pid = child_pid, "spawned boot subprocess");
 
-        self.finalize_launch(child_pid, &mounts, &ports, &resources_for_config)
+        let result = self.finalize_launch(child_pid, &mounts, &ports, &resources_for_config);
+        if result.is_err() {
+            let _ = std::fs::remove_file(&config_path);
+        }
+        result
     }
 
     /// Like `ensure_running_with_full_config` but uses subprocess launch.
@@ -1513,6 +1599,26 @@ impl Drop for AgentManager {
 mod tests {
     use super::*;
 
+    fn sample_boot_config(base: &Path) -> BootConfig {
+        BootConfig {
+            rootfs_path: base.join("rootfs"),
+            storage_disk_path: base.join("storage.img"),
+            overlay_disk_path: base.join("overlay.img"),
+            vsock_socket: base.join("agent.sock"),
+            console_log: Some(base.join("console.log")),
+            startup_error_log: base.join("startup-error.log"),
+            storage_size_gb: 1,
+            overlay_size_gb: 1,
+            mounts: Vec::new(),
+            ports: Vec::new(),
+            resources: VmResources::default(),
+            ssh_agent_socket: None,
+            egress_policy_hosts: None,
+            preloaded_image_dir: None,
+            extra_disks: Vec::new(),
+        }
+    }
+
     #[test]
     fn vm_dir_hash_is_deterministic() {
         // Stability guarantee: the same name always maps to the same hash.
@@ -1612,5 +1718,32 @@ mod tests {
             std::fs::read_to_string(dir.join("name")).unwrap(),
             "first-vm",
         );
+    }
+
+    #[test]
+    fn write_boot_config_file_uses_unique_owner_only_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = sample_boot_config(tmp.path());
+
+        let first = write_boot_config_file(tmp.path(), &config).unwrap();
+        let second = write_boot_config_file(tmp.path(), &config).unwrap();
+
+        assert_ne!(first, second);
+        assert_eq!(first.parent(), Some(tmp.path()));
+        assert_eq!(second.parent(), Some(tmp.path()));
+
+        let parsed: BootConfig = serde_json::from_slice(&std::fs::read(&first).unwrap()).unwrap();
+        assert_eq!(parsed.rootfs_path, config.rootfs_path);
+        assert_eq!(parsed.storage_disk_path, config.storage_disk_path);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let first_mode = std::fs::metadata(&first).unwrap().permissions().mode() & 0o777;
+            let second_mode = std::fs::metadata(&second).unwrap().permissions().mode() & 0o777;
+            assert_eq!(first_mode, 0o600);
+            assert_eq!(second_mode, 0o600);
+        }
     }
 }

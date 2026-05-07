@@ -8,7 +8,8 @@
 
 use smolvm::agent::boot_config::BootConfig;
 use smolvm::agent::{launch_agent_vm, LaunchConfig, VmDisks};
-use std::path::PathBuf;
+use std::io::Read;
+use std::path::{Path, PathBuf};
 
 /// Run the boot subprocess.
 ///
@@ -20,14 +21,7 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
         libc::setsid();
     }
 
-    // Read boot config
-    let config_data = std::fs::read(&config_path)
-        .map_err(|e| smolvm::Error::agent("read boot config", e.to_string()))?;
-    let config: BootConfig = serde_json::from_slice(&config_data)
-        .map_err(|e| smolvm::Error::agent("parse boot config", e.to_string()))?;
-
-    // Clean up the config file — it's no longer needed
-    let _ = std::fs::remove_file(&config_path);
+    let config = read_boot_config(&config_path)?;
 
     let policy = smolvm::security::policy::LaunchPolicy::from_boot_config(config)?;
     let prepared = smolvm::security::prepare::PreparedLaunch::prepare(policy)?;
@@ -46,7 +40,9 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
                     );
                     if fd >= 0 {
                         libc::dup2(fd, 2);
-                        libc::close(fd);
+                        if fd > 2 {
+                            libc::close(fd);
+                        }
                     }
                 }
             }
@@ -57,7 +53,9 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
             if devnull >= 0 {
                 libc::dup2(devnull, 0);
                 libc::dup2(devnull, 1);
-                libc::close(devnull);
+                if devnull > 2 {
+                    libc::close(devnull);
+                }
             }
         }
     } else if let Err(e) =
@@ -74,11 +72,12 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
     // Without this, the subprocess holds database locks, network sockets, etc.
     // that can interfere with libkrun's operation. Keep stdin/stdout/stderr (0-2)
     // which now point to /dev/null.
-    unsafe {
-        let max_fd = libc::getdtablesize();
-        for fd in 3..max_fd {
-            libc::close(fd);
-        }
+    if let Err(e) = smolvm::process::close_inherited_fds_from(3) {
+        let _ = std::fs::write(
+            &prepared.policy.startup_error_log,
+            format!("failed to close inherited file descriptors: {}", e),
+        );
+        smolvm::process::exit_child(1);
     }
 
     // Open storage and overlay disks
@@ -143,4 +142,213 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
     }
 
     smolvm::process::exit_child(1);
+}
+
+fn read_boot_config(path: &Path) -> smolvm::Result<BootConfig> {
+    let path_metadata = std::fs::symlink_metadata(path).map_err(|e| {
+        smolvm::Error::agent("read boot config", format!("{}: {}", path.display(), e))
+    })?;
+    validate_boot_config_metadata(path, &path_metadata)?;
+
+    let mut file = std::fs::File::open(path).map_err(|e| {
+        smolvm::Error::agent("open boot config", format!("{}: {}", path.display(), e))
+    })?;
+    let file_metadata = file.metadata().map_err(|e| {
+        smolvm::Error::agent("stat boot config", format!("{}: {}", path.display(), e))
+    })?;
+    validate_boot_config_metadata(path, &file_metadata)?;
+
+    #[cfg(unix)]
+    ensure_same_boot_config_file(path, &path_metadata, &file_metadata)?;
+
+    let mut config_data = Vec::new();
+    file.read_to_end(&mut config_data).map_err(|e| {
+        smolvm::Error::agent("read boot config", format!("{}: {}", path.display(), e))
+    })?;
+
+    let config: BootConfig = serde_json::from_slice(&config_data)
+        .map_err(|e| smolvm::Error::agent("parse boot config", e.to_string()))?;
+
+    #[cfg(unix)]
+    {
+        let current_metadata = std::fs::symlink_metadata(path).map_err(|e| {
+            smolvm::Error::agent("stat boot config", format!("{}: {}", path.display(), e))
+        })?;
+        ensure_same_boot_config_file(path, &current_metadata, &file_metadata)?;
+    }
+
+    drop(file);
+
+    std::fs::remove_file(path).map_err(|e| {
+        smolvm::Error::agent("remove boot config", format!("{}: {}", path.display(), e))
+    })?;
+
+    Ok(config)
+}
+
+fn validate_boot_config_metadata(path: &Path, metadata: &std::fs::Metadata) -> smolvm::Result<()> {
+    if !metadata.file_type().is_file() {
+        return Err(smolvm::Error::agent(
+            "validate boot config",
+            format!("{} is not a regular file", path.display()),
+        ));
+    }
+
+    #[cfg(unix)]
+    validate_unix_boot_config_metadata(path, metadata)?;
+
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_unix_boot_config_metadata(
+    path: &Path,
+    metadata: &std::fs::Metadata,
+) -> smolvm::Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let mode = metadata.permissions().mode();
+    if mode & 0o077 != 0 {
+        return Err(smolvm::Error::agent(
+            "validate boot config",
+            format!(
+                "{} must not grant group/other access (mode {:03o})",
+                path.display(),
+                mode & 0o777
+            ),
+        ));
+    }
+    if mode & 0o400 == 0 {
+        return Err(smolvm::Error::agent(
+            "validate boot config",
+            format!("{} must be owner-readable", path.display()),
+        ));
+    }
+
+    let euid = unsafe { libc::geteuid() };
+    if metadata.uid() != euid {
+        return Err(smolvm::Error::agent(
+            "validate boot config",
+            format!(
+                "{} is owned by uid {}, expected current euid {}",
+                path.display(),
+                metadata.uid(),
+                euid
+            ),
+        ));
+    }
+
+    Ok(())
+}
+
+#[cfg(unix)]
+fn ensure_same_boot_config_file(
+    path: &Path,
+    expected: &std::fs::Metadata,
+    actual: &std::fs::Metadata,
+) -> smolvm::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    if expected.dev() != actual.dev() || expected.ino() != actual.ino() {
+        return Err(smolvm::Error::agent(
+            "validate boot config",
+            format!("{} changed while being opened", path.display()),
+        ));
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use smolvm::agent::VmResources;
+
+    fn sample_boot_config(base: &Path) -> BootConfig {
+        BootConfig {
+            rootfs_path: base.join("rootfs"),
+            storage_disk_path: base.join("storage.img"),
+            overlay_disk_path: base.join("overlay.img"),
+            vsock_socket: base.join("agent.sock"),
+            console_log: Some(base.join("console.log")),
+            startup_error_log: base.join("startup-error.log"),
+            storage_size_gb: 1,
+            overlay_size_gb: 1,
+            mounts: Vec::new(),
+            ports: Vec::new(),
+            resources: VmResources::default(),
+            ssh_agent_socket: None,
+            egress_policy_hosts: None,
+            preloaded_image_dir: None,
+            extra_disks: Vec::new(),
+        }
+    }
+
+    fn write_config(path: &Path, config: &BootConfig, mode: u32) {
+        let json = serde_json::to_vec(config).unwrap();
+        std::fs::write(path, json).unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+        }
+
+        #[cfg(not(unix))]
+        let _ = mode;
+    }
+
+    #[test]
+    fn read_boot_config_accepts_owner_only_file_and_removes_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("boot-config.json");
+        let config = sample_boot_config(tmp.path());
+        write_config(&path, &config, 0o600);
+
+        let parsed = read_boot_config(&path).unwrap();
+
+        assert_eq!(parsed.rootfs_path, config.rootfs_path);
+        assert_eq!(parsed.storage_disk_path, config.storage_disk_path);
+        assert!(
+            !path.exists(),
+            "boot config should be removed after parsing"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_boot_config_rejects_group_accessible_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("boot-config.json");
+        let config = sample_boot_config(tmp.path());
+        write_config(&path, &config, 0o640);
+
+        let err = read_boot_config(&path).expect_err("group-readable config must fail");
+
+        assert!(
+            err.to_string().contains("group/other access"),
+            "unexpected error: {err}"
+        );
+        assert!(path.exists(), "rejected config should not be removed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_boot_config_rejects_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("target.json");
+        let link = tmp.path().join("boot-config.json");
+        let config = sample_boot_config(tmp.path());
+        write_config(&target, &config, 0o600);
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let err = read_boot_config(&link).expect_err("symlink config must fail");
+
+        assert!(
+            err.to_string().contains("regular file"),
+            "unexpected error: {err}"
+        );
+        assert!(target.exists());
+        assert!(link.exists());
+    }
 }
