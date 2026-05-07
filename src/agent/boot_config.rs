@@ -48,9 +48,9 @@ pub struct BootConfig {
     /// Hostnames from `--allow-host` to re-resolve for egress policy refresh.
     #[serde(default)]
     pub egress_policy_hosts: Option<Vec<String>>,
-    /// Pre-extracted OCI layers directory for .smolmachine-sourced machines.
+    /// Host directory containing image data mounted for the guest agent.
     #[serde(default)]
-    pub packed_layers_dir: Option<PathBuf>,
+    pub preloaded_image_dir: Option<PathBuf>,
     /// Additional disk images to attach (path, read_only).
     #[serde(default)]
     pub extra_disks: Vec<(PathBuf, bool)>,

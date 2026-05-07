@@ -8,21 +8,30 @@
 
 #![deny(missing_docs)]
 
+#[cfg(feature = "packaging")]
 pub mod assets;
+#[cfg(feature = "packaging")]
 pub mod detect;
+#[cfg(feature = "packaging")]
 pub mod extract;
+#[cfg(feature = "packaging")]
 pub mod format;
-#[cfg(target_os = "macos")]
+#[cfg(all(feature = "packaging", target_os = "macos"))]
 pub mod macho;
 pub mod oci_archive;
+#[cfg(feature = "packaging")]
 pub mod packer;
+#[cfg(feature = "packaging")]
 pub mod signing;
 
+#[cfg(feature = "packaging")]
 pub use detect::{detect_packed_mode, PackedMode};
+#[cfg(feature = "packaging")]
 pub use format::{
     PackFooter, PackManifest, PackMode, SectionHeader, FOOTER_SIZE, MAGIC, SECTION_HEADER_SIZE,
     SECTION_MAGIC, SIDECAR_EXTENSION,
 };
+#[cfg(feature = "packaging")]
 pub use packer::{
     read_footer, read_footer_from_sidecar, read_manifest, read_manifest_from_sidecar,
     sidecar_path_for, verify_sidecar_checksum, Packer,

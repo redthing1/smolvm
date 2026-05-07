@@ -6,7 +6,7 @@
 //! - Layer extraction and deduplication
 //! - Overlay filesystem management
 //! - Container execution via crun OCI runtime
-//! - Support for pre-packed OCI layers (smolvm pack)
+//! - Support for preloaded image data mounted from the host
 
 use crate::crun::CrunCommand;
 use crate::oci::{generate_container_id, OciSpec};
@@ -28,7 +28,9 @@ const LAYERS_DIR: &str = "layers";
 const CONFIGS_DIR: &str = "configs";
 const MANIFESTS_DIR: &str = "manifests";
 const OVERLAYS_DIR: &str = "overlays";
-const PACKED_IMAGE_METADATA: &str = ".smolvm-image.json";
+const IMAGE_METADATA_FILENAME: &str = ".smolvm-image.json";
+const IMAGE_OCI_ARCHIVE_FILENAME: &str = ".smolvm-image.oci.tar";
+const MATERIALIZED_IMAGE_ROOTFS_DIR: &str = "imported-rootfs";
 const WORKSPACE_DIR: &str = "workspace";
 const DOCKER_HUB_AUTH_CONFIG_KEY: &str = "https://index.docker.io/v1/";
 const DOCKER_HUB_REGISTRY_ALIASES: &[&str] = &["docker.io", "index.docker.io"];
@@ -240,38 +242,35 @@ fn ensure_mount_target_under_root(rootfs: &Path, container_path: &str) -> Result
     Ok(final_canon)
 }
 
-/// Global state for packed layers support.
-/// Set at startup if SMOLVM_PACKED_LAYERS env var is present.
-static PACKED_LAYERS_DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
+const PRELOADED_IMAGE_ENV: &str = "SMOLVM_PRELOADED_IMAGE";
+
+/// Global state for preloaded image data mounted from the host.
+static PRELOADED_IMAGE_DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
 
 /// Global state for boot-time volume mounts.
 /// Set at startup if SMOLVM_MOUNT_COUNT env var is present.
 static BOOT_VOLUME_MOUNTS: OnceLock<Vec<(String, String, bool)>> = OnceLock::new();
 
-/// Initialize packed layers support by checking SMOLVM_PACKED_LAYERS env var.
-/// Format: "virtiofs_tag:mount_point" (e.g., "smolvm_layers:/packed_layers")
+/// Initialize preloaded image data by checking the launcher-provided env var.
+/// Format: "virtiofs_tag:mount_point" (e.g., "smolvm_image:/preloaded_image")
 /// Returns the mount point path if successfully mounted.
-pub fn init_packed_layers() -> Option<PathBuf> {
-    let env_val = match std::env::var("SMOLVM_PACKED_LAYERS") {
+pub fn init_preloaded_image_dir() -> Option<PathBuf> {
+    let env_val = match std::env::var(PRELOADED_IMAGE_ENV) {
         Ok(v) => v,
         Err(_) => return None,
     };
 
-    // Parse "tag:mount_point"
-    let parts: Vec<&str> = env_val.split(':').collect();
-    if parts.len() != 2 {
-        warn!(env_val = %env_val, "invalid SMOLVM_PACKED_LAYERS format, expected 'tag:mount_point'");
+    let Some((tag, mount_point)) = env_val.split_once(':') else {
+        warn!(env_val = %env_val, "invalid preloaded image env format, expected 'tag:mount_point'");
         return None;
-    }
+    };
+    let mount_point = PathBuf::from(mount_point);
 
-    let tag = parts[0];
-    let mount_point = PathBuf::from(parts[1]);
-
-    info!(tag = %tag, mount_point = %mount_point.display(), "setting up packed layers from virtiofs");
+    info!(tag = %tag, mount_point = %mount_point.display(), "setting up preloaded image data from virtiofs");
 
     // Create mount point
     if let Err(e) = std::fs::create_dir_all(&mount_point) {
-        warn!(error = %e, mount_point = %mount_point.display(), "failed to create packed layers mount point");
+        warn!(error = %e, mount_point = %mount_point.display(), "failed to create preloaded image mount point");
         return None;
     }
 
@@ -292,28 +291,30 @@ pub fn init_packed_layers() -> Option<PathBuf> {
 
     if rc != 0 {
         let err = std::io::Error::last_os_error();
-        warn!(error = %err, tag = %tag, "failed to mount packed layers virtiofs");
+        warn!(error = %err, tag = %tag, "failed to mount preloaded image virtiofs");
         return None;
     }
 
-    info!(mount_point = %mount_point.display(), "packed layers mounted successfully");
+    info!(mount_point = %mount_point.display(), "preloaded image data mounted successfully");
 
     // List contents for debugging (only at debug level to avoid boot overhead)
     if let Ok(entries) = std::fs::read_dir(&mount_point) {
-        let layer_dirs: Vec<_> = entries
+        let entry_names: Vec<_> = entries
             .filter_map(|e| e.ok())
             .filter(|e| e.path().is_dir())
             .map(|e| e.file_name().to_string_lossy().to_string())
             .collect();
-        debug!(layer_count = layer_dirs.len(), layers = ?layer_dirs, "packed layers available");
+        debug!(entry_count = entry_names.len(), entries = ?entry_names, "preloaded image data available");
     }
 
     Some(mount_point)
 }
 
-/// Get the packed layers directory if available.
-pub fn get_packed_layers_dir() -> Option<&'static PathBuf> {
-    PACKED_LAYERS_DIR.get_or_init(init_packed_layers).as_ref()
+/// Get the preloaded image data directory if available.
+pub fn get_preloaded_image_dir() -> Option<&'static PathBuf> {
+    PRELOADED_IMAGE_DIR
+        .get_or_init(init_preloaded_image_dir)
+        .as_ref()
 }
 
 /// Initialize volume mounts at boot by reading SMOLVM_MOUNT_* env vars.
@@ -377,19 +378,17 @@ pub fn init_volume_mounts() -> &'static [(String, String, bool)] {
     })
 }
 
-/// Create a synthetic ImageInfo from packed layers.
-/// This is used when running from a packed binary where layers are pre-extracted.
-fn create_packed_image_info(image: &str, packed_dir: &Path) -> Result<ImageInfo> {
-    if let Some(mut info) = read_packed_image_metadata(packed_dir)? {
+/// Create ImageInfo from preloaded image data.
+fn create_preloaded_image_info(image: &str, image_dir: &Path) -> Result<ImageInfo> {
+    if let Some(mut info) = read_preloaded_image_metadata(image_dir)? {
         info.reference = image.to_string();
         return Ok(info);
     }
 
-    // Find all layer directories in packed_dir
     let mut layer_dirs: Vec<String> = Vec::new();
 
-    let entries = std::fs::read_dir(packed_dir)
-        .map_err(|e| StorageError::read_error(packed_dir.display().to_string(), e))?;
+    let entries = std::fs::read_dir(image_dir)
+        .map_err(|e| StorageError::read_error(image_dir.display().to_string(), e))?;
 
     for entry in entries {
         let entry: std::fs::DirEntry = entry?;
@@ -411,7 +410,7 @@ fn create_packed_image_info(image: &str, packed_dir: &Path) -> Result<ImageInfo>
     let mut total_size = 0u64;
     for layer_digest in &layer_dirs {
         let short_id = layer_digest.strip_prefix("sha256:").unwrap_or(layer_digest);
-        let layer_path = packed_dir.join(short_id);
+        let layer_path = image_dir.join(short_id);
         if let Ok(size) = dir_size(&layer_path) {
             total_size += size;
         }
@@ -427,14 +426,13 @@ fn create_packed_image_info(image: &str, packed_dir: &Path) -> Result<ImageInfo>
 
     Ok(ImageInfo {
         reference: image.to_string(),
-        digest: "packed".to_string(), // No real digest available for packed images
+        digest: "preloaded".to_string(),
         size: total_size,
         created: None,
         architecture,
         os: "linux".to_string(),
         layer_count: layer_dirs.len(),
         layers: layer_dirs,
-        // Packed mode: config is in the PackManifest, not the image
         entrypoint: Vec::new(),
         cmd: Vec::new(),
         env: Vec::new(),
@@ -443,15 +441,15 @@ fn create_packed_image_info(image: &str, packed_dir: &Path) -> Result<ImageInfo>
     })
 }
 
-fn read_packed_image_metadata(packed_dir: &Path) -> Result<Option<ImageInfo>> {
-    let metadata_path = packed_dir.join(PACKED_IMAGE_METADATA);
+fn read_preloaded_image_metadata(image_dir: &Path) -> Result<Option<ImageInfo>> {
+    let metadata_path = image_dir.join(IMAGE_METADATA_FILENAME);
     if !metadata_path.is_file() {
         return Ok(None);
     }
     let text = std::fs::read_to_string(&metadata_path)
         .map_err(|e| StorageError::read_error(metadata_path.display().to_string(), e))?;
     let info = serde_json::from_str(&text)
-        .map_err(|e| StorageError::parse_error(PACKED_IMAGE_METADATA, e))?;
+        .map_err(|e| StorageError::parse_error(IMAGE_METADATA_FILENAME, e))?;
     Ok(Some(info))
 }
 
@@ -978,10 +976,9 @@ where
         }
     })?;
 
-    // If packed layers are available, return synthetic image info
-    if let Some(packed_dir) = get_packed_layers_dir() {
-        info!(image = %image, "using packed layers, skipping network pull");
-        return create_packed_image_info(image, packed_dir);
+    if let Some(image_dir) = get_preloaded_image_dir() {
+        info!(image = %image, "using preloaded image data, skipping network pull");
+        return create_preloaded_image_info(image, image_dir);
     }
 
     // Determine OCI platform - default to current architecture
@@ -1261,9 +1258,9 @@ where
 
 /// Query if an image exists locally.
 pub fn query_image(image: &str) -> Result<Option<ImageInfo>> {
-    if let Some(packed_dir) = get_packed_layers_dir() {
-        info!(image = %image, "using packed layers for image query");
-        return create_packed_image_info(image, packed_dir).map(Some);
+    if let Some(image_dir) = get_preloaded_image_dir() {
+        info!(image = %image, "using preloaded image data for image query");
+        return create_preloaded_image_info(image, image_dir).map(Some);
     }
 
     let root = Path::new(STORAGE_ROOT);
@@ -1834,10 +1831,9 @@ fn overlay_resolv_conf_contents() -> String {
 /// a fresh overlay. This idempotent behavior is critical for `machine cp`
 /// which may call this before or after `machine exec`.
 pub fn prepare_overlay(image: &str, workload_id: &str) -> Result<OverlayInfo> {
-    // Check if we have packed layers available
-    if let Some(packed_dir) = get_packed_layers_dir() {
-        info!(image = %image, packed_dir = %packed_dir.display(), "using packed layers");
-        return prepare_overlay_from_packed(image, workload_id, packed_dir);
+    if let Some(image_dir) = get_preloaded_image_dir() {
+        info!(image = %image, image_dir = %image_dir.display(), "using preloaded image data");
+        return prepare_overlay_from_preloaded_image(image, workload_id, image_dir);
     }
 
     // Ensure image exists
@@ -1859,21 +1855,23 @@ pub fn prepare_overlay(image: &str, workload_id: &str) -> Result<OverlayInfo> {
     OverlaySetup::new(workload_id)?.execute_or_remount(lowerdirs)
 }
 
-/// Prepare an overlay filesystem using pre-packed layers.
-///
-/// Packed layers are stored as directories named by short digest (first 12 chars)
-/// in the packed_dir. This function builds the overlay using these layers.
-fn prepare_overlay_from_packed(
+/// Prepare an overlay filesystem using preloaded image data.
+fn prepare_overlay_from_preloaded_image(
     image: &str,
     workload_id: &str,
-    packed_dir: &Path,
+    image_dir: &Path,
 ) -> Result<OverlayInfo> {
-    let layer_dirs = packed_layer_dirs(packed_dir)?;
+    if image_dir.join(IMAGE_OCI_ARCHIVE_FILENAME).is_file() {
+        let rootfs = materialize_preloaded_oci_archive(image_dir)?;
+        return OverlaySetup::new(workload_id)?.execute(vec![rootfs.display().to_string()]);
+    }
+
+    let layer_dirs = preloaded_layer_dirs(image_dir)?;
 
     if layer_dirs.is_empty() {
         return Err(StorageError::new(format!(
             "no layer directories found in {}",
-            packed_dir.display()
+            image_dir.display()
         )));
     }
 
@@ -1881,7 +1879,7 @@ fn prepare_overlay_from_packed(
         image = %image,
         layer_count = layer_dirs.len(),
         layers = ?layer_dirs.iter().map(|p| p.file_name().unwrap_or_default().to_string_lossy().to_string()).collect::<Vec<_>>(),
-        "found packed layers"
+        "found preloaded layer directories"
     );
 
     // Build lowerdir from layers (reversed for overlay order - top layer first)
@@ -1912,13 +1910,18 @@ fn get_image_lowerdirs(image: &str) -> Result<Vec<String>> {
         .collect())
 }
 
-/// Build lowerdir list from pre-packed layer directories.
-fn get_packed_lowerdirs(packed_dir: &Path) -> Result<Vec<String>> {
-    let layer_dirs = packed_layer_dirs(packed_dir)?;
+/// Build lowerdir list from preloaded image data.
+fn get_preloaded_lowerdirs(image_dir: &Path) -> Result<Vec<String>> {
+    if image_dir.join(IMAGE_OCI_ARCHIVE_FILENAME).is_file() {
+        let rootfs = materialize_preloaded_oci_archive(image_dir)?;
+        return Ok(vec![rootfs.display().to_string()]);
+    }
+
+    let layer_dirs = preloaded_layer_dirs(image_dir)?;
     if layer_dirs.is_empty() {
         return Err(StorageError::new(format!(
             "no layer directories found in {}",
-            packed_dir.display()
+            image_dir.display()
         )));
     }
 
@@ -1929,14 +1932,75 @@ fn get_packed_lowerdirs(packed_dir: &Path) -> Result<Vec<String>> {
         .collect())
 }
 
-fn packed_layer_dirs(packed_dir: &Path) -> Result<Vec<PathBuf>> {
-    if let Some(info) = read_packed_image_metadata(packed_dir)? {
+fn materialize_preloaded_oci_archive(image_dir: &Path) -> Result<PathBuf> {
+    let archive_path = image_dir.join(IMAGE_OCI_ARCHIVE_FILENAME);
+    if !archive_path.is_file() {
+        return Err(StorageError::new(format!(
+            "preloaded OCI archive not found: {}",
+            archive_path.display()
+        )));
+    }
+
+    let info = read_preloaded_image_metadata(image_dir)?
+        .ok_or_else(|| StorageError::new("preloaded OCI metadata not found".to_string()))?;
+    let image_id = info
+        .digest
+        .strip_prefix("sha256:")
+        .unwrap_or(&info.digest)
+        .to_string();
+    validate_storage_id(&image_id, "preloaded OCI image digest")?;
+
+    let image_root = Path::new(STORAGE_ROOT)
+        .join(MATERIALIZED_IMAGE_ROOTFS_DIR)
+        .join(&image_id);
+    let rootfs_path = image_root.join("rootfs");
+    let marker_path = image_root.join(".complete");
+    if marker_path.is_file() && rootfs_path.is_dir() {
+        return Ok(rootfs_path);
+    }
+
+    info!(
+        image = %info.reference,
+        digest = %info.digest,
+        "materializing preloaded OCI archive"
+    );
+
+    if image_root.exists() {
+        std::fs::remove_dir_all(&image_root)?;
+    }
+    std::fs::create_dir_all(&image_root)?;
+
+    let work_dir = image_root.join("work");
+    let staging_rootfs = image_root.join("rootfs.tmp");
+    let platform = format!("{}/{}", info.os, info.architecture);
+    smolvm_pack::oci_archive::import_oci_archive_rootfs(
+        &archive_path,
+        &staging_rootfs,
+        &work_dir,
+        Some(&platform),
+    )
+    .map_err(|e| StorageError::new(format!("failed to materialize OCI archive: {}", e)))?;
+
+    if rootfs_path.exists() {
+        std::fs::remove_dir_all(&rootfs_path)?;
+    }
+    std::fs::rename(&staging_rootfs, &rootfs_path)?;
+    if work_dir.exists() {
+        std::fs::remove_dir_all(&work_dir)?;
+    }
+    std::fs::write(&marker_path, info.digest.as_bytes())?;
+
+    Ok(rootfs_path)
+}
+
+fn preloaded_layer_dirs(image_dir: &Path) -> Result<Vec<PathBuf>> {
+    if let Some(info) = read_preloaded_image_metadata(image_dir)? {
         let dirs = info
             .layers
             .iter()
             .map(|digest| {
                 let id = digest.strip_prefix("sha256:").unwrap_or(digest);
-                packed_dir.join(id)
+                image_dir.join(id)
             })
             .filter(|path| path.is_dir())
             .collect::<Vec<_>>();
@@ -1947,8 +2011,8 @@ fn packed_layer_dirs(packed_dir: &Path) -> Result<Vec<PathBuf>> {
 
     let mut layer_dirs: Vec<PathBuf> = Vec::new();
 
-    let entries = std::fs::read_dir(packed_dir)
-        .map_err(|e| StorageError::read_error(packed_dir.display().to_string(), e))?;
+    let entries = std::fs::read_dir(image_dir)
+        .map_err(|e| StorageError::read_error(image_dir.display().to_string(), e))?;
 
     for entry in entries {
         let entry: std::fs::DirEntry = entry?;
@@ -2254,8 +2318,8 @@ pub fn prepare_for_run_persistent(image: &str, overlay_id: &str) -> Result<Prepa
     let workload_id = format!("persistent-{}", overlay_id);
 
     // Resolve image layers (same logic as prepare_overlay)
-    let lowerdirs = if let Some(packed_dir) = get_packed_layers_dir() {
-        get_packed_lowerdirs(&packed_dir)?
+    let lowerdirs = if let Some(image_dir) = get_preloaded_image_dir() {
+        get_preloaded_lowerdirs(image_dir)?
     } else {
         get_image_lowerdirs(image)?
     };

@@ -120,7 +120,7 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
         port_mappings: &config.ports,
         resources: config.resources,
         ssh_agent_socket: config.ssh_agent_socket.as_deref(),
-        packed_layers_dir: config.packed_layers_dir.as_deref(),
+        preloaded_image_dir: config.preloaded_image_dir.as_deref(),
         extra_disks: &config.extra_disks,
         egress_refresh_hosts: config.egress_policy_hosts.clone(),
     });

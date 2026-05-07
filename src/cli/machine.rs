@@ -407,9 +407,11 @@ impl RunCmd {
         println!("Starting {} machine...", mode);
 
         let imported_image = vm_common::resolve_imported_image(image.as_deref())?;
-        let imported_layers_dir = imported_image
+        let imported_image_data_dir = imported_image
             .as_ref()
-            .map(|image| smolvm::image_store::ImageStore::open().map(|s| s.layers_dir(&image.key)))
+            .map(|image| {
+                smolvm::image_store::ImageStore::open().map(|s| s.image_data_dir(&image.key))
+            })
             .transpose()?;
 
         let ssh_agent_socket = if self.ssh_agent || params.ssh_agent {
@@ -429,7 +431,7 @@ impl RunCmd {
         let features = smolvm::agent::LaunchFeatures {
             ssh_agent_socket,
             egress_policy_hosts: params.egress_policy_hosts.clone(),
-            packed_layers_dir: imported_layers_dir,
+            preloaded_image_dir: imported_image_data_dir,
             extra_disks: Vec::new(),
         };
 

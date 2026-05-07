@@ -5,7 +5,7 @@
 //! can either write that root filesystem as a single merged layer tarball for a
 //! portable `.smolmachine`, or keep it as a directory for local execution.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 #[cfg(unix)]
@@ -22,10 +22,14 @@ use crate::{PackError, Result};
 const OCI_IMAGE_MANIFEST: &str = "application/vnd.oci.image.manifest.v1+json";
 const OCI_LAYER_TAR: &str = "application/vnd.oci.image.layer.v1.tar";
 const OCI_LAYER_TAR_GZIP: &str = "application/vnd.oci.image.layer.v1.tar+gzip";
+#[cfg(feature = "zstd")]
 const OCI_LAYER_TAR_ZSTD: &str = "application/vnd.oci.image.layer.v1.tar+zstd";
 const OCI_NONDIST_LAYER_TAR: &str = "application/vnd.oci.image.layer.nondistributable.v1.tar";
 const OCI_NONDIST_LAYER_TAR_GZIP: &str =
     "application/vnd.oci.image.layer.nondistributable.v1.tar+gzip";
+#[cfg(feature = "zstd")]
+const OCI_NONDIST_LAYER_TAR_ZSTD: &str =
+    "application/vnd.oci.image.layer.nondistributable.v1.tar+zstd";
 const DOCKER_LAYER_TAR_GZIP: &str = "application/vnd.docker.image.rootfs.diff.tar.gzip";
 
 /// Image metadata and merged layer produced from an OCI archive.
@@ -84,6 +88,95 @@ pub struct OciArchiveRootfs {
     pub layer_digest: String,
     /// Path to the merged root filesystem directory.
     pub rootfs_path: PathBuf,
+}
+
+/// Image metadata read from an OCI archive without unpacking its rootfs.
+#[derive(Debug, Clone)]
+pub struct OciArchiveInspection {
+    /// Human-readable image reference from archive annotations.
+    pub reference: String,
+    /// Config digest (`sha256:...`) for the selected image manifest.
+    pub digest: String,
+    /// Target platform architecture, for example `amd64`.
+    pub architecture: String,
+    /// Target platform operating system, usually `linux`.
+    pub os: String,
+    /// Total size of the selected layer blobs in bytes.
+    pub size: u64,
+    /// Image entrypoint from OCI config.
+    pub entrypoint: Vec<String>,
+    /// Image command from OCI config.
+    pub cmd: Vec<String>,
+    /// Image environment from OCI config.
+    pub env: Vec<String>,
+    /// Image working directory from OCI config.
+    pub workdir: Option<String>,
+    /// Image user from OCI config.
+    pub user: Option<String>,
+    /// Stable digest for the selected image contents.
+    pub image_key: String,
+    /// Selected layer descriptors in manifest order.
+    pub layers: Vec<OciArchiveLayer>,
+}
+
+/// A selected layer descriptor from an OCI archive.
+#[derive(Debug, Clone)]
+pub struct OciArchiveLayer {
+    /// Layer media type.
+    pub media_type: String,
+    /// Layer digest (`sha256:...`).
+    pub digest: String,
+    /// Layer blob size in bytes.
+    pub size: u64,
+}
+
+/// Inspect an OCI archive without unpacking image layers.
+pub fn inspect_oci_archive(
+    archive_path: &Path,
+    work_dir: &Path,
+    platform: Option<&str>,
+) -> Result<OciArchiveInspection> {
+    let archive_dir = work_dir.join("oci-archive");
+    fs::create_dir_all(&archive_dir)?;
+    unpack_outer_archive(archive_path, &archive_dir)?;
+
+    let selected = read_selected_image(&archive_dir, platform)?;
+
+    let mut layers = Vec::with_capacity(selected.manifest.layers.len());
+    let mut layer_digests = Vec::with_capacity(selected.manifest.layers.len());
+    let mut total_size = 0_u64;
+    for layer in &selected.manifest.layers {
+        blob_path(&archive_dir, &layer.digest)?;
+        total_size = total_size.saturating_add(layer.size);
+        layer_digests.push(layer.digest.clone());
+        layers.push(OciArchiveLayer {
+            media_type: layer.media_type.clone(),
+            digest: layer.digest.clone(),
+            size: layer.size,
+        });
+    }
+
+    let image_key = merged_layer_digest(
+        &selected.digest,
+        &layer_digests,
+        &selected.os,
+        &selected.architecture,
+    );
+    let runtime = selected.runtime;
+    Ok(OciArchiveInspection {
+        reference: selected.reference,
+        digest: selected.digest,
+        architecture: selected.architecture,
+        os: selected.os,
+        size: total_size,
+        entrypoint: runtime.entrypoint,
+        cmd: runtime.cmd,
+        env: runtime.env,
+        workdir: runtime.workdir,
+        user: runtime.user,
+        image_key,
+        layers,
+    })
 }
 
 /// Import an OCI archive and write a merged layer tarball under `work_dir`.
@@ -180,26 +273,11 @@ fn apply_oci_archive(
 
     unpack_outer_archive(archive_path, &archive_dir)?;
 
-    let index: OciIndex = read_json(&archive_dir.join("index.json"))?;
-    let selected = select_manifest(&index.manifests, platform)?;
-    if selected
-        .media_type
-        .as_deref()
-        .is_some_and(|mt| mt != OCI_IMAGE_MANIFEST)
-    {
-        return Err(PackError::InvalidOciArchive(format!(
-            "unsupported manifest media type: {}",
-            selected.media_type.as_deref().unwrap_or_default()
-        )));
-    }
-
-    let manifest: OciManifest = read_json(&blob_path(&archive_dir, &selected.digest)?)?;
-    let config_path = blob_path(&archive_dir, &manifest.config.digest)?;
-    let config: OciConfig = read_json(&config_path)?;
+    let selected = read_selected_image(&archive_dir, platform)?;
 
     let mut directory_permissions = DirectoryPermissions::default();
     let apply_result = (|| {
-        for layer in &manifest.layers {
+        for layer in &selected.manifest.layers {
             let layer_path = blob_path(&archive_dir, &layer.digest)?;
             apply_layer(
                 &layer_path,
@@ -214,23 +292,20 @@ fn apply_oci_archive(
     let image_size = apply_result?;
     restore_result?;
 
-    let config_values = config.config.unwrap_or_default();
+    let runtime = selected.runtime;
     Ok(AppliedOciArchive {
-        reference: selected
-            .annotations
-            .as_ref()
-            .and_then(|a| a.reference_name.clone())
-            .unwrap_or_else(|| "local/archive:latest".to_string()),
-        digest: manifest.config.digest,
-        architecture: config.architecture,
-        os: config.os,
+        reference: selected.reference,
+        digest: selected.digest,
+        architecture: selected.architecture,
+        os: selected.os,
         size: image_size,
-        entrypoint: config_values.entrypoint.unwrap_or_default(),
-        cmd: config_values.cmd.unwrap_or_default(),
-        env: config_values.env.unwrap_or_default(),
-        workdir: config_values.working_dir.filter(|s| !s.is_empty()),
-        user: config_values.user.filter(|s| !s.is_empty()),
-        source_layer_digests: manifest
+        entrypoint: runtime.entrypoint,
+        cmd: runtime.cmd,
+        env: runtime.env,
+        workdir: runtime.workdir,
+        user: runtime.user,
+        source_layer_digests: selected
+            .manifest
             .layers
             .into_iter()
             .map(|layer| layer.digest)
@@ -292,7 +367,75 @@ fn unpack_outer_archive(archive_path: &Path, dest: &Path) -> Result<()> {
     Ok(())
 }
 
+struct SelectedOciImage {
+    reference: String,
+    digest: String,
+    architecture: String,
+    os: String,
+    runtime: ImageRuntimeConfig,
+    manifest: OciManifest,
+}
+
+#[derive(Default)]
+struct ImageRuntimeConfig {
+    entrypoint: Vec<String>,
+    cmd: Vec<String>,
+    env: Vec<String>,
+    workdir: Option<String>,
+    user: Option<String>,
+}
+
+fn read_selected_image(archive_dir: &Path, platform: Option<&str>) -> Result<SelectedOciImage> {
+    let index: OciIndex = read_json(&archive_dir.join("index.json"))?;
+    let selected = select_manifest(archive_dir, &index.manifests, platform)?;
+    if selected
+        .media_type
+        .as_deref()
+        .is_some_and(|mt| mt != OCI_IMAGE_MANIFEST)
+    {
+        return Err(PackError::InvalidOciArchive(format!(
+            "unsupported manifest media type: {}",
+            selected.media_type.as_deref().unwrap_or_default()
+        )));
+    }
+
+    let reference = selected
+        .annotations
+        .as_ref()
+        .and_then(|a| a.reference_name.clone())
+        .unwrap_or_else(|| "local/archive:latest".to_string());
+    let manifest: OciManifest = read_json(&blob_path(archive_dir, &selected.digest)?)?;
+    let config_path = blob_path(archive_dir, &manifest.config.digest)?;
+    let config: OciConfig = read_json(&config_path)?;
+    let OciConfig {
+        architecture,
+        os,
+        config,
+    } = config;
+
+    Ok(SelectedOciImage {
+        reference,
+        digest: manifest.config.digest.clone(),
+        architecture,
+        os,
+        runtime: image_runtime_config(config),
+        manifest,
+    })
+}
+
+fn image_runtime_config(config: Option<OciConfigValues>) -> ImageRuntimeConfig {
+    let config = config.unwrap_or_default();
+    ImageRuntimeConfig {
+        entrypoint: config.entrypoint.unwrap_or_default(),
+        cmd: config.cmd.unwrap_or_default(),
+        env: config.env.unwrap_or_default(),
+        workdir: config.working_dir.filter(|s| !s.is_empty()),
+        user: config.user.filter(|s| !s.is_empty()),
+    }
+}
+
 fn select_manifest<'a>(
+    archive_dir: &Path,
     manifests: &'a [OciDescriptor],
     platform: Option<&str>,
 ) -> Result<&'a OciDescriptor> {
@@ -309,19 +452,43 @@ fn select_manifest<'a>(
         PackError::InvalidOciArchive(format!("invalid platform [{platform}], expected OS/ARCH"))
     })?;
 
-    manifests
-        .iter()
-        .find(|manifest| {
-            manifest
-                .platform
-                .as_ref()
-                .is_some_and(|p| p.os == wanted_os && p.architecture == wanted_arch)
-        })
-        .ok_or_else(|| {
-            PackError::InvalidOciArchive(format!(
-                "archive has no manifest for platform [{platform}]"
-            ))
-        })
+    if let Some(manifest) = manifests.iter().find(|manifest| {
+        manifest
+            .platform
+            .as_ref()
+            .is_some_and(|p| p.os == wanted_os && p.architecture == wanted_arch)
+    }) {
+        return Ok(manifest);
+    }
+
+    for manifest in manifests {
+        if manifest
+            .media_type
+            .as_deref()
+            .is_some_and(|mt| mt != OCI_IMAGE_MANIFEST)
+        {
+            continue;
+        }
+        let Ok(manifest_path) = blob_path(archive_dir, &manifest.digest) else {
+            continue;
+        };
+        let Ok(image_manifest) = read_json::<OciManifest>(&manifest_path) else {
+            continue;
+        };
+        let Ok(config_path) = blob_path(archive_dir, &image_manifest.config.digest) else {
+            continue;
+        };
+        let Ok(config) = read_json::<OciConfig>(&config_path) else {
+            continue;
+        };
+        if config.os == wanted_os && config.architecture == wanted_arch {
+            return Ok(manifest);
+        }
+    }
+
+    Err(PackError::InvalidOciArchive(format!(
+        "archive has no manifest for platform [{platform}]"
+    )))
 }
 
 fn apply_layer(
@@ -339,7 +506,8 @@ fn apply_layer(
             let file = File::open(layer_path)?;
             apply_layer_tar(GzDecoder::new(file), rootfs_dir, directory_permissions)
         }
-        OCI_LAYER_TAR_ZSTD => {
+        #[cfg(feature = "zstd")]
+        OCI_LAYER_TAR_ZSTD | OCI_NONDIST_LAYER_TAR_ZSTD => {
             let file = File::open(layer_path)?;
             let decoder = zstd::stream::read::Decoder::new(file)
                 .map_err(|e| PackError::Compression(e.to_string()))?;
@@ -355,7 +523,9 @@ fn apply_layer_tar<R: Read>(
     directory_permissions: &mut DirectoryPermissions,
 ) -> Result<()> {
     let mut archive = tar::Archive::new(reader);
+    preserve_root_metadata_when_possible(&mut archive);
     let mut pending_hard_links = Vec::new();
+    let mut created_paths = BTreeSet::new();
     for entry in archive
         .entries()
         .map_err(|e| PackError::Tar(e.to_string()))?
@@ -366,12 +536,13 @@ fn apply_layer_tar<R: Read>(
             continue;
         }
 
-        if apply_whiteout(rootfs_dir, &path, directory_permissions)? {
+        if apply_whiteout(rootfs_dir, &path, directory_permissions, &created_paths)? {
             resolve_pending_hard_links(
                 rootfs_dir,
                 &mut pending_hard_links,
                 directory_permissions,
                 false,
+                &mut created_paths,
             )?;
             continue;
         }
@@ -380,6 +551,8 @@ fn apply_layer_tar<R: Read>(
             let hard_link = pending_hard_link(&entry, path)?;
             if !try_apply_hard_link(rootfs_dir, &hard_link, directory_permissions)? {
                 pending_hard_links.push(hard_link);
+            } else {
+                created_paths.insert(hard_link.target);
             }
             continue;
         }
@@ -396,11 +569,13 @@ fn apply_layer_tar<R: Read>(
         if entry.header().entry_type().is_dir() {
             directory_permissions.make_writable(&target)?;
         }
+        created_paths.insert(path);
         resolve_pending_hard_links(
             rootfs_dir,
             &mut pending_hard_links,
             directory_permissions,
             false,
+            &mut created_paths,
         )?;
     }
     resolve_pending_hard_links(
@@ -408,8 +583,25 @@ fn apply_layer_tar<R: Read>(
         &mut pending_hard_links,
         directory_permissions,
         true,
+        &mut created_paths,
     )?;
     Ok(())
+}
+
+fn preserve_root_metadata_when_possible<R: Read>(archive: &mut tar::Archive<R>) {
+    #[cfg(unix)]
+    {
+        if unsafe { libc::geteuid() } == 0 {
+            archive.set_preserve_permissions(true);
+            archive.set_preserve_ownerships(true);
+            archive.set_unpack_xattrs(true);
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = archive;
+    }
 }
 
 #[derive(Debug)]
@@ -437,11 +629,14 @@ fn resolve_pending_hard_links(
     pending: &mut Vec<PendingHardLink>,
     directory_permissions: &mut DirectoryPermissions,
     final_pass: bool,
+    created_paths: &mut BTreeSet<PathBuf>,
 ) -> Result<()> {
     let mut remaining = Vec::new();
     for hard_link in pending.drain(..) {
         if !try_apply_hard_link(rootfs_dir, &hard_link, directory_permissions)? {
             remaining.push(hard_link);
+        } else {
+            created_paths.insert(hard_link.target);
         }
     }
 
@@ -572,6 +767,7 @@ fn apply_whiteout(
     rootfs_dir: &Path,
     path: &Path,
     directory_permissions: &mut DirectoryPermissions,
+    created_paths: &BTreeSet<PathBuf>,
 ) -> Result<bool> {
     let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
         return Ok(false);
@@ -581,12 +777,27 @@ fn apply_whiteout(
     if name == ".wh..wh..opq" {
         let dir = rootfs_dir.join(parent);
         validate_parent_inside(rootfs_dir, &dir)?;
-        clear_directory(&dir, directory_permissions)?;
+        clear_directory_preserving(&dir, parent, directory_permissions, created_paths)?;
         return Ok(true);
     }
 
     if let Some(removed) = name.strip_prefix(".wh.") {
+        let removed_path = parent.join(removed);
         let target = rootfs_dir.join(parent).join(removed);
+        if created_paths.contains(&removed_path) {
+            return Ok(true);
+        }
+        if has_created_descendant(created_paths, &removed_path) {
+            if target.is_dir() {
+                clear_directory_preserving(
+                    &target,
+                    &removed_path,
+                    directory_permissions,
+                    created_paths,
+                )?;
+            }
+            return Ok(true);
+        }
         if let Some(parent) = target.parent() {
             if !parent.exists() {
                 return Ok(true);
@@ -601,7 +812,12 @@ fn apply_whiteout(
     Ok(false)
 }
 
-fn clear_directory(dir: &Path, directory_permissions: &mut DirectoryPermissions) -> Result<()> {
+fn clear_directory_preserving(
+    dir: &Path,
+    relative_dir: &Path,
+    directory_permissions: &mut DirectoryPermissions,
+    created_paths: &BTreeSet<PathBuf>,
+) -> Result<()> {
     if !dir.exists() {
         fs::create_dir_all(dir)?;
         directory_permissions.make_writable(dir)?;
@@ -618,9 +834,30 @@ fn clear_directory(dir: &Path, directory_permissions: &mut DirectoryPermissions)
     }
     directory_permissions.make_writable(dir)?;
     for entry in fs::read_dir(dir)? {
-        remove_path(&entry?.path(), directory_permissions)?;
+        let entry = entry?;
+        let entry_path = entry.path();
+        let relative_entry = relative_dir.join(entry.file_name());
+        if has_created_descendant(created_paths, &relative_entry) {
+            let metadata = fs::symlink_metadata(&entry_path)?;
+            if metadata.is_dir() && !metadata.file_type().is_symlink() {
+                clear_directory_preserving(
+                    &entry_path,
+                    &relative_entry,
+                    directory_permissions,
+                    created_paths,
+                )?;
+            }
+            continue;
+        }
+        remove_path(&entry_path, directory_permissions)?;
     }
     Ok(())
+}
+
+fn has_created_descendant(created_paths: &BTreeSet<PathBuf>, path: &Path) -> bool {
+    created_paths
+        .iter()
+        .any(|created| created == path || created.starts_with(path))
 }
 
 fn remove_path(path: &Path, directory_permissions: &mut DirectoryPermissions) -> Result<()> {
@@ -1027,6 +1264,8 @@ struct OciLayer {
     #[serde(rename = "mediaType")]
     media_type: String,
     digest: String,
+    #[serde(default)]
+    size: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1090,6 +1329,28 @@ mod tests {
     }
 
     #[test]
+    fn inspects_oci_archive_without_unpacking_rootfs() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive_path = temp.path().join("image.oci.tar");
+        build_test_archive(&archive_path);
+
+        let work_dir = temp.path().join("work");
+        let image = inspect_oci_archive(&archive_path, &work_dir, Some("linux/amd64")).unwrap();
+
+        assert_eq!(image.reference, "localhost/test:latest");
+        assert_eq!(image.architecture, "amd64");
+        assert_eq!(image.os, "linux");
+        assert_eq!(image.entrypoint, ["/bin/app"]);
+        assert_eq!(image.cmd, ["serve"]);
+        assert_eq!(image.env, ["A=1"]);
+        assert_eq!(image.workdir.as_deref(), Some("/app"));
+        assert_eq!(image.user.as_deref(), Some("1000:1000"));
+        assert_eq!(image.layers.len(), 2);
+        assert!(image.image_key.starts_with("sha256:"));
+        assert!(!work_dir.join("rootfs").exists());
+    }
+
+    #[test]
     fn imports_oci_archive_with_restrictive_directories() {
         let temp = tempfile::tempdir().unwrap();
         let archive_path = temp.path().join("locked.oci.tar");
@@ -1113,6 +1374,23 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert!(names.iter().any(|name| name.ends_with("locked/new")));
+    }
+
+    #[test]
+    fn applies_late_whiteouts_without_removing_same_layer_entries() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive_path = temp.path().join("late-whiteout.oci.tar");
+        build_late_whiteout_archive(&archive_path);
+
+        let work_dir = temp.path().join("work");
+        import_oci_archive(&archive_path, &work_dir, Some("linux/amd64")).unwrap();
+
+        assert!(!work_dir.join("rootfs/dir/old").exists());
+        assert!(work_dir.join("rootfs/dir/new").exists());
+        assert_eq!(
+            fs::read_to_string(work_dir.join("rootfs/explicit/old")).unwrap(),
+            "new"
+        );
     }
 
     #[test]
@@ -1348,6 +1626,17 @@ mod tests {
     fn build_unreadable_file_archive(path: &Path) {
         let layer = tar_bytes_with_file_mode("secret", "secret", 0o111);
         build_archive(path, &[(OCI_LAYER_TAR, layer)]);
+    }
+
+    fn build_late_whiteout_archive(path: &Path) {
+        let layer1 = tar_bytes(&[("dir/old", "old"), ("explicit/old", "old")]);
+        let layer2 = tar_bytes(&[
+            ("dir/new", "new"),
+            ("dir/.wh..wh..opq", ""),
+            ("explicit/old", "new"),
+            ("explicit/.wh.old", ""),
+        ]);
+        build_archive(path, &[(OCI_LAYER_TAR, layer1), (OCI_LAYER_TAR, layer2)]);
     }
 
     fn build_archive(path: &Path, layers: &[(&str, Vec<u8>)]) {

@@ -1,7 +1,7 @@
 //! Local imported image store.
 //!
-//! Imported images are host-local, unpacked once into a smolvm-owned directory,
-//! and then mounted into VMs as pre-extracted layers.
+//! Imported images are host-local OCI archives. The host stores verified image
+//! bytes and metadata; the guest materializes the rootfs inside VM storage.
 
 use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
@@ -11,10 +11,12 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// Metadata file the guest agent reads from mounted imported layers.
-pub const PACKED_IMAGE_METADATA: &str = ".smolvm-image.json";
+/// Metadata file the guest agent reads from mounted image data.
+pub const IMAGE_METADATA_FILENAME: &str = ".smolvm-image.json";
+/// OCI archive file the guest agent materializes from mounted imported data.
+pub const IMAGE_OCI_ARCHIVE_FILENAME: &str = ".smolvm-image.oci.tar";
 
-const STORE_VERSION: u32 = 1;
+const STORE_VERSION: u32 = 2;
 
 /// A reference to an imported local image.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -40,8 +42,8 @@ pub struct ImportedImageRecord {
     pub architecture: String,
     /// Platform operating system.
     pub os: String,
-    /// Merged layer digest.
-    pub layer_digest: String,
+    /// Source layer digests in OCI manifest order.
+    pub layers: Vec<String>,
     /// Image entrypoint.
     #[serde(default)]
     pub entrypoint: Vec<String>,
@@ -69,8 +71,8 @@ impl ImportedImageRecord {
             created: Some(self.created_at.clone()),
             architecture: self.architecture.clone(),
             os: self.os.clone(),
-            layer_count: 1,
-            layers: vec![self.layer_digest.clone()],
+            layer_count: self.layers.len(),
+            layers: self.layers.clone(),
             entrypoint: self.entrypoint.clone(),
             cmd: self.cmd.clone(),
             env: self.env.clone(),
@@ -133,29 +135,43 @@ impl ImageStore {
         fs::create_dir_all(self.refs_dir())?;
         fs::create_dir_all(self.tmp_dir())?;
 
-        let staging = self.tmp_dir().join(unique_name("import"));
-        let work_dir = staging.join("work");
-        let staging_layers = staging.join("entry").join("layers");
-        let staging_rootfs = staging_layers.join("rootfs");
-        fs::create_dir_all(&staging_layers)?;
+        let staging = StagingDir::create(&self.tmp_dir(), "import")?;
+        let work_dir = staging.path().join("work");
+        let staging_image_data = staging.path().join("entry").join("image");
+        fs::create_dir_all(&staging_image_data)?;
 
-        let imported = smolvm_pack::oci_archive::import_oci_archive_rootfs(
-            archive_path,
-            &staging_rootfs,
-            &work_dir,
-            platform,
-        )
-        .map_err(|e| Error::storage("import OCI archive", e.to_string()))?;
+        let imported =
+            smolvm_pack::oci_archive::inspect_oci_archive(archive_path, &work_dir, platform)
+                .map_err(|e| Error::storage("import OCI archive", e.to_string()))?;
+        if let Some(layer) = imported
+            .layers
+            .iter()
+            .find(|layer| layer.media_type.ends_with("+zstd"))
+        {
+            return Err(Error::storage(
+                "import OCI archive",
+                format!(
+                    "zstd-compressed local image layers are not supported yet: {}",
+                    layer.digest
+                ),
+            ));
+        }
 
         let reference = reference.unwrap_or(&imported.reference).to_string();
-        let layer_id = imported
-            .layer_digest
+        let key = imported
+            .image_key
             .strip_prefix("sha256:")
-            .unwrap_or(&imported.layer_digest)
+            .unwrap_or(&imported.image_key)
             .to_string();
-        let key = layer_id.clone();
-        let final_rootfs = staging_layers.join(&layer_id);
-        fs::rename(&imported.rootfs_path, &final_rootfs)?;
+        fs::copy(
+            archive_path,
+            staging_image_data.join(IMAGE_OCI_ARCHIVE_FILENAME),
+        )?;
+        let layers = imported
+            .layers
+            .iter()
+            .map(|layer| layer.digest.clone())
+            .collect::<Vec<_>>();
 
         let record = ImportedImageRecord {
             version: STORE_VERSION,
@@ -168,7 +184,7 @@ impl ImageStore {
             last_used_at: crate::util::current_timestamp(),
             architecture: imported.architecture,
             os: imported.os,
-            layer_digest: imported.layer_digest,
+            layers,
             entrypoint: imported.entrypoint,
             cmd: imported.cmd,
             env: imported.env,
@@ -177,13 +193,18 @@ impl ImageStore {
         };
 
         let entry_dir = self.entry_dir(&key);
-        if entry_dir.exists() && !entry_dir.join("layers").join(&layer_id).is_dir() {
+        if entry_dir.exists()
+            && !entry_dir
+                .join("image")
+                .join(IMAGE_OCI_ARCHIVE_FILENAME)
+                .is_file()
+        {
             remove_dir_all_writable(&entry_dir)?;
         }
         if !entry_dir.exists() {
-            fs::rename(staging.join("entry"), &entry_dir)?;
+            fs::rename(staging.path().join("entry"), &entry_dir)?;
         }
-        remove_dir_all_writable(&staging)?;
+        staging.cleanup()?;
 
         self.write_agent_metadata(&record)?;
         self.write_ref(&record)?;
@@ -200,7 +221,7 @@ impl ImageStore {
         if record.version != STORE_VERSION {
             return Ok(None);
         }
-        if !self.layers_dir(&record.key).is_dir() {
+        if !self.image_data_dir(&record.key).is_dir() {
             return Ok(None);
         }
         record.last_used_at = crate::util::current_timestamp();
@@ -222,7 +243,7 @@ impl ImageStore {
             let Ok(record) = read_json::<ImportedImageRecord>(&path) else {
                 continue;
             };
-            if record.version == STORE_VERSION && self.layers_dir(&record.key).is_dir() {
+            if record.version == STORE_VERSION && self.image_data_dir(&record.key).is_dir() {
                 records.push(record);
             }
         }
@@ -264,7 +285,7 @@ impl ImageStore {
                 let Ok(record) = read_json::<ImportedImageRecord>(&path) else {
                     continue;
                 };
-                if record.version != STORE_VERSION || !self.layers_dir(&record.key).is_dir() {
+                if record.version != STORE_VERSION || !self.image_data_dir(&record.key).is_dir() {
                     continue;
                 }
                 if protected.contains(&record.key) {
@@ -321,9 +342,9 @@ impl ImageStore {
         })
     }
 
-    /// Return the host directory that should be mounted as packed layers.
-    pub fn layers_dir(&self, key: &str) -> PathBuf {
-        self.entry_dir(key).join("layers")
+    /// Return the host directory that should be mounted as preloaded image data.
+    pub fn image_data_dir(&self, key: &str) -> PathBuf {
+        self.entry_dir(key).join("image")
     }
 
     fn write_ref(&self, record: &ImportedImageRecord) -> Result<()> {
@@ -333,11 +354,11 @@ impl ImageStore {
 
     fn write_agent_metadata(&self, record: &ImportedImageRecord) -> Result<()> {
         let entry_dir = self.entry_dir(&record.key);
-        let layers_dir = entry_dir.join("layers");
-        fs::create_dir_all(&layers_dir)?;
+        let image_data_dir = entry_dir.join("image");
+        fs::create_dir_all(&image_data_dir)?;
         write_json_atomic(&entry_dir.join("image.json"), record)?;
         write_json_atomic(
-            &layers_dir.join(PACKED_IMAGE_METADATA),
+            &image_data_dir.join(IMAGE_METADATA_FILENAME),
             &record.image_info(),
         )
     }
@@ -375,6 +396,42 @@ fn unique_name(prefix: &str) -> String {
         .map(|d| d.as_nanos())
         .unwrap_or_default();
     format!("{}-{}-{}", prefix, std::process::id(), nanos)
+}
+
+struct StagingDir {
+    path: PathBuf,
+    cleanup_on_drop: bool,
+}
+
+impl StagingDir {
+    fn create(parent: &Path, prefix: &str) -> Result<Self> {
+        let path = parent.join(unique_name(prefix));
+        fs::create_dir_all(&path)?;
+        Ok(Self {
+            path,
+            cleanup_on_drop: true,
+        })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn cleanup(mut self) -> Result<()> {
+        let result = remove_dir_all_writable(&self.path);
+        if result.is_ok() {
+            self.cleanup_on_drop = false;
+        }
+        result
+    }
+}
+
+impl Drop for StagingDir {
+    fn drop(&mut self) {
+        if self.cleanup_on_drop && self.path.exists() {
+            let _ = remove_dir_all_writable(&self.path);
+        }
+    }
 }
 
 fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
@@ -517,17 +574,30 @@ mod tests {
             last_used_at: "1".to_string(),
             architecture: "amd64".to_string(),
             os: "linux".to_string(),
-            layer_digest: format!("sha256:{key}"),
+            layers: vec![format!("sha256:{key}")],
             entrypoint: Vec::new(),
             cmd: Vec::new(),
             env: Vec::new(),
             workdir: None,
             user: None,
         };
-        let layer_dir = store.layers_dir(key).join(key);
-        fs::create_dir_all(&layer_dir).unwrap();
-        fs::write(layer_dir.join("file"), "data").unwrap();
+        let image_data_dir = store.image_data_dir(key);
+        fs::create_dir_all(&image_data_dir).unwrap();
+        fs::write(image_data_dir.join(IMAGE_OCI_ARCHIVE_FILENAME), "data").unwrap();
         store.write_ref(&record).unwrap();
         record
+    }
+
+    #[test]
+    fn failed_import_removes_staging_dir() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = store_in(temp.path());
+        let archive = temp.path().join("broken.oci.tar");
+        fs::write(&archive, "not a tar archive").unwrap();
+
+        let result = store.import_oci_archive(&archive, Some("broken:latest"), None, None);
+
+        assert!(result.is_err());
+        assert_eq!(fs::read_dir(store.tmp_dir()).unwrap().count(), 0);
     }
 }

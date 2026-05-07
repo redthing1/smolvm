@@ -88,7 +88,7 @@ pub fn find_lib_dir() -> Option<PathBuf> {
 /// It should be called in the child process after fork, where
 /// DYLD_LIBRARY_PATH is still available for dlopen to find libkrunfw.
 ///
-/// Optional features for VM launch (SSH agent, packed layers, etc.).
+/// Optional features for VM launch (SSH agent, preloaded image data, etc.).
 ///
 /// Groups optional capabilities that don't affect core VM operation.
 /// New features should be added here rather than as additional parameters
@@ -99,10 +99,10 @@ pub struct LaunchFeatures {
     pub ssh_agent_socket: Option<std::path::PathBuf>,
     /// Hostnames from `--allow-host` to periodically re-resolve for egress policy.
     pub egress_policy_hosts: Option<Vec<String>>,
-    /// Pre-extracted OCI layer directory for machines created from .smolmachine.
+    /// Host directory containing image data mounted for the guest agent.
     /// When set, the launcher mounts this directory via virtiofs so the agent
-    /// can use pre-extracted layers instead of pulling from a registry.
-    pub packed_layers_dir: Option<std::path::PathBuf>,
+    /// can use local image data instead of pulling from a registry.
+    pub preloaded_image_dir: Option<std::path::PathBuf>,
     /// Additional disk images to attach to the VM (path, read_only).
     /// Appear as /dev/vdc, /dev/vdd, ... after the storage and overlay disks.
     pub extra_disks: Vec<(std::path::PathBuf, bool)>,
@@ -126,9 +126,8 @@ pub struct LaunchConfig<'a> {
     pub resources: VmResources,
     /// Host SSH agent socket path for forwarding into the guest.
     pub ssh_agent_socket: Option<&'a Path>,
-    /// Pre-extracted OCI layers directory for .smolmachine-sourced machines.
-    /// Mounted via virtiofs as "smolvm_layers" so the agent uses packed layers.
-    pub packed_layers_dir: Option<&'a Path>,
+    /// Host directory containing image data mounted for the guest agent.
+    pub preloaded_image_dir: Option<&'a Path>,
     /// Additional disk images (path, read_only). Appear as /dev/vdc, /dev/vdd, ...
     pub extra_disks: &'a [(std::path::PathBuf, bool)],
     /// Hostnames to periodically re-resolve for the live egress policy.
@@ -152,7 +151,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         port_mappings,
         resources,
         ssh_agent_socket,
-        packed_layers_dir,
+        preloaded_image_dir,
         extra_disks,
         egress_refresh_hosts,
     } = config;
@@ -556,18 +555,15 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             }
         }
 
-        // Mount pre-extracted OCI layers for .smolmachine-sourced machines.
-        // The agent detects this via SMOLVM_PACKED_LAYERS and uses the layers
-        // as container overlay lowerdirs instead of pulling from a registry.
-        if let Some(layers_dir) = packed_layers_dir {
-            if layers_dir.exists() {
-                let tag = cstr("smolvm_layers");
-                let host_path = path_to_cstring(layers_dir)?;
+        if let Some(image_dir) = preloaded_image_dir {
+            if image_dir.exists() {
+                let tag = cstr("smolvm_image");
+                let host_path = path_to_cstring(image_dir)?;
                 if krun_add_virtiofs(ctx, tag.as_ptr(), host_path.as_ptr()) < 0 {
                     krun_free_ctx(ctx);
                     return Err(Error::agent(
-                        "add packed layers virtiofs",
-                        "krun_add_virtiofs failed for packed layers",
+                        "add image data virtiofs",
+                        "krun_add_virtiofs failed for preloaded image data",
                     ));
                 }
             }
@@ -655,9 +651,8 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             env_strings.push(cstr(&format!("{}={}", guest_env::DNS, network.dns_server)));
         }
 
-        // Tell the agent about pre-extracted packed layers
-        if packed_layers_dir.is_some_and(|d| d.exists()) {
-            env_strings.push(cstr("SMOLVM_PACKED_LAYERS=smolvm_layers:/packed_layers"));
+        if preloaded_image_dir.is_some_and(|d| d.exists()) {
+            env_strings.push(cstr("SMOLVM_PRELOADED_IMAGE=smolvm_image:/preloaded_image"));
         }
 
         let mut envp: Vec<*const libc::c_char> = env_strings.iter().map(|s| s.as_ptr()).collect();

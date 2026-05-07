@@ -214,13 +214,13 @@ fn main() {
     // before this point, ensure_storage_mounted() handles the mount on demand.
     ensure_storage_mounted();
 
-    // Initialize packed layers support (if SMOLVM_PACKED_LAYERS env var is set)
+    // Initialize preloaded image data if the launcher provided it.
     let t0 = uptime_ms();
-    if let Some(packed_dir) = storage::get_packed_layers_dir() {
+    if let Some(image_dir) = storage::get_preloaded_image_dir() {
         info!(
             duration_ms = uptime_ms() - t0,
-            packed_dir = %packed_dir.display(),
-            "packed layers initialized"
+            image_dir = %image_dir.display(),
+            "preloaded image data initialized"
         );
     }
 

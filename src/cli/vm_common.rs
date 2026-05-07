@@ -696,7 +696,7 @@ pub fn start_vm_named(name: &str) -> smolvm::Result<()> {
     let mut features = smolvm::agent::LaunchFeatures {
         ssh_agent_socket,
         egress_policy_hosts: record.egress_policy_hosts.clone(),
-        packed_layers_dir: None,
+        preloaded_image_dir: None,
         extra_disks: Vec::new(),
     };
 
@@ -720,14 +720,14 @@ pub fn start_vm_named(name: &str) -> smolvm::Result<()> {
             .map_err(|e| Error::agent("extract sidecar", e.to_string()))?;
         let layers_lease = smolvm_pack::extract::acquire_layers_lease(&cache_dir, false)
             .map_err(|e| Error::agent("acquire layers lease", e.to_string()))?;
-        features.packed_layers_dir = Some(layers_lease.path.clone());
+        features.preloaded_image_dir = Some(layers_lease.path.clone());
         // Leak the lease — the volume must stay mounted while the VM runs.
         // Cleanup happens via `pack prune` or on next `machine start`.
         std::mem::forget(layers_lease);
     } else if let Some(ref key) = record.source_imported_image {
         let store = ImageStore::open()?;
-        let layers_dir = store.layers_dir(key);
-        if !layers_dir.is_dir() {
+        let image_data_dir = store.image_data_dir(key);
+        if !image_data_dir.is_dir() {
             return Err(Error::agent(
                 "start machine",
                 format!(
@@ -736,7 +736,7 @@ pub fn start_vm_named(name: &str) -> smolvm::Result<()> {
                 ),
             ));
         }
-        features.packed_layers_dir = Some(layers_dir);
+        features.preloaded_image_dir = Some(image_data_dir);
     }
 
     let _ = manager

@@ -353,9 +353,8 @@ pub fn launch_agent_vm_dynamic(
         cstr("TERM=xterm-256color"),
     ];
 
-    // Tell agent about packed layers mount
     if config.layers_dir.exists() {
-        env_strings.push(cstr("SMOLVM_PACKED_LAYERS=smolvm_layers:/packed_layers"));
+        env_strings.push(cstr("SMOLVM_PRELOADED_IMAGE=smolvm_image:/preloaded_image"));
     }
 
     // Pass mount info to the agent via environment
@@ -419,16 +418,16 @@ pub fn launch_agent_vm_dynamic(
         free_ctx_on_err!("krun_set_exec failed");
     }
 
-    // Add virtiofs mount for packed layers (AFTER set_exec)
+    // Add preloaded image data mount (AFTER set_exec)
     if config.layers_dir.exists() {
-        let layers_tag = cstr("smolvm_layers");
+        let layers_tag = cstr("smolvm_image");
         let layers_path = try_or_free_ctx!(
             path_to_cstring(config.layers_dir),
             "layers dir path contains null byte"
         );
         // SAFETY: ctx is valid, tag and path are valid C strings
         if unsafe { (krun.add_virtiofs)(ctx, layers_tag.as_ptr(), layers_path.as_ptr()) } < 0 {
-            free_ctx_on_err!("krun_add_virtiofs failed for packed layers");
+            free_ctx_on_err!("krun_add_virtiofs failed for preloaded image data");
         }
     }
 

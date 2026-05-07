@@ -1093,7 +1093,7 @@ impl AgentManager {
             resources: resources_for_config.clone(),
             ssh_agent_socket: features.ssh_agent_socket,
             egress_policy_hosts: features.egress_policy_hosts,
-            packed_layers_dir: features.packed_layers_dir,
+            preloaded_image_dir: features.preloaded_image_dir,
             extra_disks: features.extra_disks,
         };
         let config_path = self

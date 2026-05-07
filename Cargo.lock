@@ -2058,6 +2058,7 @@ dependencies = [
  "serde",
  "serde_json",
  "smolvm-network",
+ "smolvm-pack",
  "smolvm-protocol",
  "tempfile",
  "tracing",
