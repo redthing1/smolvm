@@ -7,10 +7,10 @@
 use crate::data::consts::{
     ENV_SMOLVM_GPU, ENV_SMOLVM_KRUN_LOG_LEVEL, ENV_SMOLVM_LIB_DIR, ENV_VALUE_ON,
 };
-use crate::data::storage::HostMount;
 use crate::error::{Error, Result};
 use crate::network::backend::{COMPAT_NET_FEATURES, TSI_FEATURE_HIJACK_INET};
 use crate::network::{plan_launch_network, EffectiveNetworkBackend};
+use crate::security::prepare::{PreparedDisk, PreparedMount};
 use crate::storage::{OverlayDisk, StorageDisk};
 use crate::util::{libkrun_filename, libkrunfw_filename};
 
@@ -118,18 +118,18 @@ pub struct LaunchConfig<'a> {
     pub vsock_socket: &'a Path,
     /// Optional path to write console output.
     pub console_log: Option<&'a Path>,
-    /// Host directory mounts to expose to the guest.
-    pub mounts: &'a [HostMount],
+    /// Prepared host directory mounts to expose to the guest.
+    pub mounts: &'a [PreparedMount],
     /// Port mappings (host:guest).
     pub port_mappings: &'a [PortMapping],
     /// VM resources (CPU, memory, network, disk sizes).
     pub resources: VmResources,
     /// Host SSH agent socket path for forwarding into the guest.
     pub ssh_agent_socket: Option<&'a Path>,
-    /// Host directory containing image data mounted for the guest agent.
-    pub preloaded_image_dir: Option<&'a Path>,
-    /// Additional disk images (path, read_only). Appear as /dev/vdc, /dev/vdd, ...
-    pub extra_disks: &'a [(std::path::PathBuf, bool)],
+    /// Prepared host directory containing image data mounted for the guest agent.
+    pub preloaded_image_mount: Option<&'a PreparedMount>,
+    /// Additional disk images. Appear as /dev/vdc, /dev/vdd, ...
+    pub extra_disks: &'a [PreparedDisk],
     /// Hostnames to periodically re-resolve for the live egress policy.
     /// When set, a background thread re-resolves these every 5 minutes and
     /// atomically replaces the CIDR list via the Arc handle obtained from
@@ -151,7 +151,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         port_mappings,
         resources,
         ssh_agent_socket,
-        preloaded_image_dir,
+        preloaded_image_mount,
         extra_disks,
         egress_refresh_hosts,
     } = config;
@@ -187,7 +187,6 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         let krun_add_vsock_port2 = krun.add_vsock_port2;
         let krun_set_console_output = krun.set_console_output;
         let krun_set_port_map = krun.set_port_map;
-        let krun_add_virtiofs = krun.add_virtiofs;
         let krun_start_enter = krun.start_enter;
         let krun_disable_implicit_vsock = krun.disable_implicit_vsock;
         let krun_add_vsock = krun.add_vsock;
@@ -453,7 +452,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
 
         // Add extra disks (e.g., source VM storage for --from-vm export)
         // These appear as /dev/vdc, /dev/vdd, ... after storage and overlay
-        for (i, (disk_path, read_only)) in extra_disks.iter().enumerate() {
+        for (i, disk) in extra_disks.iter().enumerate() {
             let block_id_str = format!("extra{}", i);
             let block_id = try_or_free_ctx!(
                 CString::new(block_id_str.as_str()),
@@ -461,18 +460,23 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                 "block id contains null byte"
             );
             let path = try_or_free_ctx!(
-                path_to_cstring(disk_path),
+                path_to_cstring(&disk.path_for_vmm),
                 "add extra disk",
                 "path contains null byte"
             );
-            if krun_add_disk2(ctx, block_id.as_ptr(), path.as_ptr(), 0, *read_only) < 0 {
+            if krun_add_disk2(ctx, block_id.as_ptr(), path.as_ptr(), 0, disk.read_only) < 0 {
                 krun_free_ctx(ctx);
                 return Err(Error::agent(
                     "add extra disk",
                     format!("krun_add_disk2 failed for extra disk {}", i),
                 ));
             }
-            tracing::debug!(disk = i, path = %disk_path.display(), read_only, "added extra disk");
+            tracing::debug!(
+                disk = i,
+                path = %disk.path_for_vmm.display(),
+                read_only = disk.read_only,
+                "added extra disk"
+            );
         }
 
         // Add vsock port for control channel (critical - host-guest communication)
@@ -519,52 +523,30 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             }
         }
 
-        // Add virtiofs mounts
-        // Each mount gets a tag like "smolvm0", "smolvm1", etc.
-        // The guest must mount these manually (or via the agent)
-        for (i, mount) in mounts.iter().enumerate() {
-            let mount_tag = HostMount::mount_tag(i);
-            let tag = try_or_free_ctx!(
-                CString::new(mount_tag.clone()),
-                "configure mount",
-                "mount tag contains null byte"
-            );
-            let host_path = try_or_free_ctx!(
-                path_to_cstring(&mount.source),
-                "configure mount",
-                "mount path contains null byte"
-            );
-
+        // Add prepared virtiofs mounts. Tags and VMM-facing paths are assigned
+        // before the launcher so future jail-path rewriting stays out of this
+        // libkrun setup code.
+        for mount in mounts.iter() {
             tracing::debug!(
-                tag = %mount_tag,
-                host = %mount.source.display(),
-                guest = %mount.target.display(),
-                read_only = mount.read_only,
+                tag = %mount.tag,
+                host = %mount.host_source.display(),
+                vmm_path = %mount.source_for_vmm.display(),
+                guest = %mount.guest_target.display(),
+                read_only = mount.access.is_read_only(),
                 "adding virtiofs mount"
             );
 
-            if krun_add_virtiofs(ctx, tag.as_ptr(), host_path.as_ptr()) < 0 {
+            if let Err(e) = add_virtiofs_prepared(&krun, ctx, mount) {
                 krun_free_ctx(ctx);
-                return Err(Error::agent(
-                    "add virtiofs mount",
-                    format!(
-                        "krun_add_virtiofs failed for '{}' - requested mount cannot be attached",
-                        mount.source.display()
-                    ),
-                ));
+                return Err(e);
             }
         }
 
-        if let Some(image_dir) = preloaded_image_dir {
-            if image_dir.exists() {
-                let tag = cstr("smolvm_image");
-                let host_path = path_to_cstring(image_dir)?;
-                if krun_add_virtiofs(ctx, tag.as_ptr(), host_path.as_ptr()) < 0 {
+        if let Some(image_mount) = preloaded_image_mount {
+            if image_mount.source_for_vmm.exists() {
+                if let Err(e) = add_virtiofs_prepared(&krun, ctx, image_mount) {
                     krun_free_ctx(ctx);
-                    return Err(Error::agent(
-                        "add image data virtiofs",
-                        "krun_add_virtiofs failed for preloaded image data",
-                    ));
+                    return Err(e);
                 }
             }
         }
@@ -583,14 +565,12 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         // Pass mount info to the agent via environment
         // Format: SMOLVM_MOUNT_0=tag:guest_path:ro
         for (i, mount) in mounts.iter().enumerate() {
-            let mount_tag = HostMount::mount_tag(i);
-            let ro_flag = if mount.read_only { "ro" } else { "rw" };
             let env_val = format!(
                 "SMOLVM_MOUNT_{}={}:{}:{}",
                 i,
-                mount_tag,
-                mount.target.display(),
-                ro_flag
+                mount.tag,
+                mount.guest_target.display(),
+                mount.access.agent_flag()
             );
             if let Ok(cstr) = CString::new(env_val) {
                 env_strings.push(cstr);
@@ -651,7 +631,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             env_strings.push(cstr(&format!("{}={}", guest_env::DNS, network.dns_server)));
         }
 
-        if preloaded_image_dir.is_some_and(|d| d.exists()) {
+        if preloaded_image_mount.is_some_and(|mount| mount.source_for_vmm.exists()) {
             env_strings.push(cstr("SMOLVM_PRELOADED_IMAGE=smolvm_image:/preloaded_image"));
         }
 
@@ -755,6 +735,18 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             format!("krun_start_enter returned: {}", ret),
         ))
     }
+}
+
+fn add_virtiofs_prepared(krun: &KrunFunctions, ctx: u32, mount: &PreparedMount) -> Result<()> {
+    unsafe {
+        krun.add_virtiofs_path(
+            ctx,
+            &mount.tag,
+            &mount.source_for_vmm,
+            mount.access.is_read_only(),
+        )
+    }
+    .map_err(|err| Error::agent("add virtiofs mount", err.to_string()))
 }
 
 /// Create a CString from a static string that is known not to contain NUL bytes.

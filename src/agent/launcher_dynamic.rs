@@ -25,7 +25,7 @@ use super::VmResources;
 pub struct PackedMount {
     /// Virtiofs tag (e.g., "smolvm0").
     pub tag: String,
-    /// Host source path (passed to `krun_add_virtiofs`).
+    /// Host source path exposed through libkrun virtio-fs setup.
     pub host_path: String,
     /// Guest mount path (passed to agent via `SMOLVM_MOUNT_*` env).
     pub guest_path: String,
@@ -420,34 +420,16 @@ pub fn launch_agent_vm_dynamic(
 
     // Add preloaded image data mount (AFTER set_exec)
     if config.layers_dir.exists() {
-        let layers_tag = cstr("smolvm_image");
-        let layers_path = try_or_free_ctx!(
-            path_to_cstring(config.layers_dir),
-            "layers dir path contains null byte"
-        );
-        // SAFETY: ctx is valid, tag and path are valid C strings
-        if unsafe { (krun.add_virtiofs)(ctx, layers_tag.as_ptr(), layers_path.as_ptr()) } < 0 {
-            free_ctx_on_err!("krun_add_virtiofs failed for preloaded image data");
+        if let Err(e) = add_virtiofs_path(krun, ctx, "smolvm_image", config.layers_dir, true) {
+            free_ctx_on_err!(e);
         }
     }
 
     // Add user-specified virtiofs mounts
     for mount in config.mounts.iter() {
-        let tag = try_or_free_ctx!(
-            CString::new(mount.tag.as_str()),
-            "mount tag contains null byte"
-        );
-        let host_path = try_or_free_ctx!(
-            CString::new(mount.host_path.as_str()),
-            "mount path contains null byte"
-        );
-
-        // SAFETY: ctx is valid, tag and host_path are valid C strings
-        if unsafe { (krun.add_virtiofs)(ctx, tag.as_ptr(), host_path.as_ptr()) } < 0 {
-            free_ctx_on_err!(format!(
-                "krun_add_virtiofs failed for '{}' - requested mount cannot be attached",
-                mount.tag
-            ));
+        let host_path = Path::new(&mount.host_path);
+        if let Err(e) = add_virtiofs_path(krun, ctx, &mount.tag, host_path, mount.read_only) {
+            free_ctx_on_err!(e);
         }
     }
 
@@ -460,6 +442,16 @@ pub fn launch_agent_vm_dynamic(
     unsafe { (krun.free_ctx)(ctx) };
     drop(virtio_network_runtime);
     Err(format!("krun_start_enter returned: {}", ret))
+}
+
+fn add_virtiofs_path(
+    krun: &KrunFunctions,
+    ctx: u32,
+    tag: &str,
+    path: &Path,
+    read_only: bool,
+) -> Result<(), String> {
+    unsafe { krun.add_virtiofs_path(ctx, tag, path, read_only) }.map_err(|err| err.to_string())
 }
 
 /// Create a CString from a static string that is known not to contain NUL bytes.

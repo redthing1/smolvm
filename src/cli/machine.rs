@@ -221,7 +221,7 @@ pub struct RunCmd {
     #[arg(
         short = 'v',
         long = "volume",
-        value_name = "HOST:CONTAINER[:ro]",
+        value_name = "HOST:CONTAINER[:ro|:rw]",
         help_heading = "Container"
     )]
     pub volume: Vec<String>,
@@ -1117,7 +1117,7 @@ pub struct CreateCmd {
     pub overlay: Option<u64>,
 
     /// Mount host directory (can be used multiple times)
-    #[arg(short = 'v', long = "volume", value_name = "HOST:GUEST[:ro]")]
+    #[arg(short = 'v', long = "volume", value_name = "HOST:GUEST[:ro|:rw]")]
     pub volume: Vec<String>,
 
     /// Expose port from VM to host (can be used multiple times)

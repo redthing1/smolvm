@@ -115,7 +115,6 @@ impl LibkrunVm {
             let krun_set_root = krun.set_root;
             let krun_set_workdir = krun.set_workdir;
             let krun_set_exec = krun.set_exec;
-            let krun_add_virtiofs = krun.add_virtiofs;
             let krun_set_port_map = krun.set_port_map;
             let krun_add_disk2 = krun.add_disk2;
             let krun_add_vsock_port2 = krun.add_vsock_port2;
@@ -222,38 +221,31 @@ impl LibkrunVm {
 
             // Add virtiofs mounts for host directories
             for (i, mount) in config.mounts.iter().enumerate() {
-                let tag = CString::new(HostMount::mount_tag(i))
-                    .map_err(|_| Error::mount("create mount tag", "tag contains null byte"))?;
-                let path = path_to_cstring(&mount.source)?;
-
-                if krun_add_virtiofs(ctx, tag.as_ptr(), path.as_ptr()) < 0 {
-                    tracing::warn!(
-                        "failed to add virtiofs mount: {} -> {}",
-                        mount.source.display(),
-                        mount.target.display()
-                    );
+                let tag = HostMount::mount_tag(i);
+                if let Err(err) = krun.add_virtiofs_path(ctx, &tag, &mount.source, mount.read_only)
+                {
+                    krun_free_ctx(ctx);
+                    return Err(Error::mount("add virtiofs mount", err.to_string()));
                 }
             }
 
             // Add Rosetta virtiofs mount if enabled
             if rosetta_enabled {
                 if let Some(runtime_path) = rosetta::runtime_path() {
-                    let tag = CString::new(rosetta::ROSETTA_TAG).map_err(|_| {
-                        Error::mount("create rosetta tag", "tag contains null byte")
-                    })?;
-                    let path = CString::new(runtime_path).map_err(|_| {
-                        Error::mount("create rosetta path", "path contains null byte")
-                    })?;
-
-                    if krun_add_virtiofs(ctx, tag.as_ptr(), path.as_ptr()) < 0 {
-                        tracing::warn!("failed to add Rosetta virtiofs mount");
-                    } else {
-                        tracing::debug!(
-                            tag = rosetta::ROSETTA_TAG,
-                            path = runtime_path,
-                            "added Rosetta virtiofs mount"
-                        );
+                    if let Err(err) = krun.add_virtiofs_path(
+                        ctx,
+                        rosetta::ROSETTA_TAG,
+                        Path::new(runtime_path),
+                        true,
+                    ) {
+                        krun_free_ctx(ctx);
+                        return Err(Error::mount("add rosetta virtiofs mount", err.to_string()));
                     }
+                    tracing::debug!(
+                        tag = rosetta::ROSETTA_TAG,
+                        path = runtime_path,
+                        "added Rosetta virtiofs mount"
+                    );
                 }
             }
 

@@ -145,7 +145,7 @@ pub struct PackRunCmd {
     #[arg(
         short = 'v',
         long = "volume",
-        value_name = "HOST:CONTAINER[:ro]",
+        value_name = "HOST:CONTAINER[:ro|:rw]",
         help_heading = "Container"
     )]
     pub volume: Vec<String>,
@@ -846,8 +846,8 @@ struct PackedRunArgs {
     #[arg(short = 'e', long = "env", value_name = "KEY=VALUE")]
     env: Vec<String>,
 
-    /// Mount a volume (HOST:GUEST[:ro])
-    #[arg(short = 'v', long = "volume", value_name = "HOST:GUEST[:ro]")]
+    /// Mount a volume (HOST:GUEST[:ro|:rw])
+    #[arg(short = 'v', long = "volume", value_name = "HOST:GUEST[:ro|:rw]")]
     volume: Vec<String>,
 
     /// Expose port from container to host
@@ -898,8 +898,8 @@ struct PackedStartArgs {
     #[arg(long, value_name = "GiB")]
     overlay: Option<u64>,
 
-    /// Mount a volume (HOST:GUEST[:ro])
-    #[arg(short = 'v', long = "volume", value_name = "HOST:GUEST[:ro]")]
+    /// Mount a volume (HOST:GUEST[:ro|:rw])
+    #[arg(short = 'v', long = "volume", value_name = "HOST:GUEST[:ro|:rw]")]
     volume: Vec<String>,
 
     /// Expose port from container to host

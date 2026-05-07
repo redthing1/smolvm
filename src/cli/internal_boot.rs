@@ -29,10 +29,13 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
     // Clean up the config file — it's no longer needed
     let _ = std::fs::remove_file(&config_path);
 
+    let policy = smolvm::security::policy::LaunchPolicy::from_boot_config(config)?;
+    let prepared = smolvm::security::prepare::PreparedLaunch::prepare(policy)?;
+
     // Redirect stdio. When SMOLVM_GPU_DEBUG=1, keep stderr pointed at a
     // debug log file so virglrenderer/MoltenVK errors are captured.
     if std::env::var_os("SMOLVM_GPU_DEBUG").is_some() {
-        if let Some(ref log) = config.console_log {
+        if let Some(ref log) = prepared.policy.console_log {
             let debug_path = log.with_file_name("gpu-debug.log");
             if let Ok(cpath) = std::ffi::CString::new(debug_path.to_string_lossy().as_bytes()) {
                 unsafe {
@@ -57,9 +60,11 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
                 libc::close(devnull);
             }
         }
-    } else if let Err(e) = smolvm::process::detach_stdio_to_stderr_file(&config.startup_error_log) {
+    } else if let Err(e) =
+        smolvm::process::detach_stdio_to_stderr_file(&prepared.policy.startup_error_log)
+    {
         let _ = std::fs::write(
-            &config.startup_error_log,
+            &prepared.policy.startup_error_log,
             format!("failed to redirect stdio: {}", e),
         );
         smolvm::process::exit_child(1);
@@ -78,13 +83,13 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
 
     // Open storage and overlay disks
     let storage_disk = match smolvm::storage::StorageDisk::open_or_create_at(
-        &config.storage_disk_path,
-        config.storage_size_gb,
+        &prepared.policy.storage_disk_path,
+        prepared.policy.storage_size_gb,
     ) {
         Ok(d) => d,
         Err(e) => {
             let _ = std::fs::write(
-                &config.startup_error_log,
+                &prepared.policy.startup_error_log,
                 format!("failed to open storage disk: {}", e),
             );
             smolvm::process::exit_child(1);
@@ -92,13 +97,13 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
     };
 
     let overlay_disk = match smolvm::storage::OverlayDisk::open_or_create_at(
-        &config.overlay_disk_path,
-        config.overlay_size_gb,
+        &prepared.policy.overlay_disk_path,
+        prepared.policy.overlay_size_gb,
     ) {
         Ok(d) => d,
         Err(e) => {
             let _ = std::fs::write(
-                &config.startup_error_log,
+                &prepared.policy.startup_error_log,
                 format!("failed to open overlay disk: {}", e),
             );
             smolvm::process::exit_child(1);
@@ -112,17 +117,17 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
     };
 
     let result = launch_agent_vm(&LaunchConfig {
-        rootfs_path: &config.rootfs_path,
+        rootfs_path: &prepared.policy.rootfs_path,
         disks: &disks,
-        vsock_socket: &config.vsock_socket,
-        console_log: config.console_log.as_deref(),
-        mounts: &config.mounts,
-        port_mappings: &config.ports,
-        resources: config.resources,
-        ssh_agent_socket: config.ssh_agent_socket.as_deref(),
-        preloaded_image_dir: config.preloaded_image_dir.as_deref(),
-        extra_disks: &config.extra_disks,
-        egress_refresh_hosts: config.egress_policy_hosts.clone(),
+        vsock_socket: &prepared.policy.vsock_socket,
+        console_log: prepared.policy.console_log.as_deref(),
+        mounts: &prepared.mounts,
+        port_mappings: &prepared.policy.ports,
+        resources: prepared.policy.resources.clone(),
+        ssh_agent_socket: prepared.policy.secrets.ssh_agent_socket.as_deref(),
+        preloaded_image_mount: prepared.preloaded_image_mount.as_ref(),
+        extra_disks: &prepared.extra_disks,
+        egress_refresh_hosts: prepared.policy.egress_policy_hosts.clone(),
     });
 
     // If we get here, launch_agent_vm returned (should only happen on error)
@@ -130,7 +135,7 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
         let _ = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(&config.startup_error_log)
+            .open(&prepared.policy.startup_error_log)
             .and_then(|mut file| {
                 use std::io::Write;
                 writeln!(file, "{e}")

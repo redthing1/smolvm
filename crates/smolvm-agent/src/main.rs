@@ -229,7 +229,13 @@ fn main() {
     // `-v host:/workspace`, the bind mount claims /workspace first and
     // the symlink's `!exists()` guard correctly skips creation.
     let t0 = uptime_ms();
-    let boot_mounts = storage::init_volume_mounts();
+    let boot_mounts = match storage::init_volume_mounts() {
+        Ok(mounts) => mounts,
+        Err(err) => {
+            error!(error = %err, "failed to initialize volume mounts");
+            std::process::exit(1);
+        }
+    };
     if !boot_mounts.is_empty() {
         info!(
             duration_ms = uptime_ms() - t0,

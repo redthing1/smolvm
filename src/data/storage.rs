@@ -18,6 +18,39 @@ pub const OVERLAY_DISK_FILENAME: &str = "overlay.raw";
 /// Storage disk filename.
 pub const STORAGE_DISK_FILENAME: &str = "storage.raw";
 
+/// Access mode for a host directory mount.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum MountAccess {
+    /// Guest may read files from the mounted host directory but not modify them.
+    ReadOnly,
+    /// Guest may read and modify files in the mounted host directory.
+    ReadWrite,
+}
+
+impl MountAccess {
+    /// Convert the persisted `read_only` flag into the internal access enum.
+    pub fn from_read_only(read_only: bool) -> Self {
+        if read_only {
+            Self::ReadOnly
+        } else {
+            Self::ReadWrite
+        }
+    }
+
+    /// Whether this access mode is read-only.
+    pub fn is_read_only(self) -> bool {
+        matches!(self, Self::ReadOnly)
+    }
+
+    /// Mount mode string passed to the guest agent.
+    pub fn agent_flag(self) -> &'static str {
+        match self {
+            Self::ReadOnly => "ro",
+            Self::ReadWrite => "rw",
+        }
+    }
+}
+
 /// Host directory mount.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HostMount {
@@ -27,7 +60,8 @@ pub struct HostMount {
     /// Path inside the guest.
     pub target: PathBuf,
 
-    /// Read-only mount (default: true per DESIGN.md).
+    /// Read-only mount flag. `host:guest` defaults to read-write; use `:ro`
+    /// to request read-only access.
     pub read_only: bool,
 }
 
@@ -127,6 +161,11 @@ impl HostMount {
         specs.iter().map(|spec| Self::_parse(spec)).collect()
     }
 
+    /// Return the internal access mode for this mount.
+    pub fn access(&self) -> MountAccess {
+        MountAccess::from_read_only(self.read_only)
+    }
+
     fn validate(mount: &Self) -> Result<()> {
         for (illegal_path, block_subtree) in Self::ILLEGAL_SOURCE_MOUNT_PATH {
             let illegal_path = Path::new(illegal_path);
@@ -195,6 +234,20 @@ mod tests {
     }
 
     #[test]
+    fn test_mount_access_from_read_only_flag() {
+        assert_eq!(MountAccess::from_read_only(true), MountAccess::ReadOnly);
+        assert_eq!(MountAccess::from_read_only(false), MountAccess::ReadWrite);
+        assert!(MountAccess::ReadOnly.is_read_only());
+        assert!(!MountAccess::ReadWrite.is_read_only());
+    }
+
+    #[test]
+    fn test_mount_access_agent_flag() {
+        assert_eq!(MountAccess::ReadOnly.agent_flag(), "ro");
+        assert_eq!(MountAccess::ReadWrite.agent_flag(), "rw");
+    }
+
+    #[test]
     fn test_new_mount_rejects_illegal_source_mount_path() {
         for path in ["/", "/etc", "/var", "/var/run", "/var/log"] {
             let result = HostMount::new(path, "/guest/path", true);
@@ -236,18 +289,21 @@ mod tests {
         assert_eq!(mount.source, PathBuf::from("/tmp").canonicalize().unwrap());
         assert_eq!(mount.target, PathBuf::from("/guest/path"));
         assert!(!mount.read_only);
+        assert_eq!(mount.access(), MountAccess::ReadWrite);
     }
 
     #[test]
     fn test_parse_mount_spec_read_only() {
         let mount = parse_one("/tmp:/guest/path:ro");
         assert!(mount.read_only);
+        assert_eq!(mount.access(), MountAccess::ReadOnly);
     }
 
     #[test]
     fn test_parse_mount_spec_explicit_rw() {
         let mount = parse_one("/tmp:/guest/path:rw");
         assert!(!mount.read_only);
+        assert_eq!(mount.access(), MountAccess::ReadWrite);
     }
 
     #[test]

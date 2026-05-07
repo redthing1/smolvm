@@ -36,7 +36,7 @@ pub struct HostMountConfig {
     pub source: String,
     /// Absolute path inside the guest.
     pub target: String,
-    /// Mount as read-only (default: true).
+    /// Mount as read-only. Defaults to false, matching the CLI's read-write default.
     pub read_only: Option<bool>,
 }
 
@@ -152,7 +152,7 @@ impl TryFrom<&HostMountConfig> for HostMount {
     type Error = smolvm::error::Error;
 
     fn try_from(m: &HostMountConfig) -> Result<Self, Self::Error> {
-        HostMount::new(&m.source, &m.target, m.read_only.unwrap_or(true))
+        HostMount::new(&m.source, &m.target, m.read_only.unwrap_or(false))
     }
 }
 
@@ -266,5 +266,31 @@ mod tests {
 
         assert!(resources.gpu);
         assert_eq!(resources.gpu_vram_mib, Some(2048));
+    }
+
+    #[test]
+    fn host_mount_config_defaults_to_read_write() {
+        let config = HostMountConfig {
+            source: "/tmp".to_string(),
+            target: "/guest".to_string(),
+            read_only: None,
+        };
+
+        let mount = HostMount::try_from(&config).unwrap();
+
+        assert!(!mount.read_only);
+    }
+
+    #[test]
+    fn host_mount_config_preserves_explicit_read_only() {
+        let config = HostMountConfig {
+            source: "/tmp".to_string(),
+            target: "/guest".to_string(),
+            read_only: Some(true),
+        };
+
+        let mount = HostMount::try_from(&config).unwrap();
+
+        assert!(mount.read_only);
     }
 }

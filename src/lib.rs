@@ -76,6 +76,8 @@ pub mod network;
 pub mod platform;
 pub mod process;
 pub mod registry;
+/// Internal launch policy and hardening preparation support.
+pub mod security;
 pub mod smolfile;
 pub mod storage;
 pub mod util;

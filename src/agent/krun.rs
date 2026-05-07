@@ -34,6 +34,9 @@ pub struct KrunFunctions {
         unsafe extern "C" fn(u32, *const libc::c_char, *const libc::c_char, u32, bool) -> i32,
     pub add_vsock_port2: unsafe extern "C" fn(u32, u32, *const libc::c_char, bool) -> i32,
     pub add_virtiofs: unsafe extern "C" fn(u32, *const libc::c_char, *const libc::c_char) -> i32,
+    pub add_virtiofs3: Option<
+        unsafe extern "C" fn(u32, *const libc::c_char, *const libc::c_char, u64, bool) -> i32,
+    >,
     pub start_enter: unsafe extern "C" fn(u32) -> i32,
     pub disable_implicit_vsock: unsafe extern "C" fn(u32) -> i32,
     pub add_vsock: unsafe extern "C" fn(u32, u32) -> i32,
@@ -125,6 +128,7 @@ impl KrunFunctions {
             add_disk2: load_sym!(krun_add_disk2),
             add_vsock_port2: load_sym!(krun_add_vsock_port2),
             add_virtiofs: load_sym!(krun_add_virtiofs),
+            add_virtiofs3: load_optional_sym!("krun_add_virtiofs3"),
             start_enter: load_sym!(krun_start_enter),
             disable_implicit_vsock: load_sym!(krun_disable_implicit_vsock),
             add_vsock: load_sym!(krun_add_vsock),
@@ -134,6 +138,99 @@ impl KrunFunctions {
             get_egress_handle: load_optional_sym!("krun_get_egress_handle"),
             set_gpu_options2: load_optional_sym!("krun_set_gpu_options2"),
         })
+    }
+
+    /// Add a virtio-fs mount, enforcing read-only access when requested.
+    ///
+    /// # Safety
+    ///
+    /// Caller must ensure `ctx` is a live libkrun context.
+    pub(crate) unsafe fn add_virtiofs_path(
+        &self,
+        ctx: u32,
+        tag: &str,
+        path: &Path,
+        read_only: bool,
+    ) -> Result<(), VirtiofsAddError> {
+        let tag_c = CString::new(tag).map_err(|_| VirtiofsAddError::TagContainsNull)?;
+        let path_c = CString::new(path.to_string_lossy().as_bytes())
+            .map_err(|_| VirtiofsAddError::PathContainsNull)?;
+
+        let tag = tag.to_string();
+        let path = path.display().to_string();
+
+        match select_virtiofs_add_mode(read_only, self.add_virtiofs3.is_some()) {
+            VirtiofsAddMode::Add3 { read_only } => {
+                let add3 = self
+                    .add_virtiofs3
+                    .expect("add3 availability checked by selected mode");
+                let rc = unsafe { add3(ctx, tag_c.as_ptr(), path_c.as_ptr(), 0, read_only) };
+                if rc < 0 {
+                    return Err(VirtiofsAddError::Add3Failed { tag, path });
+                }
+            }
+            VirtiofsAddMode::LegacyReadWrite => {
+                let rc = unsafe { (self.add_virtiofs)(ctx, tag_c.as_ptr(), path_c.as_ptr()) };
+                if rc < 0 {
+                    return Err(VirtiofsAddError::LegacyFailed { tag, path });
+                }
+            }
+            VirtiofsAddMode::UnsupportedReadOnly => {
+                return Err(VirtiofsAddError::UnsupportedReadOnly { tag, path });
+            }
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VirtiofsAddMode {
+    Add3 { read_only: bool },
+    LegacyReadWrite,
+    UnsupportedReadOnly,
+}
+
+pub(crate) fn select_virtiofs_add_mode(read_only: bool, add3_available: bool) -> VirtiofsAddMode {
+    if add3_available {
+        VirtiofsAddMode::Add3 { read_only }
+    } else if read_only {
+        VirtiofsAddMode::UnsupportedReadOnly
+    } else {
+        VirtiofsAddMode::LegacyReadWrite
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum VirtiofsAddError {
+    TagContainsNull,
+    PathContainsNull,
+    Add3Failed { tag: String, path: String },
+    LegacyFailed { tag: String, path: String },
+    UnsupportedReadOnly { tag: String, path: String },
+}
+
+impl std::fmt::Display for VirtiofsAddError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TagContainsNull => write!(f, "mount tag contains null byte"),
+            Self::PathContainsNull => write!(f, "mount path contains null byte"),
+            Self::Add3Failed { tag, path } => write!(
+                f,
+                "krun_add_virtiofs3 failed for tag '{}' path '{}'",
+                tag, path
+            ),
+            Self::LegacyFailed { tag, path } => write!(
+                f,
+                "krun_add_virtiofs failed for tag '{}' path '{}'",
+                tag, path
+            ),
+            Self::UnsupportedReadOnly { tag, path } => write!(
+                f,
+                "libkrun does not expose krun_add_virtiofs3; cannot enforce read-only virtiofs mount for tag '{}' path '{}'",
+                tag, path
+            ),
+        }
     }
 }
 
@@ -194,4 +291,33 @@ fn dlopen_global(path: &Path) -> bool {
     }
 
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn virtiofs_mode_uses_add3_when_available() {
+        assert_eq!(
+            select_virtiofs_add_mode(false, true),
+            VirtiofsAddMode::Add3 { read_only: false }
+        );
+        assert_eq!(
+            select_virtiofs_add_mode(true, true),
+            VirtiofsAddMode::Add3 { read_only: true }
+        );
+    }
+
+    #[test]
+    fn virtiofs_mode_allows_legacy_rw_only() {
+        assert_eq!(
+            select_virtiofs_add_mode(false, false),
+            VirtiofsAddMode::LegacyReadWrite
+        );
+        assert_eq!(
+            select_virtiofs_add_mode(true, false),
+            VirtiofsAddMode::UnsupportedReadOnly
+        );
+    }
 }

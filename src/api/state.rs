@@ -875,6 +875,14 @@ mod tests {
         };
         assert!(!HostMount::try_from(&spec).unwrap().read_only);
 
+        let spec: MountSpec = serde_json::from_value(serde_json::json!({
+            "source": "/tmp",
+            "target": "/guest"
+        }))
+        .unwrap();
+        assert!(!spec.readonly);
+        assert!(!HostMount::try_from(&spec).unwrap().read_only);
+
         // ResourceSpec with None uses defaults
         let spec = ResourceSpec {
             cpus: None,

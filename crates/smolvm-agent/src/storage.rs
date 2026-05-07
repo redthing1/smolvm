@@ -14,6 +14,7 @@ use crate::paths;
 use crate::process::{WaitResult, TIMEOUT_EXIT_CODE};
 use smolvm_network::guest_env;
 use smolvm_protocol::{ImageInfo, OverlayInfo, RegistryAuth, StorageStatus};
+use std::ffi::CString;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -327,55 +328,69 @@ pub fn get_preloaded_image_dir() -> Option<&'static PathBuf> {
 /// This mounts each virtiofs device at its staging area and bind-mounts
 /// to the guest target path, making volumes visible to all code paths
 /// including VmExec.
-pub fn init_volume_mounts() -> &'static [(String, String, bool)] {
-    BOOT_VOLUME_MOUNTS.get_or_init(|| {
-        let count: usize = match std::env::var("SMOLVM_MOUNT_COUNT") {
-            Ok(v) => match v.parse() {
-                Ok(n) => n,
-                Err(_) => {
-                    warn!(value = %v, "invalid SMOLVM_MOUNT_COUNT");
-                    return Vec::new();
-                }
-            },
-            Err(_) => return Vec::new(),
+pub fn init_volume_mounts() -> Result<&'static [(String, String, bool)]> {
+    if let Some(mounts) = BOOT_VOLUME_MOUNTS.get() {
+        return Ok(mounts);
+    }
+
+    let mounts = parse_boot_volume_mounts_from_env()?;
+
+    // Mount using existing logic with empty rootfs prefix so bind mounts
+    // go to absolute guest paths (e.g., "/data"), visible to VmExec.
+    if !mounts.is_empty() {
+        setup_volume_mounts("/", &mounts)?;
+    }
+
+    let _ = BOOT_VOLUME_MOUNTS.set(mounts);
+    Ok(BOOT_VOLUME_MOUNTS
+        .get()
+        .expect("boot volume mounts were just initialized"))
+}
+
+fn parse_boot_volume_mounts_from_env() -> Result<Vec<(String, String, bool)>> {
+    let count: usize = match std::env::var("SMOLVM_MOUNT_COUNT") {
+        Ok(v) => v.parse().map_err(|_| StorageError::ValidationFailed {
+            context: "SMOLVM_MOUNT_COUNT".to_string(),
+            reason: format!("invalid count: {}", v),
+        })?,
+        Err(_) => return Ok(Vec::new()),
+    };
+
+    let mut mounts = Vec::with_capacity(count);
+    for i in 0..count {
+        let env_key = format!("SMOLVM_MOUNT_{}", i);
+        let env_val = std::env::var(&env_key).map_err(|_| StorageError::ValidationFailed {
+            context: env_key.clone(),
+            reason: "missing mount environment variable".to_string(),
+        })?;
+
+        // Parse "tag:guest_path:ro|rw".
+        let parts: Vec<&str> = env_val.splitn(3, ':').collect();
+        if parts.len() != 3 {
+            return Err(StorageError::ValidationFailed {
+                context: env_key,
+                reason: format!("invalid mount format, expected tag:path:ro|rw: {}", env_val),
+            });
+        }
+
+        let read_only = match parts[2] {
+            "ro" => true,
+            "rw" => false,
+            mode => {
+                return Err(StorageError::ValidationFailed {
+                    context: env_key,
+                    reason: format!("invalid mount mode: {}", mode),
+                });
+            }
         };
 
-        let mut mounts = Vec::with_capacity(count);
-        for i in 0..count {
-            let env_key = format!("SMOLVM_MOUNT_{}", i);
-            let env_val = match std::env::var(&env_key) {
-                Ok(v) => v,
-                Err(_) => {
-                    warn!(key = %env_key, "missing mount env var");
-                    continue;
-                }
-            };
+        let tag = parts[0].to_string();
+        let guest_path = parts[1].to_string();
+        info!(tag = %tag, guest_path = %guest_path, read_only = read_only, "boot volume mount");
+        mounts.push((tag, guest_path, read_only));
+    }
 
-            // Parse "tag:guest_path:ro|rw"
-            let parts: Vec<&str> = env_val.splitn(3, ':').collect();
-            if parts.len() != 3 {
-                warn!(key = %env_key, value = %env_val, "invalid mount format, expected tag:path:ro|rw");
-                continue;
-            }
-
-            let tag = parts[0].to_string();
-            let guest_path = parts[1].to_string();
-            let read_only = parts[2] == "ro";
-
-            info!(tag = %tag, guest_path = %guest_path, read_only = read_only, "boot volume mount");
-            mounts.push((tag, guest_path, read_only));
-        }
-
-        // Mount using existing logic with empty rootfs prefix so bind mounts
-        // go to absolute guest paths (e.g., "/data"), visible to VmExec.
-        if !mounts.is_empty() {
-            if let Err(e) = setup_volume_mounts("/", &mounts) {
-                warn!(error = %e, "failed to setup boot volume mounts");
-            }
-        }
-
-        mounts
-    })
+    Ok(mounts)
 }
 
 /// Create ImageInfo from preloaded image data.
@@ -516,6 +531,20 @@ pub enum StorageError {
     // ========================================================================
     /// Failed to mount overlay filesystem.
     OverlayMountFailed { path: String, cause: String },
+    /// Failed to mount a virtiofs device.
+    VirtiofsMountFailed {
+        tag: String,
+        path: String,
+        cause: String,
+    },
+    /// Failed to bind-mount a staged filesystem into a rootfs.
+    BindMountFailed {
+        source: String,
+        target: String,
+        cause: String,
+    },
+    /// Failed to remount a bind mount read-only.
+    ReadonlyRemountFailed { path: String, cause: String },
     /// Failed to unmount filesystem.
     UnmountFailed { path: String, cause: String },
 
@@ -683,6 +712,27 @@ impl std::fmt::Display for StorageError {
             // Mount errors
             StorageError::OverlayMountFailed { path, cause } => {
                 write!(f, "overlay mount failed at '{}': {}", path, cause)
+            }
+            StorageError::VirtiofsMountFailed { tag, path, cause } => {
+                write!(
+                    f,
+                    "virtiofs mount '{}' failed at '{}': {}",
+                    tag, path, cause
+                )
+            }
+            StorageError::BindMountFailed {
+                source,
+                target,
+                cause,
+            } => {
+                write!(
+                    f,
+                    "bind mount '{}' -> '{}' failed: {}",
+                    source, target, cause
+                )
+            }
+            StorageError::ReadonlyRemountFailed { path, cause } => {
+                write!(f, "read-only bind remount failed at '{}': {}", path, cause)
             }
             StorageError::UnmountFailed { path, cause } => {
                 write!(f, "failed to unmount '{}': {}", path, cause)
@@ -2360,42 +2410,14 @@ fn setup_volume_mounts(rootfs: &str, mounts: &[(String, String, bool)]) -> Resul
         // Check if already mounted
         if !is_mountpoint(&virtiofs_mount) {
             info!(tag = %tag, mount_point = %virtiofs_mount.display(), "mounting virtiofs");
-
-            // Mount virtiofs using direct syscall (avoids ~3-5ms fork+exec overhead).
-            // Use sync option to ensure writes are persisted immediately.
-            let src = std::ffi::CString::new(tag.as_str()).map_err(|e| StorageError::Internal {
-                message: format!("invalid tag: {}", e),
-            })?;
-            let dst =
-                std::ffi::CString::new(virtiofs_mount.to_string_lossy().as_ref()).map_err(|e| {
-                    StorageError::Internal {
-                        message: format!("invalid mount point: {}", e),
-                    }
-                })?;
-            let fstype = std::ffi::CString::new("virtiofs").unwrap();
-            let opts = std::ffi::CString::new("sync").unwrap();
-            // SAFETY: mount virtiofs with valid CString arguments
-            let rc = unsafe {
-                libc::mount(
-                    src.as_ptr(),
-                    dst.as_ptr(),
-                    fstype.as_ptr(),
-                    0,
-                    opts.as_ptr() as *const libc::c_void,
-                )
-            };
-            if rc != 0 {
-                let err = std::io::Error::last_os_error();
-                warn!(error = %err, tag = %tag, "failed to mount virtiofs device");
-                continue;
-            }
+            mount_virtiofs(tag, &virtiofs_mount)?;
         }
 
         // Now bind-mount into the container rootfs
         let target_path = ensure_mount_target_under_root(rootfs_path, container_path)?;
 
         // Check if already bind-mounted
-        if !is_mountpoint(&target_path) {
+        let created_bind_mount = if !is_mountpoint(&target_path) {
             info!(
                 source = %virtiofs_mount.display(),
                 target = %target_path.display(),
@@ -2403,45 +2425,27 @@ fn setup_volume_mounts(rootfs: &str, mounts: &[(String, String, bool)]) -> Resul
                 "bind-mounting into container"
             );
 
-            // Bind mount using direct syscall
-            let bind_src = std::ffi::CString::new(virtiofs_mount.to_string_lossy().as_ref())
-                .map_err(|e| StorageError::Internal {
-                    message: format!("invalid source: {}", e),
-                })?;
-            let bind_dst =
-                std::ffi::CString::new(target_path.to_string_lossy().as_ref()).map_err(|e| {
-                    StorageError::Internal {
-                        message: format!("invalid target: {}", e),
-                    }
-                })?;
-            // SAFETY: bind mount with MS_BIND flag
-            let rc = unsafe {
-                libc::mount(
-                    bind_src.as_ptr(),
-                    bind_dst.as_ptr(),
-                    std::ptr::null(),
-                    libc::MS_BIND,
-                    std::ptr::null(),
-                )
-            };
-            if rc != 0 {
-                let err = std::io::Error::last_os_error();
-                warn!(error = %err, target = %target_path.display(), "failed to bind-mount");
-                continue;
-            }
+            bind_mount(&virtiofs_mount, &target_path)?;
+            true
+        } else {
+            false
+        };
 
-            // Remount read-only if requested
-            if *read_only {
-                // SAFETY: remount with MS_BIND|MS_RDONLY|MS_REMOUNT
-                unsafe {
-                    libc::mount(
-                        std::ptr::null(),
-                        bind_dst.as_ptr(),
-                        std::ptr::null(),
-                        libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY,
-                        std::ptr::null(),
-                    );
+        // Remount read-only if requested. If this setup just created the bind
+        // mount, remove it before returning so the guest cannot keep a writable
+        // mount after a failed read-only setup.
+        if *read_only {
+            if let Err(err) = remount_bind_readonly(&target_path) {
+                if created_bind_mount {
+                    if let Err(cleanup_err) = detach_unmount(&target_path) {
+                        warn!(
+                            error = %cleanup_err,
+                            target = %target_path.display(),
+                            "failed to clean up writable bind mount after read-only remount failure"
+                        );
+                    }
                 }
+                return Err(err);
             }
         }
 
@@ -2449,6 +2453,105 @@ fn setup_volume_mounts(rootfs: &str, mounts: &[(String, String, bool)]) -> Resul
     }
 
     Ok(mounted_paths)
+}
+
+fn mount_virtiofs(tag: &str, target: &Path) -> Result<()> {
+    // Use sync option to ensure writes are persisted immediately.
+    let src = CString::new(tag).map_err(|e| StorageError::Internal {
+        message: format!("invalid tag: {}", e),
+    })?;
+    let dst = path_to_cstring(target, "mount point")?;
+    let fstype = CString::new("virtiofs").unwrap();
+    let opts = CString::new("sync").unwrap();
+
+    // SAFETY: mount virtiofs with valid CString arguments.
+    let rc = unsafe {
+        libc::mount(
+            src.as_ptr(),
+            dst.as_ptr(),
+            fstype.as_ptr(),
+            0,
+            opts.as_ptr() as *const libc::c_void,
+        )
+    };
+    if rc != 0 {
+        return Err(StorageError::VirtiofsMountFailed {
+            tag: tag.to_string(),
+            path: target.display().to_string(),
+            cause: std::io::Error::last_os_error().to_string(),
+        });
+    }
+
+    Ok(())
+}
+
+fn bind_mount(source: &Path, target: &Path) -> Result<()> {
+    let bind_src = path_to_cstring(source, "bind mount source")?;
+    let bind_dst = path_to_cstring(target, "bind mount target")?;
+
+    // SAFETY: bind mount with MS_BIND flag and valid paths.
+    let rc = unsafe {
+        libc::mount(
+            bind_src.as_ptr(),
+            bind_dst.as_ptr(),
+            std::ptr::null(),
+            libc::MS_BIND,
+            std::ptr::null(),
+        )
+    };
+    if rc != 0 {
+        return Err(StorageError::BindMountFailed {
+            source: source.display().to_string(),
+            target: target.display().to_string(),
+            cause: std::io::Error::last_os_error().to_string(),
+        });
+    }
+
+    Ok(())
+}
+
+fn remount_bind_readonly(target: &Path) -> Result<()> {
+    let bind_dst = path_to_cstring(target, "read-only bind mount target")?;
+
+    // SAFETY: remount with MS_BIND|MS_RDONLY|MS_REMOUNT and a valid target.
+    let rc = unsafe {
+        libc::mount(
+            std::ptr::null(),
+            bind_dst.as_ptr(),
+            std::ptr::null(),
+            libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY,
+            std::ptr::null(),
+        )
+    };
+    if rc != 0 {
+        return Err(StorageError::ReadonlyRemountFailed {
+            path: target.display().to_string(),
+            cause: std::io::Error::last_os_error().to_string(),
+        });
+    }
+
+    Ok(())
+}
+
+fn detach_unmount(target: &Path) -> Result<()> {
+    let target_c = path_to_cstring(target, "unmount target")?;
+
+    // SAFETY: unmount with a valid target path.
+    let rc = unsafe { libc::umount2(target_c.as_ptr(), libc::MNT_DETACH) };
+    if rc != 0 {
+        return Err(StorageError::UnmountFailed {
+            path: target.display().to_string(),
+            cause: std::io::Error::last_os_error().to_string(),
+        });
+    }
+
+    Ok(())
+}
+
+fn path_to_cstring(path: &Path, context: &str) -> Result<CString> {
+    CString::new(path.to_string_lossy().as_ref()).map_err(|e| StorageError::InvalidPath {
+        path: format!("{} '{}': {}", context, path.display(), e),
+    })
 }
 
 /// Check if a path is a mountpoint.
@@ -3023,6 +3126,13 @@ mod tests {
         LOCK.get_or_init(|| Mutex::new(()))
     }
 
+    fn clear_mount_env() {
+        std::env::remove_var("SMOLVM_MOUNT_COUNT");
+        for i in 0..4 {
+            std::env::remove_var(format!("SMOLVM_MOUNT_{}", i));
+        }
+    }
+
     #[test]
     fn test_oci_platform_to_arch_linux_arm64() {
         assert_eq!(oci_platform_to_arch("linux/arm64"), "arm64");
@@ -3123,6 +3233,47 @@ mod tests {
             overlay_resolv_conf_contents(),
             "nameserver 8.8.8.8\nnameserver 1.1.1.1\n"
         );
+    }
+
+    #[test]
+    fn boot_volume_mount_env_absent_is_empty() {
+        let _guard = env_lock().lock().unwrap();
+        clear_mount_env();
+
+        assert!(parse_boot_volume_mounts_from_env().unwrap().is_empty());
+    }
+
+    #[test]
+    fn boot_volume_mount_env_parses_rw_and_ro() {
+        let _guard = env_lock().lock().unwrap();
+        clear_mount_env();
+        std::env::set_var("SMOLVM_MOUNT_COUNT", "2");
+        std::env::set_var("SMOLVM_MOUNT_0", "smolvm0:/workspace:rw");
+        std::env::set_var("SMOLVM_MOUNT_1", "smolvm1:/config:ro");
+
+        let mounts = parse_boot_volume_mounts_from_env().unwrap();
+
+        assert_eq!(
+            mounts,
+            vec![
+                ("smolvm0".to_string(), "/workspace".to_string(), false),
+                ("smolvm1".to_string(), "/config".to_string(), true),
+            ]
+        );
+        clear_mount_env();
+    }
+
+    #[test]
+    fn boot_volume_mount_env_rejects_invalid_mode() {
+        let _guard = env_lock().lock().unwrap();
+        clear_mount_env();
+        std::env::set_var("SMOLVM_MOUNT_COUNT", "1");
+        std::env::set_var("SMOLVM_MOUNT_0", "smolvm0:/workspace:maybe");
+
+        let err = parse_boot_volume_mounts_from_env().unwrap_err();
+
+        assert!(err.to_string().contains("invalid mount mode"));
+        clear_mount_env();
     }
 
     #[test]
