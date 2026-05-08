@@ -1,8 +1,11 @@
 //! Linux runner hardening implementation.
 
+mod cgroup;
 mod landlock;
 
-use crate::security::hardening::{Enforcement, RunnerFilesystemReport, RunnerHardeningReport};
+use crate::security::hardening::{
+    Enforcement, RunnerFilesystemReport, RunnerHardeningReport, RunnerResourceReport,
+};
 use crate::security::prepare::PreparedLaunch;
 use crate::{Error, Result};
 
@@ -23,6 +26,16 @@ pub(super) fn apply_runner_filesystem_confinement(
     Ok(RunnerFilesystemReport {
         landlock: landlock::apply(prepared)?,
     })
+}
+
+pub(crate) struct LinuxResourceGuard {
+    _cgroup: Option<cgroup::CgroupGuard>,
+}
+
+pub(super) fn apply_runner_resource_confinement(
+    prepared: &PreparedLaunch,
+) -> Result<(RunnerResourceReport, LinuxResourceGuard)> {
+    cgroup::apply(prepared)
 }
 
 fn set_no_new_privs() -> Result<()> {

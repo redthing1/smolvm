@@ -95,6 +95,58 @@ impl RunnerFilesystemReport {
     }
 }
 
+/// Resource confinement applied to the host-side VM runner process.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunnerResourceReport {
+    /// Linux cgroup v2 membership.
+    pub cgroup: Enforcement,
+    /// Linux cgroup v2 process/thread count limit.
+    pub pids: Enforcement,
+    /// Linux cgroup v2 memory limit.
+    pub memory: Enforcement,
+}
+
+impl RunnerResourceReport {
+    /// Render this report as stable newline-delimited text.
+    pub fn render_text(&self) -> String {
+        [
+            format!("cgroup={}", self.cgroup.render()),
+            format!("pids={}", self.pids.render()),
+            format!("memory={}", self.memory.render()),
+        ]
+        .join("\n")
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn skipped_for_platform() -> Self {
+        Self {
+            cgroup: Enforcement::Skipped {
+                reason: "not a Linux host".to_string(),
+            },
+            pids: Enforcement::Skipped {
+                reason: "not a Linux host".to_string(),
+            },
+            memory: Enforcement::Skipped {
+                reason: "not a Linux host".to_string(),
+            },
+        }
+    }
+}
+
+/// Keeps resource confinement alive for the duration of the VM runner.
+pub struct RunnerResourceGuard {
+    report: RunnerResourceReport,
+    #[cfg(target_os = "linux")]
+    _linux: crate::security::linux::LinuxResourceGuard,
+}
+
+impl RunnerResourceGuard {
+    /// Report describing resource controls installed by this guard.
+    pub fn report(&self) -> &RunnerResourceReport {
+        &self.report
+    }
+}
+
 /// Apply the baseline hardening controls for the current VM runner process.
 ///
 /// On Linux this enforces `no_new_privs` and disables core dumps. It reports
@@ -133,6 +185,31 @@ pub fn apply_runner_filesystem_confinement(
     }
 }
 
+/// Apply resource confinement for the current VM runner process.
+///
+/// On Linux this uses cgroup v2 when the current process is already in a
+/// writable delegated cgroup. The returned guard must stay alive until libkrun
+/// exits so cleanup can move the runner back to its parent cgroup and remove
+/// the child cgroup on normal return.
+pub fn apply_runner_resource_confinement(prepared: &PreparedLaunch) -> Result<RunnerResourceGuard> {
+    #[cfg(target_os = "linux")]
+    {
+        let (report, linux) = crate::security::linux::apply_runner_resource_confinement(prepared)?;
+        Ok(RunnerResourceGuard {
+            report,
+            _linux: linux,
+        })
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = prepared;
+        Ok(RunnerResourceGuard {
+            report: RunnerResourceReport::skipped_for_platform(),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -163,5 +240,22 @@ mod tests {
         };
 
         assert_eq!(report.render_text(), "landlock=enforced");
+    }
+
+    #[test]
+    fn runner_resource_report_renders_cgroup_states() {
+        let report = RunnerResourceReport {
+            cgroup: Enforcement::Enforced,
+            pids: Enforcement::Enforced,
+            memory: Enforcement::Skipped {
+                reason: "not measured yet".to_string(),
+            },
+        };
+
+        let text = report.render_text();
+
+        assert!(text.contains("cgroup=enforced"));
+        assert!(text.contains("pids=enforced"));
+        assert!(text.contains("memory=skipped (not measured yet)"));
     }
 }

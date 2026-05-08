@@ -144,6 +144,12 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
     // Raise file descriptor limits
     raise_fd_limits();
 
+    let resource_guard = crate::security::hardening::apply_runner_resource_confinement(prepared)?;
+    tracing::debug!(
+        hardening = %resource_guard.report().render_text(),
+        "applied runner resource confinement"
+    );
+
     let lib_dir = find_lib_dir().ok_or_else(|| {
         Error::agent(
             "find libraries",
@@ -715,12 +721,14 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             }
         }
 
-        // Start VM (this replaces the process on success)
+        // Start VM (this replaces the process on success). Keep resource
+        // confinement alive until libkrun returns on failure or VM exit.
         let ret = krun_start_enter(ctx);
 
         // If we get here, something went wrong — free the context before returning
         krun_free_ctx(ctx);
         drop(virtio_network_runtime);
+        drop(resource_guard);
         Err(Error::agent(
             "start vm",
             format!("krun_start_enter returned: {}", ret),
