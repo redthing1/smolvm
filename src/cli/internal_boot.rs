@@ -131,17 +131,8 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
     };
 
     let result = launch_agent_vm(&LaunchConfig {
-        rootfs_path: &prepared.policy.rootfs_path,
+        prepared: &prepared,
         disks: &disks,
-        vsock_socket: &prepared.policy.vsock_socket,
-        console_log: prepared.policy.console_log.as_deref(),
-        mounts: &prepared.mounts,
-        port_mappings: &prepared.policy.ports,
-        resources: prepared.policy.resources.clone(),
-        ssh_agent_socket: prepared.policy.secrets.ssh_agent_socket.as_deref(),
-        preloaded_image_mount: prepared.preloaded_image_mount.as_ref(),
-        extra_disks: &prepared.extra_disks,
-        egress_refresh_hosts: prepared.policy.egress_policy_hosts.clone(),
     });
 
     // If we get here, launch_agent_vm returned (should only happen on error)

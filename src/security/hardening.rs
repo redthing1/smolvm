@@ -4,6 +4,7 @@
 //! syscall details live behind it so launch orchestration stays readable and
 //! pure policy/preparation modules stay side-effect free.
 
+use crate::security::prepare::PreparedLaunch;
 use crate::Result;
 
 /// Enforcement state for one runner hardening control.
@@ -24,7 +25,7 @@ pub enum Enforcement {
 }
 
 impl Enforcement {
-    fn render(&self) -> String {
+    pub(crate) fn render(&self) -> String {
         match self {
             Self::Enforced => "enforced".to_string(),
             Self::Unavailable { reason } => format!("unavailable ({reason})"),
@@ -71,6 +72,29 @@ impl RunnerHardeningReport {
     }
 }
 
+/// Filesystem confinement applied to the host-side VM runner process.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunnerFilesystemReport {
+    /// Linux Landlock filesystem allowlist.
+    pub landlock: Enforcement,
+}
+
+impl RunnerFilesystemReport {
+    /// Render this report as stable newline-delimited text.
+    pub fn render_text(&self) -> String {
+        format!("landlock={}", self.landlock.render())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn skipped_for_platform() -> Self {
+        Self {
+            landlock: Enforcement::Skipped {
+                reason: "not a Linux host".to_string(),
+            },
+        }
+    }
+}
+
 /// Apply the baseline hardening controls for the current VM runner process.
 ///
 /// On Linux this enforces `no_new_privs` and disables core dumps. It reports
@@ -85,6 +109,27 @@ pub fn apply_runner_baseline() -> Result<RunnerHardeningReport> {
     #[cfg(not(target_os = "linux"))]
     {
         Ok(RunnerHardeningReport::skipped_for_platform())
+    }
+}
+
+/// Apply filesystem confinement for the current VM runner process.
+///
+/// This runs after libkrun has been loaded, but before the prepared rootfs,
+/// disk, socket, log, and virtio-fs paths are passed to libkrun. That ordering
+/// keeps dynamic loader behavior out of the allowlist while still constraining
+/// the filesystem authority used for launch resources and VM runtime I/O.
+pub fn apply_runner_filesystem_confinement(
+    prepared: &PreparedLaunch,
+) -> Result<RunnerFilesystemReport> {
+    #[cfg(target_os = "linux")]
+    {
+        crate::security::linux::apply_runner_filesystem_confinement(prepared)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = prepared;
+        Ok(RunnerFilesystemReport::skipped_for_platform())
     }
 }
 
@@ -109,5 +154,14 @@ mod tests {
         assert!(text.contains("no_new_privs=enforced"));
         assert!(text.contains("core_dumps=unavailable (kernel does not support control)"));
         assert!(text.contains("nofile=skipped (left unchanged)"));
+    }
+
+    #[test]
+    fn runner_filesystem_report_renders_landlock_state() {
+        let report = RunnerFilesystemReport {
+            landlock: Enforcement::Enforced,
+        };
+
+        assert_eq!(report.render_text(), "landlock=enforced");
     }
 }

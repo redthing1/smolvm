@@ -10,7 +10,7 @@ use crate::data::consts::{
 use crate::error::{Error, Result};
 use crate::network::backend::{COMPAT_NET_FEATURES, TSI_FEATURE_HIJACK_INET};
 use crate::network::{plan_launch_network, EffectiveNetworkBackend};
-use crate::security::prepare::{PreparedDisk, PreparedMount};
+use crate::security::prepare::{PreparedLaunch, PreparedMount};
 use crate::storage::{OverlayDisk, StorageDisk};
 use crate::util::{libkrun_filename, libkrunfw_filename};
 
@@ -23,7 +23,7 @@ use std::ffi::CString;
 use std::os::fd::RawFd;
 use std::path::{Path, PathBuf};
 
-use super::{KrunFunctions, PortMapping, VmResources};
+use super::KrunFunctions;
 
 /// Maximum number of CIDR entries held in the live egress allow-list.
 /// Protects the muxer's per-packet O(n) scan from unbounded growth when
@@ -110,51 +110,29 @@ pub struct LaunchFeatures {
 
 /// Configuration for launching an agent VM.
 pub struct LaunchConfig<'a> {
-    /// Path to the agent rootfs directory.
-    pub rootfs_path: &'a Path,
+    /// Prepared launch policy and VMM-facing resources.
+    pub prepared: &'a PreparedLaunch,
     /// Storage and overlay disk handles.
     pub disks: &'a VmDisks<'a>,
-    /// Path to the vsock Unix socket for the control channel.
-    pub vsock_socket: &'a Path,
-    /// Optional path to write console output.
-    pub console_log: Option<&'a Path>,
-    /// Prepared host directory mounts to expose to the guest.
-    pub mounts: &'a [PreparedMount],
-    /// Port mappings (host:guest).
-    pub port_mappings: &'a [PortMapping],
-    /// VM resources (CPU, memory, network, disk sizes).
-    pub resources: VmResources,
-    /// Host SSH agent socket path for forwarding into the guest.
-    pub ssh_agent_socket: Option<&'a Path>,
-    /// Prepared host directory containing image data mounted for the guest agent.
-    pub preloaded_image_mount: Option<&'a PreparedMount>,
-    /// Additional disk images. Appear as /dev/vdc, /dev/vdd, ...
-    pub extra_disks: &'a [PreparedDisk],
-    /// Hostnames to periodically re-resolve for the live egress policy.
-    /// When set, a background thread re-resolves these every 5 minutes and
-    /// atomically replaces the CIDR list via the Arc handle obtained from
-    /// libkrun. This keeps the egress allow-list accurate for long-running VMs
-    /// hitting CDN-backed hosts whose IPs rotate.
-    pub egress_refresh_hosts: Option<Vec<String>>,
 }
 
 /// Launch the agent VM using libkrun.
 ///
 /// This function never returns on success.
 pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
-    let LaunchConfig {
-        rootfs_path,
-        disks,
-        vsock_socket,
-        console_log,
-        mounts,
-        port_mappings,
-        resources,
-        ssh_agent_socket,
-        preloaded_image_mount,
-        extra_disks,
-        egress_refresh_hosts,
-    } = config;
+    let prepared = config.prepared;
+    let policy = &prepared.policy;
+    let disks = config.disks;
+    let rootfs_path = &policy.rootfs_path;
+    let vsock_socket = &policy.vsock_socket;
+    let console_log = policy.console_log.as_deref();
+    let mounts = &prepared.mounts;
+    let port_mappings = &policy.ports;
+    let resources = &policy.resources;
+    let ssh_agent_socket = policy.secrets.ssh_agent_socket.as_deref();
+    let preloaded_image_mount = prepared.preloaded_image_mount.as_ref();
+    let extra_disks = &prepared.extra_disks;
+    let egress_refresh_hosts = &policy.egress_policy_hosts;
 
     let hostname_policy_hosts = egress_refresh_hosts.as_deref();
     crate::network::validate_requested_network_backend(
@@ -261,6 +239,19 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                 }
             };
         }
+
+        let filesystem_report =
+            match crate::security::hardening::apply_runner_filesystem_confinement(prepared) {
+                Ok(report) => report,
+                Err(e) => {
+                    krun_free_ctx(ctx);
+                    return Err(e);
+                }
+            };
+        tracing::debug!(
+            hardening = %filesystem_report.render_text(),
+            "applied runner filesystem confinement"
+        );
 
         // Set root filesystem
         let root = try_or_free_ctx!(

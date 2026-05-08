@@ -1,6 +1,9 @@
 //! Linux runner hardening implementation.
 
-use crate::security::hardening::{Enforcement, RunnerHardeningReport};
+mod landlock;
+
+use crate::security::hardening::{Enforcement, RunnerFilesystemReport, RunnerHardeningReport};
+use crate::security::prepare::PreparedLaunch;
 use crate::{Error, Result};
 
 pub(super) fn apply_runner_baseline() -> Result<RunnerHardeningReport> {
@@ -11,6 +14,14 @@ pub(super) fn apply_runner_baseline() -> Result<RunnerHardeningReport> {
         no_new_privs: Enforcement::Enforced,
         core_dumps: Enforcement::Enforced,
         nofile: report_nofile_unchanged(),
+    })
+}
+
+pub(super) fn apply_runner_filesystem_confinement(
+    prepared: &PreparedLaunch,
+) -> Result<RunnerFilesystemReport> {
+    Ok(RunnerFilesystemReport {
+        landlock: landlock::apply(prepared)?,
     })
 }
 
