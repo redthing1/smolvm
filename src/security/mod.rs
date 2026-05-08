@@ -5,9 +5,11 @@
 //! prepared paths and platform-specific enforcement behind this boundary.
 
 pub mod audit;
+pub(crate) mod filesystem_view;
 pub mod hardening;
 #[cfg(target_os = "linux")]
 mod linux;
 pub mod materialize;
 pub mod policy;
 pub mod prepare;
+pub mod secrets;

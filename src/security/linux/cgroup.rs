@@ -264,7 +264,7 @@ fn planned_pids_max(prepared: &PreparedLaunch) -> u64 {
     if resources.network {
         limit += 128;
     }
-    if resources.gpu {
+    if prepared.policy.devices.gpu {
         limit += 256;
     }
     if prepared.policy.secrets.ssh_agent_socket.is_some() {

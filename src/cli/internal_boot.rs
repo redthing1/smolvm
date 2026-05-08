@@ -95,6 +95,14 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
         "applied runner hardening baseline"
     );
 
+    if let Err(e) = smolvm::security::secrets::validate_secret_grants(&prepared) {
+        let _ = std::fs::write(
+            &prepared.policy.startup_error_log,
+            format!("failed to validate secret grants: {}", e),
+        );
+        smolvm::process::exit_child(1);
+    }
+
     let startup_error_log = prepared.policy.startup_error_log.clone();
     let materialized = match smolvm::security::materialize::materialize_launch(prepared) {
         Ok(materialized) => materialized,

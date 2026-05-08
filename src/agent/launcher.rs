@@ -129,6 +129,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
     let mounts = &prepared.mounts;
     let port_mappings = &policy.ports;
     let resources = &policy.resources;
+    let gpu_requested = policy.devices.gpu;
     let ssh_agent_socket = policy.secrets.ssh_agent_socket.as_deref();
     let preloaded_image_mount = prepared.preloaded_image_mount.as_ref();
     let extra_disks = &prepared.extra_disks;
@@ -194,7 +195,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         // Enable GPU if requested (virgl for OpenGL + Venus for Vulkan via virtio-gpu).
         // Requires libkrun built with `gpu` feature and host virglrenderer.
         // On macOS, also requires MoltenVK (Vulkan → Metal translation).
-        if resources.gpu {
+        if gpu_requested {
             let virgl_flags = super::gpu_virgl_flags();
             // Size the GPU shared-memory region. Caller may override
             // via `--gpu-vram <MiB>` (CLI) or `gpu_vram = N` (Smolfile);
@@ -495,7 +496,11 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             );
             // listen=false: guest connects out to this port, host receives via Unix socket
             if krun_add_vsock_port2(ctx, ports::SSH_AGENT, ssh_path.as_ptr(), false) < 0 {
-                tracing::warn!("failed to add SSH agent vsock port — SSH forwarding disabled");
+                krun_free_ctx(ctx);
+                return Err(Error::agent(
+                    "add ssh agent vsock port",
+                    "krun_add_vsock_port2 failed for SSH agent forwarding",
+                ));
             } else {
                 tracing::info!(
                     "SSH agent forwarding enabled on vsock port {}",
@@ -588,7 +593,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         // kernel lacks the driver; without this check the user sees
         // "VM started" and discovers missing GPU only when their
         // workload hits a rendering call.
-        if resources.gpu {
+        if gpu_requested {
             let gpu_env = format!("{}={}", ENV_SMOLVM_GPU, ENV_VALUE_ON);
             if let Ok(cs) = CString::new(gpu_env) {
                 env_strings.push(cs);

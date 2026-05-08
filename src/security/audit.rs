@@ -79,6 +79,14 @@ mod tests {
     use crate::data::resources::VmResources;
 
     fn policy_with_network(network: bool) -> LaunchPolicy {
+        policy_with_requested_capabilities(network, false, false)
+    }
+
+    fn policy_with_requested_capabilities(
+        network: bool,
+        ssh_agent: bool,
+        gpu: bool,
+    ) -> LaunchPolicy {
         let config = BootConfig {
             rootfs_path: "/smolvm/rootfs".into(),
             storage_disk_path: "/smolvm/storage.raw".into(),
@@ -92,9 +100,10 @@ mod tests {
             ports: Vec::new(),
             resources: VmResources {
                 network,
+                gpu,
                 ..VmResources::default()
             },
-            ssh_agent_socket: None,
+            ssh_agent_socket: ssh_agent.then(|| "/tmp/ssh-agent.sock".into()),
             egress_policy_hosts: None,
             preloaded_image_dir: None,
             extra_disks: Vec::new(),
@@ -114,6 +123,16 @@ mod tests {
         assert!(text.contains("network=broad"));
         assert!(text.contains("ssh_agent=disabled"));
         assert!(text.contains("gpu=disabled"));
+    }
+
+    #[test]
+    fn audit_renders_requested_secret_and_device_capabilities() {
+        let policy = policy_with_requested_capabilities(false, true, true);
+        let audit = SecurityAudit::from_policy(&policy);
+        let text = audit.render_text();
+
+        assert!(text.contains("ssh_agent=enabled"));
+        assert!(text.contains("gpu=enabled"));
     }
 
     #[test]

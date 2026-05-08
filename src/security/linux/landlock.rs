@@ -58,7 +58,7 @@ const FS_READ_WRITE: u64 = FS_READ | FS_WRITE_TREE;
 const FS_DEVICE: u64 = FS_READ_FILE | FS_WRITE_FILE | FS_IOCTL_DEV;
 
 pub(super) fn apply(prepared: &PreparedLaunch) -> Result<Enforcement> {
-    if prepared.policy.resources.gpu {
+    if prepared.policy.devices.gpu {
         return Ok(Enforcement::Skipped {
             reason: "GPU device and helper-process access is not modeled by Landlock yet"
                 .to_string(),
@@ -483,6 +483,30 @@ mod tests {
         assert!(
             rules.iter().all(|rule| rule.path != host_mount),
             "Landlock must not retain the original host path after materialization"
+        );
+    }
+
+    #[test]
+    fn landlock_skips_gpu_device_grant_until_device_model_is_explicit() {
+        let temp = tempfile::tempdir().unwrap();
+        let rootfs = temp.path().join("rootfs");
+        let runtime = temp.path().join("runtime");
+        let storage = runtime.join("storage.img");
+        let overlay = runtime.join("overlay.img");
+        std::fs::create_dir_all(&rootfs).unwrap();
+        std::fs::create_dir_all(&runtime).unwrap();
+        std::fs::write(&storage, b"storage").unwrap();
+        std::fs::write(&overlay, b"overlay").unwrap();
+
+        let mut prepared = prepared_launch_for_paths(&rootfs, &storage, &overlay, Vec::new());
+        prepared.policy.devices.gpu = true;
+
+        assert_eq!(
+            apply(&prepared).unwrap(),
+            Enforcement::Skipped {
+                reason: "GPU device and helper-process access is not modeled by Landlock yet"
+                    .to_string(),
+            }
         );
     }
 

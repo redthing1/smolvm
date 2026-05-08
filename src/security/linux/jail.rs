@@ -5,6 +5,10 @@
 //! the required privilege, bind-mounts only those grants into a generated
 //! runtime directory, and rewrites VMM-facing paths to that generated view.
 
+use crate::security::filesystem_view::{
+    FilesystemViewEntry, FilesystemViewKind, FilesystemViewRequest, FilesystemViewSource,
+    FilesystemViewSourceRequirement, FilesystemViewSpec,
+};
 use crate::security::hardening::Enforcement;
 use crate::security::prepare::PreparedLaunch;
 use crate::{Error, Result};
@@ -20,10 +24,24 @@ const JAIL_ROOT_COMPONENT: &str = "jails";
 pub(super) fn materialize(
     prepared: PreparedLaunch,
 ) -> Result<(PreparedLaunch, Enforcement, Option<JailGuard>)> {
-    let specs = collect_binding_specs(&prepared)?;
-    if specs.is_empty() {
+    let request = FilesystemViewRequest::from_prepared(&prepared);
+    let runtime_dir = launch_runtime_dir(&prepared)?;
+    let (report, mounted_view) = materialize_view_request(request, runtime_dir)?;
+
+    let Some((view, guard)) = mounted_view else {
+        return Ok((prepared, report, None));
+    };
+
+    let prepared = view.apply_to_prepared(prepared);
+    Ok((prepared, report, Some(guard)))
+}
+
+pub(crate) fn materialize_view_request(
+    request: FilesystemViewRequest,
+    runtime_dir: &Path,
+) -> Result<(Enforcement, Option<(FilesystemViewSpec, JailGuard)>)> {
+    if request.is_empty() {
         return Ok((
-            prepared,
             Enforcement::Skipped {
                 reason: "no filesystem grants require generated VMM paths".to_string(),
             },
@@ -31,28 +49,37 @@ pub(super) fn materialize(
         ));
     }
 
+    let request = validate_view_sources(request)?;
+    if request.is_empty() {
+        return Ok((
+            Enforcement::Skipped {
+                reason: "no present filesystem grants require generated VMM paths".to_string(),
+            },
+            None,
+        ));
+    }
+
     if let Some(reason) = enter_private_mount_namespace()? {
-        return Ok((prepared, Enforcement::Unavailable { reason }, None));
+        return Ok((Enforcement::Unavailable { reason }, None));
     }
 
     make_mounts_private()?;
 
-    let mut guard = JailGuard::new(create_jail_root(&prepared)?);
-    let plans = plan_bind_paths(&specs, guard.root())?;
+    let mut guard = JailGuard::new(create_jail_root_in(runtime_dir)?);
+    let view = request.plan(guard.root().to_path_buf())?;
 
-    for plan in &plans {
-        create_bind_target(plan)?;
-        let source = open_source(&plan.spec)?;
-        bind_mount(&source, &plan.destination, plan.spec.kind)?;
-        guard.record_mount(plan.destination.clone());
+    for entry in view.entries() {
+        create_bind_target(entry)?;
+        let source = open_source(&entry.source)?;
+        bind_mount(&source, &entry.destination, entry.source.kind)?;
+        guard.record_mount(entry.destination.clone());
 
-        if plan.spec.read_only {
-            remount_readonly(&plan.destination, plan.spec.kind)?;
+        if entry.source.access.is_read_only() {
+            remount_readonly(&entry.destination, entry.source.kind)?;
         }
     }
 
-    let prepared = apply_bind_paths(prepared, &plans);
-    Ok((prepared, Enforcement::Enforced, Some(guard)))
+    Ok((Enforcement::Enforced, Some((view, guard))))
 }
 
 pub(crate) struct JailGuard {
@@ -92,102 +119,21 @@ impl JailGuard {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct BindingSpec {
-    target: BindingTarget,
-    source: PathBuf,
-    kind: BindKind,
-    read_only: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct BindPlan {
-    spec: BindingSpec,
-    destination: PathBuf,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BindingTarget {
-    UserMount(usize),
-    PreloadedImage,
-    ExtraDisk(usize),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BindKind {
-    Directory,
-    File,
-}
-
-impl BindKind {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Directory => "directory",
-            Self::File => "regular file",
+fn validate_view_sources(request: FilesystemViewRequest) -> Result<FilesystemViewRequest> {
+    let mut entries = Vec::new();
+    for source in request.entries() {
+        if validate_source(source)? {
+            entries.push(source.clone());
         }
     }
+    Ok(FilesystemViewRequest::from_entries(entries))
 }
 
-fn collect_binding_specs(prepared: &PreparedLaunch) -> Result<Vec<BindingSpec>> {
-    let mut specs = Vec::new();
-
-    for (index, mount) in prepared.mounts.iter().enumerate() {
-        validate_source(
-            &mount.host_source,
-            BindKind::Directory,
-            SourceRequirement::Required,
-        )?;
-        specs.push(BindingSpec {
-            target: BindingTarget::UserMount(index),
-            source: mount.host_source.clone(),
-            kind: BindKind::Directory,
-            read_only: mount.access.is_read_only(),
-        });
-    }
-
-    if let Some(mount) = &prepared.preloaded_image_mount {
-        if validate_source(
-            &mount.host_source,
-            BindKind::Directory,
-            SourceRequirement::Optional,
-        )? {
-            specs.push(BindingSpec {
-                target: BindingTarget::PreloadedImage,
-                source: mount.host_source.clone(),
-                kind: BindKind::Directory,
-                read_only: true,
-            });
-        }
-    }
-
-    for (index, disk) in prepared.extra_disks.iter().enumerate() {
-        validate_source(
-            &disk.original_path,
-            BindKind::File,
-            SourceRequirement::Required,
-        )?;
-        specs.push(BindingSpec {
-            target: BindingTarget::ExtraDisk(index),
-            source: disk.original_path.clone(),
-            kind: BindKind::File,
-            read_only: disk.read_only,
-        });
-    }
-
-    Ok(specs)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SourceRequirement {
-    Required,
-    Optional,
-}
-
-fn validate_source(path: &Path, kind: BindKind, requirement: SourceRequirement) -> Result<bool> {
-    let metadata = match fs::symlink_metadata(path) {
+fn validate_source(source: &FilesystemViewSource) -> Result<bool> {
+    let metadata = match fs::symlink_metadata(&source.source) {
         Ok(metadata) => metadata,
         Err(error)
-            if requirement == SourceRequirement::Optional
+            if source.requirement == FilesystemViewSourceRequirement::Optional
                 && error.kind() == std::io::ErrorKind::NotFound =>
         {
             return Ok(false);
@@ -195,7 +141,7 @@ fn validate_source(path: &Path, kind: BindKind, requirement: SourceRequirement) 
         Err(error) => {
             return Err(Error::agent(
                 "validate filesystem jail source",
-                format!("{}: {error}", path.display()),
+                format!("{}: {error}", source.source.display()),
             ));
         }
     };
@@ -203,61 +149,29 @@ fn validate_source(path: &Path, kind: BindKind, requirement: SourceRequirement) 
     if metadata.file_type().is_symlink() {
         return Err(Error::agent(
             "validate filesystem jail source",
-            format!("source path must not be a symlink: {}", path.display()),
+            format!(
+                "source path must not be a symlink: {}",
+                source.source.display()
+            ),
         ));
     }
 
-    let valid_kind = match kind {
-        BindKind::Directory => metadata.is_dir(),
-        BindKind::File => metadata.is_file(),
+    let valid_kind = match source.kind {
+        FilesystemViewKind::Directory => metadata.is_dir(),
+        FilesystemViewKind::RegularFile => metadata.is_file(),
     };
     if !valid_kind {
         return Err(Error::agent(
             "validate filesystem jail source",
-            format!("source path must be a {}: {}", kind.label(), path.display()),
+            format!(
+                "source path must be a {}: {}",
+                source.kind.label(),
+                source.source.display()
+            ),
         ));
     }
 
     Ok(true)
-}
-
-fn plan_bind_paths(specs: &[BindingSpec], root: &Path) -> Result<Vec<BindPlan>> {
-    specs
-        .iter()
-        .map(|spec| {
-            let destination = match spec.target {
-                BindingTarget::UserMount(index) => {
-                    root.join("mounts").join(format!("smolvm{index}"))
-                }
-                BindingTarget::PreloadedImage => root.join("mounts").join("smolvm_image"),
-                BindingTarget::ExtraDisk(index) => root.join("disks").join(format!("extra{index}")),
-            };
-            ensure_under_root(root, &destination)?;
-            Ok(BindPlan {
-                spec: spec.clone(),
-                destination,
-            })
-        })
-        .collect()
-}
-
-fn apply_bind_paths(mut prepared: PreparedLaunch, plans: &[BindPlan]) -> PreparedLaunch {
-    for plan in plans {
-        match plan.spec.target {
-            BindingTarget::UserMount(index) => {
-                prepared.mounts[index].source_for_vmm = plan.destination.clone();
-            }
-            BindingTarget::PreloadedImage => {
-                if let Some(mount) = &mut prepared.preloaded_image_mount {
-                    mount.source_for_vmm = plan.destination.clone();
-                }
-            }
-            BindingTarget::ExtraDisk(index) => {
-                prepared.extra_disks[index].path_for_vmm = plan.destination.clone();
-            }
-        }
-    }
-    prepared
 }
 
 fn enter_private_mount_namespace() -> Result<Option<String>> {
@@ -297,10 +211,6 @@ fn make_mounts_private() -> Result<()> {
         return Err(last_os_error("make mount namespace private"));
     }
     Ok(())
-}
-
-fn create_jail_root(prepared: &PreparedLaunch) -> Result<PathBuf> {
-    create_jail_root_in(launch_runtime_dir(prepared)?)
 }
 
 fn launch_runtime_dir(prepared: &PreparedLaunch) -> Result<&Path> {
@@ -412,19 +322,19 @@ fn validate_generated_parent_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn create_bind_target(plan: &BindPlan) -> Result<()> {
-    match plan.spec.kind {
-        BindKind::Directory => fs::create_dir_all(&plan.destination).map_err(|error| {
+fn create_bind_target(entry: &FilesystemViewEntry) -> Result<()> {
+    match entry.source.kind {
+        FilesystemViewKind::Directory => fs::create_dir_all(&entry.destination).map_err(|error| {
             Error::agent(
                 "create filesystem jail target",
-                format!("{}: {error}", plan.destination.display()),
+                format!("{}: {error}", entry.destination.display()),
             )
         }),
-        BindKind::File => {
-            let parent = plan.destination.parent().ok_or_else(|| {
+        FilesystemViewKind::RegularFile => {
+            let parent = entry.destination.parent().ok_or_else(|| {
                 Error::agent(
                     "create filesystem jail target",
-                    format!("{} has no parent directory", plan.destination.display()),
+                    format!("{} has no parent directory", entry.destination.display()),
                 )
             })?;
             fs::create_dir_all(parent).map_err(|error| {
@@ -436,22 +346,22 @@ fn create_bind_target(plan: &BindPlan) -> Result<()> {
             fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
-                .open(&plan.destination)
+                .open(&entry.destination)
                 .map(|_| ())
                 .map_err(|error| {
                     Error::agent(
                         "create filesystem jail target",
-                        format!("{}: {error}", plan.destination.display()),
+                        format!("{}: {error}", entry.destination.display()),
                     )
                 })
         }
     }
 }
 
-fn open_source(spec: &BindingSpec) -> Result<OwnedFd> {
-    let cpath = path_to_cstring(&spec.source)?;
+fn open_source(source: &FilesystemViewSource) -> Result<OwnedFd> {
+    let cpath = path_to_cstring(&source.source)?;
     let mut flags = libc::O_PATH | libc::O_CLOEXEC | libc::O_NOFOLLOW;
-    if spec.kind == BindKind::Directory {
+    if source.kind == FilesystemViewKind::Directory {
         flags |= libc::O_DIRECTORY;
     }
 
@@ -459,29 +369,29 @@ fn open_source(spec: &BindingSpec) -> Result<OwnedFd> {
     if fd < 0 {
         return Err(last_os_error(format!(
             "open filesystem jail source {}",
-            spec.source.display()
+            source.source.display()
         )));
     }
 
     let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-    verify_open_source(&fd, spec)?;
+    verify_open_source(&fd, source)?;
     Ok(fd)
 }
 
-fn verify_open_source(fd: &OwnedFd, spec: &BindingSpec) -> Result<()> {
+fn verify_open_source(fd: &OwnedFd, source: &FilesystemViewSource) -> Result<()> {
     let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
     let ret = unsafe { libc::fstat(fd.as_raw_fd(), stat.as_mut_ptr()) };
     if ret != 0 {
         return Err(last_os_error(format!(
             "stat filesystem jail source {}",
-            spec.source.display()
+            source.source.display()
         )));
     }
     let stat = unsafe { stat.assume_init() };
     let mode = stat.st_mode & libc::S_IFMT;
-    let expected = match spec.kind {
-        BindKind::Directory => libc::S_IFDIR,
-        BindKind::File => libc::S_IFREG,
+    let expected = match source.kind {
+        FilesystemViewKind::Directory => libc::S_IFDIR,
+        FilesystemViewKind::RegularFile => libc::S_IFREG,
     };
 
     if mode != expected {
@@ -489,7 +399,7 @@ fn verify_open_source(fd: &OwnedFd, spec: &BindingSpec) -> Result<()> {
             "validate filesystem jail source",
             format!(
                 "source path changed or has wrong type before bind mount: {}",
-                spec.source.display()
+                source.source.display()
             ),
         ));
     }
@@ -497,12 +407,12 @@ fn verify_open_source(fd: &OwnedFd, spec: &BindingSpec) -> Result<()> {
     Ok(())
 }
 
-fn bind_mount(source: &OwnedFd, destination: &Path, kind: BindKind) -> Result<()> {
+fn bind_mount(source: &OwnedFd, destination: &Path, kind: FilesystemViewKind) -> Result<()> {
     let source_path = PathBuf::from(format!("/proc/self/fd/{}", source.as_raw_fd()));
     let csource = path_to_cstring(&source_path)?;
     let cdestination = path_to_cstring(destination)?;
     let mut flags = libc::MS_BIND as libc::c_ulong;
-    if kind == BindKind::Directory {
+    if kind == FilesystemViewKind::Directory {
         flags |= libc::MS_REC as libc::c_ulong;
     }
     let ret = unsafe {
@@ -523,10 +433,10 @@ fn bind_mount(source: &OwnedFd, destination: &Path, kind: BindKind) -> Result<()
     Ok(())
 }
 
-fn remount_readonly(destination: &Path, kind: BindKind) -> Result<()> {
+fn remount_readonly(destination: &Path, kind: FilesystemViewKind) -> Result<()> {
     let cdestination = path_to_cstring(destination)?;
     let mut flags = (libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY) as libc::c_ulong;
-    if kind == BindKind::Directory {
+    if kind == FilesystemViewKind::Directory {
         flags |= libc::MS_REC as libc::c_ulong;
     }
     let ret = unsafe {
@@ -545,21 +455,6 @@ fn remount_readonly(destination: &Path, kind: BindKind) -> Result<()> {
         )));
     }
     Ok(())
-}
-
-fn ensure_under_root(root: &Path, destination: &Path) -> Result<()> {
-    if destination.starts_with(root) {
-        return Ok(());
-    }
-
-    Err(Error::agent(
-        "plan filesystem jail paths",
-        format!(
-            "generated path escaped jail root: {} outside {}",
-            destination.display(),
-            root.display()
-        ),
-    ))
 }
 
 fn path_to_cstring(path: &Path) -> Result<CString> {
@@ -589,60 +484,8 @@ mod tests {
     use crate::agent::boot_config::BootConfig;
     use crate::data::resources::VmResources;
     use crate::data::storage::HostMount;
+    use crate::security::filesystem_view::{FilesystemViewAccess, FilesystemViewTarget};
     use crate::security::policy::LaunchPolicy;
-
-    #[test]
-    fn jail_paths_preserve_original_audit_paths() {
-        let temp = tempfile::tempdir().unwrap();
-        let host_mount = temp.path().join("host");
-        let image = temp.path().join("image");
-        let disk = temp.path().join("disk.raw");
-        let jail_root = temp.path().join("jail");
-        fs::create_dir_all(&host_mount).unwrap();
-        fs::create_dir_all(&image).unwrap();
-        fs::write(&disk, b"disk").unwrap();
-
-        let prepared = prepared_launch(&host_mount, Some(&image), vec![(disk.clone(), true)]);
-        let specs = collect_binding_specs(&prepared).unwrap();
-        let plans = plan_bind_paths(&specs, &jail_root).unwrap();
-        let materialized = apply_bind_paths(prepared, &plans);
-
-        assert_eq!(materialized.mounts[0].host_source, host_mount);
-        assert_ne!(
-            materialized.mounts[0].host_source,
-            materialized.mounts[0].source_for_vmm
-        );
-        assert!(materialized.mounts[0]
-            .source_for_vmm
-            .starts_with(&jail_root));
-
-        let image_mount = materialized.preloaded_image_mount.as_ref().unwrap();
-        assert_eq!(image_mount.host_source, image);
-        assert!(image_mount.source_for_vmm.starts_with(&jail_root));
-
-        assert_eq!(materialized.extra_disks[0].original_path, disk);
-        assert!(materialized.extra_disks[0]
-            .path_for_vmm
-            .starts_with(&jail_root));
-    }
-
-    #[test]
-    fn jail_paths_rewrite_vmm_paths_to_stable_generated_paths() {
-        let temp = tempfile::tempdir().unwrap();
-        let host_mount = temp.path().join("host");
-        let jail_root = temp.path().join("jail");
-        fs::create_dir_all(&host_mount).unwrap();
-
-        let prepared = prepared_launch(&host_mount, None, Vec::new());
-        let specs = collect_binding_specs(&prepared).unwrap();
-        let plans = plan_bind_paths(&specs, &jail_root).unwrap();
-        let materialized = apply_bind_paths(prepared, &plans);
-
-        assert_eq!(
-            materialized.mounts[0].source_for_vmm,
-            jail_root.join("mounts").join("smolvm0")
-        );
-    }
 
     #[test]
     fn jail_paths_do_not_fake_success_with_symlinks() {
@@ -653,7 +496,8 @@ mod tests {
         std::os::unix::fs::symlink(&target, &link).unwrap();
 
         let prepared = prepared_launch(&link, None, Vec::new());
-        let err = collect_binding_specs(&prepared).unwrap_err();
+        let request = FilesystemViewRequest::from_prepared(&prepared);
+        let err = validate_view_sources(request).unwrap_err();
 
         assert!(err.to_string().contains("must not be a symlink"));
     }
@@ -666,18 +510,19 @@ mod tests {
         fs::write(&original, b"disk").unwrap();
         fs::write(&replacement_target, b"replacement").unwrap();
 
-        let spec = BindingSpec {
-            target: BindingTarget::ExtraDisk(0),
+        let source = FilesystemViewSource {
+            target: FilesystemViewTarget::ExtraDisk(0),
             source: original.clone(),
-            kind: BindKind::File,
-            read_only: true,
+            kind: FilesystemViewKind::RegularFile,
+            access: FilesystemViewAccess::ReadOnly,
+            requirement: FilesystemViewSourceRequirement::Required,
         };
-        validate_source(&spec.source, spec.kind, SourceRequirement::Required).unwrap();
+        validate_source(&source).unwrap();
 
         fs::remove_file(&original).unwrap();
         std::os::unix::fs::symlink(&replacement_target, &original).unwrap();
 
-        let err = open_source(&spec).unwrap_err();
+        let err = open_source(&source).unwrap_err();
 
         assert!(err
             .to_string()
@@ -717,6 +562,25 @@ mod tests {
         assert!(root.read_dir().unwrap().next().is_none());
     }
 
+    #[test]
+    fn missing_optional_sources_skip_before_namespace_setup() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing_image = temp.path().join("missing-image");
+        let prepared = prepared_launch_without_mounts(Some(&missing_image));
+        let request = FilesystemViewRequest::from_prepared(&prepared);
+
+        let (report, mounted_view) = materialize_view_request(request, temp.path()).unwrap();
+
+        assert_eq!(
+            report,
+            Enforcement::Skipped {
+                reason: "no present filesystem grants require generated VMM paths".to_string()
+            }
+        );
+        assert!(mounted_view.is_none());
+        assert!(!temp.path().join(JAIL_ROOT_COMPONENT).exists());
+    }
+
     fn prepared_launch(
         mount: &Path,
         preloaded_image: Option<&Path>,
@@ -742,6 +606,29 @@ mod tests {
             egress_policy_hosts: None,
             preloaded_image_dir: preloaded_image.map(PathBuf::from),
             extra_disks,
+        };
+
+        let policy = LaunchPolicy::from_boot_config(config).unwrap();
+        PreparedLaunch::prepare(policy).unwrap()
+    }
+
+    fn prepared_launch_without_mounts(preloaded_image: Option<&Path>) -> PreparedLaunch {
+        let config = BootConfig {
+            rootfs_path: "/smolvm/rootfs".into(),
+            storage_disk_path: "/smolvm/storage.raw".into(),
+            overlay_disk_path: "/smolvm/overlay.raw".into(),
+            vsock_socket: "/smolvm/agent.sock".into(),
+            console_log: None,
+            startup_error_log: "/smolvm/startup.err".into(),
+            storage_size_gb: 20,
+            overlay_size_gb: 10,
+            mounts: Vec::new(),
+            ports: Vec::new(),
+            resources: VmResources::default(),
+            ssh_agent_socket: None,
+            egress_policy_hosts: None,
+            preloaded_image_dir: preloaded_image.map(PathBuf::from),
+            extra_disks: Vec::new(),
         };
 
         let policy = LaunchPolicy::from_boot_config(config).unwrap();
