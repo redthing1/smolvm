@@ -7,7 +7,7 @@
 //! The static FFI path in `launcher.rs` remains untouched for normal operations.
 
 use crate::network::backend::{COMPAT_NET_FEATURES, TSI_FEATURE_HIJACK_INET};
-use crate::network::{plan_launch_network, EffectiveNetworkBackend};
+use crate::network::{plan_launch_network, EffectiveNetworkBackend, PreparedNetwork};
 use smolvm_network::{
     guest_env, start_virtio_network, GuestNetworkConfig, PortMapping as VirtioPortMapping,
     VirtioNetworkRuntime,
@@ -70,12 +70,10 @@ pub fn launch_agent_vm_dynamic(
     krun: &KrunFunctions,
     config: &PackedLaunchConfig,
 ) -> Result<(), String> {
-    crate::network::validate_requested_network_backend(
-        &config.resources,
-        None,
-        config.port_mappings.len(),
-    )
-    .map_err(|e| e.to_string())?;
+    let prepared_network =
+        PreparedNetwork::from_resources(&config.resources, None, config.port_mappings.len());
+    crate::network::validate_requested_network_backend(&prepared_network)
+        .map_err(|e| e.to_string())?;
 
     // Raise file descriptor limits
     raise_fd_limits();
@@ -178,7 +176,7 @@ pub fn launch_agent_vm_dynamic(
         free_ctx_on_err!("krun_set_root failed");
     }
 
-    let network_plan = plan_launch_network(&config.resources, None, config.port_mappings.len());
+    let network_plan = plan_launch_network(&prepared_network);
     if let Some(reason) = network_plan.fallback_reason {
         tracing::warn!(reason = %reason.user_message(), "network backend fell back to TSI");
     }
@@ -219,28 +217,28 @@ pub fn launch_agent_vm_dynamic(
                 free_ctx_on_err!("krun_set_port_map failed");
             }
 
-            if let Some(ref cidrs) = config.resources.allowed_cidrs {
-                if !cidrs.is_empty() {
-                    let set_egress = krun.set_egress_policy.ok_or_else(|| {
-                        "libkrun does not support egress policy (krun_set_egress_policy not found). \
-                         Update libkrun or remove --allow-cidr flags."
-                            .to_string()
-                    })?;
+            if let Some(cidrs) = prepared_network.initial_cidrs() {
+                let set_egress = krun.set_egress_policy.ok_or_else(|| {
+                    "libkrun does not support egress policy (krun_set_egress_policy not found). \
+                     Update libkrun or remove --allow-cidr flags."
+                        .to_string()
+                })?;
 
-                    let mut all_cidrs = cidrs.clone();
+                let mut all_cidrs = cidrs.to_vec();
+                if prepared_network.should_allow_dns_for_egress_policy() {
                     crate::data::network::ensure_dns_in_cidrs(&mut all_cidrs);
+                }
 
-                    let cidr_cstrings: Vec<CString> = all_cidrs
-                        .iter()
-                        .map(|c| CString::new(c.as_str()).expect("CIDR cannot contain null bytes"))
-                        .collect();
-                    let mut cidr_ptrs: Vec<*const libc::c_char> =
-                        cidr_cstrings.iter().map(|s| s.as_ptr()).collect();
-                    cidr_ptrs.push(std::ptr::null());
+                let cidr_cstrings: Vec<CString> = all_cidrs
+                    .iter()
+                    .map(|c| CString::new(c.as_str()).expect("CIDR cannot contain null bytes"))
+                    .collect();
+                let mut cidr_ptrs: Vec<*const libc::c_char> =
+                    cidr_cstrings.iter().map(|s| s.as_ptr()).collect();
+                cidr_ptrs.push(std::ptr::null());
 
-                    if unsafe { (set_egress)(ctx, cidr_ptrs.as_ptr()) } < 0 {
-                        free_ctx_on_err!("krun_set_egress_policy failed");
-                    }
+                if unsafe { (set_egress)(ctx, cidr_ptrs.as_ptr()) } < 0 {
+                    free_ctx_on_err!("krun_set_egress_policy failed");
                 }
             }
 

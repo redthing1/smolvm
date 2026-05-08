@@ -20,7 +20,7 @@ use smolvm::agent::{docker_config_mount, AgentClient, AgentManager, RunConfig, V
 use smolvm::data::network::PortMapping;
 use smolvm::data::resources::{DEFAULT_MICROVM_CPU_COUNT, DEFAULT_MICROVM_MEMORY_MIB};
 use smolvm::data::storage::HostMount;
-use smolvm::network::{validate_requested_network_backend, NetworkBackend};
+use smolvm::network::{validate_requested_network_backend, NetworkBackend, PreparedNetwork};
 use smolvm::{DEFAULT_IDLE_CMD, DEFAULT_SHELL_CMD};
 use std::io::Write;
 use std::path::PathBuf;
@@ -419,11 +419,12 @@ impl RunCmd {
             overlay_gib: params.overlay_gb,
             allowed_cidrs: params.allowed_cidrs.clone(),
         };
-        validate_requested_network_backend(
+        let prepared_network = PreparedNetwork::from_resources(
             &resources,
             params.egress_policy_hosts.as_deref(),
             params.port.len(),
-        )?;
+        );
+        validate_requested_network_backend(&prepared_network)?;
 
         let manager =
             AgentManager::for_vm_with_sizes(&vm_name, params.storage_gb, params.overlay_gb)
@@ -1241,11 +1242,12 @@ impl CreateCmd {
             overlay_gib: params.overlay_gb,
             allowed_cidrs: params.allowed_cidrs.clone(),
         };
-        validate_requested_network_backend(
+        let prepared_network = PreparedNetwork::from_resources(
             &resources,
             params.egress_policy_hosts.as_deref(),
             params.port.len(),
-        )?;
+        );
+        validate_requested_network_backend(&prepared_network)?;
         if self.ssh_agent {
             params.ssh_agent = true;
         }

@@ -8,5 +8,6 @@ pub mod audit;
 pub mod hardening;
 #[cfg(target_os = "linux")]
 mod linux;
+pub mod materialize;
 pub mod policy;
 pub mod prepare;

@@ -6,6 +6,7 @@
 //! without changing the libkrun launcher again.
 
 use crate::data::storage::{HostMount, MountAccess};
+use crate::network::PreparedNetwork;
 use crate::security::audit::SecurityAudit;
 use crate::security::policy::{DiskGrant, LaunchPolicy, MountGrant};
 use crate::Result;
@@ -22,6 +23,8 @@ pub struct PreparedLaunch {
     pub preloaded_image_mount: Option<PreparedMount>,
     /// Additional disk images with VMM-facing paths.
     pub extra_disks: Vec<PreparedDisk>,
+    /// Launch-ready network intent and backend request.
+    pub network: PreparedNetwork,
     /// Policy/preparation audit summary.
     pub audit: SecurityAudit,
 }
@@ -52,12 +55,14 @@ impl PreparedLaunch {
             .iter()
             .map(PreparedDisk::from_grant)
             .collect();
+        let network = PreparedNetwork::from_policy(&policy);
 
         let mut prepared = Self {
             policy,
             mounts,
             preloaded_image_mount,
             extra_disks,
+            network,
             audit: SecurityAudit {
                 summary: Vec::new(),
             },
@@ -124,6 +129,10 @@ mod tests {
     use crate::security::policy::LaunchPolicy;
 
     fn prepared_launch() -> PreparedLaunch {
+        prepared_launch_with_resources(VmResources::default())
+    }
+
+    fn prepared_launch_with_resources(resources: VmResources) -> PreparedLaunch {
         let config = BootConfig {
             rootfs_path: "/smolvm/rootfs".into(),
             storage_disk_path: "/smolvm/storage.raw".into(),
@@ -146,7 +155,7 @@ mod tests {
                 },
             ],
             ports: Vec::new(),
-            resources: VmResources::default(),
+            resources,
             ssh_agent_socket: None,
             egress_policy_hosts: None,
             preloaded_image_dir: Some("/smolvm/image".into()),
@@ -202,5 +211,18 @@ mod tests {
                 read_only: true,
             }]
         );
+    }
+
+    #[test]
+    fn network_is_prepared_from_policy() {
+        let prepared = prepared_launch();
+        assert!(!prepared.network.wants_network());
+
+        let prepared = prepared_launch_with_resources(VmResources {
+            network: true,
+            ..VmResources::default()
+        });
+        assert!(prepared.network.wants_network());
+        assert!(!prepared.network.has_constrained_egress());
     }
 }

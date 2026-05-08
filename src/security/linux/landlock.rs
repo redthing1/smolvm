@@ -450,6 +450,43 @@ mod tests {
     }
 
     #[test]
+    fn landlock_uses_materialized_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let rootfs = temp.path().join("rootfs");
+        let host_mount = temp.path().join("host");
+        let jail_mount = temp.path().join("jail").join("mounts").join("smolvm0");
+        let runtime = temp.path().join("runtime");
+        let storage = runtime.join("storage.img");
+        let overlay = runtime.join("overlay.img");
+        std::fs::create_dir_all(&rootfs).unwrap();
+        std::fs::create_dir_all(&host_mount).unwrap();
+        std::fs::create_dir_all(&jail_mount).unwrap();
+        std::fs::create_dir_all(&runtime).unwrap();
+        std::fs::write(&storage, b"storage").unwrap();
+        std::fs::write(&overlay, b"overlay").unwrap();
+
+        let mut prepared = prepared_launch_for_paths(
+            &rootfs,
+            &storage,
+            &overlay,
+            vec![HostMount {
+                source: host_mount.clone(),
+                target: "/workspace".into(),
+                read_only: false,
+            }],
+        );
+        prepared.mounts[0].source_for_vmm = jail_mount.clone();
+
+        let rules = build_rules(&prepared);
+
+        find_rule(&rules, &jail_mount);
+        assert!(
+            rules.iter().all(|rule| rule.path != host_mount),
+            "Landlock must not retain the original host path after materialization"
+        );
+    }
+
+    #[test]
     fn landlock_confinement_blocks_unlisted_paths_when_available() {
         let output = Command::new(std::env::current_exe().unwrap())
             .env(CHILD_ENV, "1")

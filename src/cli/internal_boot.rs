@@ -95,6 +95,23 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
         "applied runner hardening baseline"
     );
 
+    let startup_error_log = prepared.policy.startup_error_log.clone();
+    let materialized = match smolvm::security::materialize::materialize_launch(prepared) {
+        Ok(materialized) => materialized,
+        Err(e) => {
+            let _ = std::fs::write(
+                &startup_error_log,
+                format!("failed to materialize launch paths: {}", e),
+            );
+            smolvm::process::exit_child(1);
+        }
+    };
+    tracing::debug!(
+        materialization = %materialized.filesystem_report().render_text(),
+        "materialized launch paths"
+    );
+    let prepared = materialized.prepared();
+
     // Open storage and overlay disks
     let storage_disk = match smolvm::storage::StorageDisk::open_or_create_at(
         &prepared.policy.storage_disk_path,
@@ -131,7 +148,7 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
     };
 
     let result = launch_agent_vm(&LaunchConfig {
-        prepared: &prepared,
+        prepared,
         disks: &disks,
     });
 

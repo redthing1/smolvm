@@ -132,14 +132,9 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
     let ssh_agent_socket = policy.secrets.ssh_agent_socket.as_deref();
     let preloaded_image_mount = prepared.preloaded_image_mount.as_ref();
     let extra_disks = &prepared.extra_disks;
-    let egress_refresh_hosts = &policy.egress_policy_hosts;
+    let prepared_network = &prepared.network;
 
-    let hostname_policy_hosts = egress_refresh_hosts.as_deref();
-    crate::network::validate_requested_network_backend(
-        resources,
-        hostname_policy_hosts,
-        port_mappings.len(),
-    )?;
+    crate::network::validate_requested_network_backend(prepared_network)?;
 
     // Raise file descriptor limits
     raise_fd_limits();
@@ -270,8 +265,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             return Err(Error::agent("set rootfs", "krun_set_root failed"));
         }
 
-        let network_plan =
-            plan_launch_network(resources, hostname_policy_hosts, port_mappings.len());
+        let network_plan = plan_launch_network(prepared_network);
         if let Some(reason) = network_plan.fallback_reason {
             tracing::warn!(reason = %reason.user_message(), "network backend fell back to TSI");
         }
@@ -326,7 +320,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                     return Err(Error::agent("set port mapping", "krun_set_port_map failed"));
                 }
 
-                if let Some(ref cidrs) = resources.allowed_cidrs {
+                if let Some(cidrs) = prepared_network.initial_cidrs() {
                     let Some(set_egress) = krun.set_egress_policy else {
                         krun_free_ctx(ctx);
                         return Err(Error::agent(
@@ -336,8 +330,10 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                         ));
                     };
 
-                    let mut all_cidrs = cidrs.clone();
-                    crate::data::network::ensure_dns_in_cidrs(&mut all_cidrs);
+                    let mut all_cidrs = cidrs.to_vec();
+                    if prepared_network.should_allow_dns_for_egress_policy() {
+                        crate::data::network::ensure_dns_in_cidrs(&mut all_cidrs);
+                    }
 
                     let cidr_cstrings: Vec<CString> = all_cidrs
                         .iter()
@@ -655,13 +651,13 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         //
         // Each cycle: resolve all hosts → build fresh list → single write-lock
         // swap. If all hosts fail to resolve, the previous list is kept intact.
-        if let Some(hosts) = egress_refresh_hosts.as_ref().filter(|h| !h.is_empty()) {
+        if let Some(hosts) = prepared_network.refresh_hosts() {
             if let Some(krun_get_egress_handle) = krun.get_egress_handle {
                 let raw_handle = krun_get_egress_handle(ctx);
 
                 if !raw_handle.is_null() {
                     let arc: EgressArc = *Box::from_raw(raw_handle as *mut EgressArc);
-                    let hosts_copy = hosts.clone();
+                    let hosts_copy = hosts.to_vec();
                     if let Err(e) = std::thread::Builder::new()
                         .name("egress-refresh".into())
                         .spawn(move || {

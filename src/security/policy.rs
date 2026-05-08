@@ -144,7 +144,7 @@ pub enum NetworkGrant {
 }
 
 impl NetworkGrant {
-    fn from_resources(resources: &VmResources, hosts: Option<&[String]>) -> Self {
+    pub(crate) fn from_resources(resources: &VmResources, hosts: Option<&[String]>) -> Self {
         if let Some(hosts) = hosts.filter(|hosts| !hosts.is_empty()) {
             return Self::AllowHosts {
                 hosts: hosts.to_vec(),

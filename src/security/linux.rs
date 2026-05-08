@@ -1,11 +1,13 @@
 //! Linux runner hardening implementation.
 
 mod cgroup;
+mod jail;
 mod landlock;
 
 use crate::security::hardening::{
     Enforcement, RunnerFilesystemReport, RunnerHardeningReport, RunnerResourceReport,
 };
+use crate::security::materialize::FilesystemMaterializationReport;
 use crate::security::prepare::PreparedLaunch;
 use crate::{Error, Result};
 
@@ -30,6 +32,25 @@ pub(super) fn apply_runner_filesystem_confinement(
 
 pub(crate) struct LinuxResourceGuard {
     _cgroup: Option<cgroup::CgroupGuard>,
+}
+
+pub(crate) struct LinuxJailGuard {
+    _jail: Option<jail::JailGuard>,
+}
+
+pub(super) fn materialize_launch(
+    prepared: PreparedLaunch,
+) -> Result<(
+    PreparedLaunch,
+    FilesystemMaterializationReport,
+    LinuxJailGuard,
+)> {
+    let (prepared, report, jail) = jail::materialize(prepared)?;
+    Ok((
+        prepared,
+        FilesystemMaterializationReport { jail_paths: report },
+        LinuxJailGuard { _jail: jail },
+    ))
 }
 
 pub(super) fn apply_runner_resource_confinement(
