@@ -8,6 +8,7 @@
 
 use smolvm::agent::boot_config::BootConfig;
 use smolvm::agent::{launch_agent_vm, LaunchConfig, VmDisks};
+use smolvm::security::prepare::PreparedLaunch;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
@@ -21,11 +22,136 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
         libc::setsid();
     }
 
-    let config = read_boot_config(&config_path)?;
+    let prepared = prepare_launch(&config_path)?;
 
+    if let Err(e) = redirect_stdio(&prepared) {
+        exit_with_startup_error(
+            &prepared.policy.startup_error_log,
+            format_args!("failed to redirect stdio: {e}"),
+        );
+    }
+
+    // Close ALL inherited file descriptors from the parent (server).
+    // Without this, the subprocess holds database locks, network sockets, etc.
+    // that can interfere with libkrun's operation. Keep stdin/stdout/stderr (0-2)
+    // which now point to /dev/null.
+    if let Err(e) = smolvm::process::close_inherited_fds_from(3) {
+        exit_with_startup_error(
+            &prepared.policy.startup_error_log,
+            format_args!("failed to close inherited file descriptors: {e}"),
+        );
+    }
+
+    let hardening_report = match smolvm::security::hardening::apply_runner_baseline() {
+        Ok(report) => report,
+        Err(e) => {
+            exit_with_startup_error(
+                &prepared.policy.startup_error_log,
+                format_args!("failed to apply runner hardening: {e}"),
+            );
+        }
+    };
+    tracing::debug!(
+        hardening = %hardening_report.render_text(),
+        "applied runner hardening baseline"
+    );
+
+    if let Err(e) = smolvm::security::secrets::validate_secret_grants(&prepared) {
+        exit_with_startup_error(
+            &prepared.policy.startup_error_log,
+            format_args!("failed to validate secret grants: {e}"),
+        );
+    }
+
+    let startup_error_log = prepared.policy.startup_error_log.clone();
+    let materialized = match smolvm::security::materialize::materialize_launch(prepared) {
+        Ok(materialized) => materialized,
+        Err(e) => {
+            exit_with_startup_error(
+                &startup_error_log,
+                format_args!("failed to materialize launch paths: {e}"),
+            );
+        }
+    };
+    tracing::debug!(
+        materialization = %materialized.filesystem_report().render_text(),
+        "materialized launch paths"
+    );
+    let prepared = materialized.prepared();
+
+    // Open storage and overlay disks
+    let storage_disk = match smolvm::storage::StorageDisk::open_or_create_at(
+        &prepared.policy.storage_disk_path,
+        prepared.policy.storage_size_gb,
+    ) {
+        Ok(d) => d,
+        Err(e) => {
+            exit_with_startup_error(
+                &prepared.policy.startup_error_log,
+                format_args!("failed to open storage disk: {e}"),
+            );
+        }
+    };
+
+    let overlay_disk = match smolvm::storage::OverlayDisk::open_or_create_at(
+        &prepared.policy.overlay_disk_path,
+        prepared.policy.overlay_size_gb,
+    ) {
+        Ok(d) => d,
+        Err(e) => {
+            exit_with_startup_error(
+                &prepared.policy.startup_error_log,
+                format_args!("failed to open overlay disk: {e}"),
+            );
+        }
+    };
+
+    // Launch the VM (never returns on success)
+    let disks = VmDisks {
+        storage: &storage_disk,
+        overlay: Some(&overlay_disk),
+    };
+
+    let result = launch_agent_vm(&LaunchConfig {
+        prepared,
+        disks: &disks,
+    });
+
+    // If we get here, launch_agent_vm returned (should only happen on error)
+    if let Err(ref e) = result {
+        append_startup_error(&prepared.policy.startup_error_log, e);
+    }
+
+    smolvm::process::exit_child(1);
+}
+
+fn exit_with_startup_error(path: &Path, message: impl std::fmt::Display) -> ! {
+    write_startup_error(path, message);
+    smolvm::process::exit_child(1);
+}
+
+fn write_startup_error(path: &Path, message: impl std::fmt::Display) {
+    let _ = std::fs::write(path, message.to_string());
+}
+
+fn append_startup_error(path: &Path, message: impl std::fmt::Display) {
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .and_then(|mut file| {
+            use std::io::Write;
+            writeln!(file, "{message}")
+        });
+}
+
+fn prepare_launch(config_path: &Path) -> smolvm::Result<PreparedLaunch> {
+    let config = read_boot_config_and_remove(config_path)?;
     let policy = smolvm::security::policy::LaunchPolicy::from_boot_config(config)?;
-    let prepared = smolvm::security::prepare::PreparedLaunch::prepare(policy)?;
+    smolvm::security::prepare::PreparedLaunch::prepare(policy)
+}
 
+fn redirect_stdio(prepared: &PreparedLaunch) -> smolvm::Result<()> {
     // Redirect stdio. When SMOLVM_GPU_DEBUG=1, keep stderr pointed at a
     // debug log file so virglrenderer/MoltenVK errors are captured.
     if std::env::var_os("SMOLVM_GPU_DEBUG").is_some() {
@@ -58,182 +184,172 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
                 }
             }
         }
-    } else if let Err(e) =
+        Ok(())
+    } else {
         smolvm::process::detach_stdio_to_stderr_file(&prepared.policy.startup_error_log)
-    {
-        let _ = std::fs::write(
-            &prepared.policy.startup_error_log,
-            format!("failed to redirect stdio: {}", e),
-        );
-        smolvm::process::exit_child(1);
+            .map_err(|e| smolvm::Error::agent("redirect stdio", e.to_string()))
     }
-
-    // Close ALL inherited file descriptors from the parent (server).
-    // Without this, the subprocess holds database locks, network sockets, etc.
-    // that can interfere with libkrun's operation. Keep stdin/stdout/stderr (0-2)
-    // which now point to /dev/null.
-    if let Err(e) = smolvm::process::close_inherited_fds_from(3) {
-        let _ = std::fs::write(
-            &prepared.policy.startup_error_log,
-            format!("failed to close inherited file descriptors: {}", e),
-        );
-        smolvm::process::exit_child(1);
-    }
-
-    let hardening_report = match smolvm::security::hardening::apply_runner_baseline() {
-        Ok(report) => report,
-        Err(e) => {
-            let _ = std::fs::write(
-                &prepared.policy.startup_error_log,
-                format!("failed to apply runner hardening: {}", e),
-            );
-            smolvm::process::exit_child(1);
-        }
-    };
-    tracing::debug!(
-        hardening = %hardening_report.render_text(),
-        "applied runner hardening baseline"
-    );
-
-    if let Err(e) = smolvm::security::secrets::validate_secret_grants(&prepared) {
-        let _ = std::fs::write(
-            &prepared.policy.startup_error_log,
-            format!("failed to validate secret grants: {}", e),
-        );
-        smolvm::process::exit_child(1);
-    }
-
-    let startup_error_log = prepared.policy.startup_error_log.clone();
-    let materialized = match smolvm::security::materialize::materialize_launch(prepared) {
-        Ok(materialized) => materialized,
-        Err(e) => {
-            let _ = std::fs::write(
-                &startup_error_log,
-                format!("failed to materialize launch paths: {}", e),
-            );
-            smolvm::process::exit_child(1);
-        }
-    };
-    tracing::debug!(
-        materialization = %materialized.filesystem_report().render_text(),
-        "materialized launch paths"
-    );
-    let prepared = materialized.prepared();
-
-    // Open storage and overlay disks
-    let storage_disk = match smolvm::storage::StorageDisk::open_or_create_at(
-        &prepared.policy.storage_disk_path,
-        prepared.policy.storage_size_gb,
-    ) {
-        Ok(d) => d,
-        Err(e) => {
-            let _ = std::fs::write(
-                &prepared.policy.startup_error_log,
-                format!("failed to open storage disk: {}", e),
-            );
-            smolvm::process::exit_child(1);
-        }
-    };
-
-    let overlay_disk = match smolvm::storage::OverlayDisk::open_or_create_at(
-        &prepared.policy.overlay_disk_path,
-        prepared.policy.overlay_size_gb,
-    ) {
-        Ok(d) => d,
-        Err(e) => {
-            let _ = std::fs::write(
-                &prepared.policy.startup_error_log,
-                format!("failed to open overlay disk: {}", e),
-            );
-            smolvm::process::exit_child(1);
-        }
-    };
-
-    // Launch the VM (never returns on success)
-    let disks = VmDisks {
-        storage: &storage_disk,
-        overlay: Some(&overlay_disk),
-    };
-
-    let result = launch_agent_vm(&LaunchConfig {
-        prepared,
-        disks: &disks,
-    });
-
-    // If we get here, launch_agent_vm returned (should only happen on error)
-    if let Err(ref e) = result {
-        let _ = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&prepared.policy.startup_error_log)
-            .and_then(|mut file| {
-                use std::io::Write;
-                writeln!(file, "{e}")
-            });
-    }
-
-    smolvm::process::exit_child(1);
 }
 
-fn read_boot_config(path: &Path) -> smolvm::Result<BootConfig> {
+fn read_boot_config_and_remove(path: &Path) -> smolvm::Result<BootConfig> {
+    let read = read_owner_only_file(path, "boot config")?;
+    let config = serde_json::from_slice(&read.data)
+        .map_err(|e| smolvm::Error::agent("parse boot config", e.to_string()))?;
+    remove_owner_only_file(path, "boot config", &read.identity)?;
+    Ok(config)
+}
+
+struct OwnerOnlyFileRead {
+    data: Vec<u8>,
+    identity: OwnerOnlyFileIdentity,
+}
+
+#[derive(Clone, Copy)]
+struct OwnerOnlyFileIdentity {
+    #[cfg(unix)]
+    dev: u64,
+    #[cfg(unix)]
+    ino: u64,
+}
+
+fn read_owner_only_file(path: &Path, label: &'static str) -> smolvm::Result<OwnerOnlyFileRead> {
     let path_metadata = std::fs::symlink_metadata(path).map_err(|e| {
-        smolvm::Error::agent("read boot config", format!("{}: {}", path.display(), e))
+        smolvm::Error::agent(
+            format!("read {label}"),
+            format!("{}: {}", path.display(), e),
+        )
     })?;
-    validate_boot_config_metadata(path, &path_metadata)?;
+    validate_owner_only_file_metadata(path, label, &path_metadata)?;
 
     let mut file = std::fs::File::open(path).map_err(|e| {
-        smolvm::Error::agent("open boot config", format!("{}: {}", path.display(), e))
+        smolvm::Error::agent(
+            format!("open {label}"),
+            format!("{}: {}", path.display(), e),
+        )
     })?;
     let file_metadata = file.metadata().map_err(|e| {
-        smolvm::Error::agent("stat boot config", format!("{}: {}", path.display(), e))
+        smolvm::Error::agent(
+            format!("stat {label}"),
+            format!("{}: {}", path.display(), e),
+        )
     })?;
-    validate_boot_config_metadata(path, &file_metadata)?;
+    validate_owner_only_file_metadata(path, label, &file_metadata)?;
+
+    let identity = OwnerOnlyFileIdentity::from_metadata(&file_metadata);
 
     #[cfg(unix)]
-    ensure_same_boot_config_file(path, &path_metadata, &file_metadata)?;
+    ensure_same_file(path, label, &path_metadata, &file_metadata)?;
 
-    let mut config_data = Vec::new();
-    file.read_to_end(&mut config_data).map_err(|e| {
-        smolvm::Error::agent("read boot config", format!("{}: {}", path.display(), e))
+    let mut data = Vec::new();
+    file.read_to_end(&mut data).map_err(|e| {
+        smolvm::Error::agent(
+            format!("read {label}"),
+            format!("{}: {}", path.display(), e),
+        )
     })?;
-
-    let config: BootConfig = serde_json::from_slice(&config_data)
-        .map_err(|e| smolvm::Error::agent("parse boot config", e.to_string()))?;
 
     #[cfg(unix)]
     {
         let current_metadata = std::fs::symlink_metadata(path).map_err(|e| {
-            smolvm::Error::agent("stat boot config", format!("{}: {}", path.display(), e))
+            smolvm::Error::agent(
+                format!("stat {label}"),
+                format!("{}: {}", path.display(), e),
+            )
         })?;
-        ensure_same_boot_config_file(path, &current_metadata, &file_metadata)?;
+        ensure_same_file(path, label, &current_metadata, &file_metadata)?;
     }
 
-    drop(file);
-
-    std::fs::remove_file(path).map_err(|e| {
-        smolvm::Error::agent("remove boot config", format!("{}: {}", path.display(), e))
-    })?;
-
-    Ok(config)
+    Ok(OwnerOnlyFileRead { data, identity })
 }
 
-fn validate_boot_config_metadata(path: &Path, metadata: &std::fs::Metadata) -> smolvm::Result<()> {
+fn remove_owner_only_file(
+    path: &Path,
+    label: &'static str,
+    identity: &OwnerOnlyFileIdentity,
+) -> smolvm::Result<()> {
+    let current_metadata = std::fs::symlink_metadata(path).map_err(|e| {
+        smolvm::Error::agent(
+            format!("stat {label}"),
+            format!("{}: {}", path.display(), e),
+        )
+    })?;
+    validate_owner_only_file_metadata(path, label, &current_metadata)?;
+    identity.ensure_matches(path, label, &current_metadata)?;
+
+    std::fs::remove_file(path).map_err(|e| {
+        smolvm::Error::agent(
+            format!("remove {label}"),
+            format!("{}: {}", path.display(), e),
+        )
+    })?;
+
+    Ok(())
+}
+
+impl OwnerOnlyFileIdentity {
+    fn from_metadata(metadata: &std::fs::Metadata) -> Self {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            Self {
+                dev: metadata.dev(),
+                ino: metadata.ino(),
+            }
+        }
+
+        #[cfg(not(unix))]
+        {
+            let _ = metadata;
+            Self {}
+        }
+    }
+
+    fn ensure_matches(
+        &self,
+        path: &Path,
+        label: &'static str,
+        metadata: &std::fs::Metadata,
+    ) -> smolvm::Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if self.dev != metadata.dev() || self.ino != metadata.ino() {
+                return Err(smolvm::Error::agent(
+                    format!("validate {label}"),
+                    format!("{} changed while being opened", path.display()),
+                ));
+            }
+        }
+
+        #[cfg(not(unix))]
+        let _ = (path, label, metadata);
+
+        Ok(())
+    }
+}
+
+fn validate_owner_only_file_metadata(
+    path: &Path,
+    label: &'static str,
+    metadata: &std::fs::Metadata,
+) -> smolvm::Result<()> {
     if !metadata.file_type().is_file() {
         return Err(smolvm::Error::agent(
-            "validate boot config",
+            format!("validate {label}"),
             format!("{} is not a regular file", path.display()),
         ));
     }
 
     #[cfg(unix)]
-    validate_unix_boot_config_metadata(path, metadata)?;
+    validate_unix_owner_only_file_metadata(path, label, metadata)?;
 
     Ok(())
 }
 
 #[cfg(unix)]
-fn validate_unix_boot_config_metadata(
+fn validate_unix_owner_only_file_metadata(
     path: &Path,
+    label: &'static str,
     metadata: &std::fs::Metadata,
 ) -> smolvm::Result<()> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -241,7 +357,7 @@ fn validate_unix_boot_config_metadata(
     let mode = metadata.permissions().mode();
     if mode & 0o077 != 0 {
         return Err(smolvm::Error::agent(
-            "validate boot config",
+            format!("validate {label}"),
             format!(
                 "{} must not grant group/other access (mode {:03o})",
                 path.display(),
@@ -251,7 +367,7 @@ fn validate_unix_boot_config_metadata(
     }
     if mode & 0o400 == 0 {
         return Err(smolvm::Error::agent(
-            "validate boot config",
+            format!("validate {label}"),
             format!("{} must be owner-readable", path.display()),
         ));
     }
@@ -259,7 +375,7 @@ fn validate_unix_boot_config_metadata(
     let euid = unsafe { libc::geteuid() };
     if metadata.uid() != euid {
         return Err(smolvm::Error::agent(
-            "validate boot config",
+            format!("validate {label}"),
             format!(
                 "{} is owned by uid {}, expected current euid {}",
                 path.display(),
@@ -273,8 +389,9 @@ fn validate_unix_boot_config_metadata(
 }
 
 #[cfg(unix)]
-fn ensure_same_boot_config_file(
+fn ensure_same_file(
     path: &Path,
+    label: &'static str,
     expected: &std::fs::Metadata,
     actual: &std::fs::Metadata,
 ) -> smolvm::Result<()> {
@@ -282,7 +399,7 @@ fn ensure_same_boot_config_file(
 
     if expected.dev() != actual.dev() || expected.ino() != actual.ino() {
         return Err(smolvm::Error::agent(
-            "validate boot config",
+            format!("validate {label}"),
             format!("{} changed while being opened", path.display()),
         ));
     }
@@ -336,7 +453,7 @@ mod tests {
         let config = sample_boot_config(tmp.path());
         write_config(&path, &config, 0o600);
 
-        let parsed = read_boot_config(&path).unwrap();
+        let parsed = read_boot_config_and_remove(&path).unwrap();
 
         assert_eq!(parsed.rootfs_path, config.rootfs_path);
         assert_eq!(parsed.storage_disk_path, config.storage_disk_path);
@@ -354,7 +471,7 @@ mod tests {
         let config = sample_boot_config(tmp.path());
         write_config(&path, &config, 0o640);
 
-        let err = read_boot_config(&path).expect_err("group-readable config must fail");
+        let err = read_boot_config_and_remove(&path).expect_err("group-readable config must fail");
 
         assert!(
             err.to_string().contains("group/other access"),
@@ -373,7 +490,7 @@ mod tests {
         write_config(&target, &config, 0o600);
         std::os::unix::fs::symlink(&target, &link).unwrap();
 
-        let err = read_boot_config(&link).expect_err("symlink config must fail");
+        let err = read_boot_config_and_remove(&link).expect_err("symlink config must fail");
 
         assert!(
             err.to_string().contains("regular file"),

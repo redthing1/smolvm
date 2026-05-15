@@ -1505,82 +1505,6 @@ pub fn find_layer_path(image_digest: &str, layer_index: usize) -> Result<PathBuf
     Ok(layer_dir)
 }
 
-/// Export a layer as a tar file on the storage disk.
-///
-/// DEPRECATED: Prefer streaming export via `find_layer_path()` + piped tar.
-/// This function creates a temp tar file that can fill the storage disk for
-/// large layers. Kept for backward compatibility.
-pub fn export_layer(image_digest: &str, layer_index: usize) -> Result<PathBuf> {
-    let layer_dir = find_layer_path(image_digest, layer_index)?;
-    let layer_id = layer_dir
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("unknown");
-
-    let root = Path::new(STORAGE_ROOT);
-    let tmp_dir = root.join("tmp");
-    std::fs::create_dir_all(&tmp_dir)?;
-    let tar_path = tmp_dir.join(format!("layer-{}.tar", &layer_id[..12.min(layer_id.len())]));
-
-    info!(
-        layer_id = %layer_id,
-        output = %tar_path.display(),
-        "exporting layer as tar (temp file)"
-    );
-
-    let status = Command::new("tar")
-        .args(["-cf"])
-        .arg(&tar_path)
-        .arg("-C")
-        .arg(&layer_dir)
-        .arg(".")
-        .status()?;
-
-    if !status.success() {
-        return Err(StorageError::new(format!(
-            "failed to create tar archive for layer {}",
-            layer_id
-        )));
-    }
-
-    Ok(tar_path)
-}
-
-/// Get the layer digest for an image at a specific index.
-pub fn get_layer_digest(image_digest: &str, layer_index: usize) -> Result<String> {
-    let root = Path::new(STORAGE_ROOT);
-    let manifests_dir = root.join(MANIFESTS_DIR);
-
-    if !manifests_dir.exists() {
-        return Err(StorageError::NoImagesFound);
-    }
-
-    for entry in std::fs::read_dir(&manifests_dir)? {
-        let entry = entry?;
-        let content = std::fs::read_to_string(entry.path())?;
-        if let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&content) {
-            if let Some(config) = manifest.get("config") {
-                if let Some(digest) = config.get("digest").and_then(|d| d.as_str()) {
-                    if digest == image_digest {
-                        if let Some(layers) = manifest["layers"].as_array() {
-                            if layer_index < layers.len() {
-                                if let Some(layer_digest) = layers[layer_index]["digest"].as_str() {
-                                    return Ok(layer_digest.to_string());
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    Err(StorageError::new(format!(
-        "layer {} not found for image {}",
-        layer_index, image_digest
-    )))
-}
-
 /// Run garbage collection.
 pub fn garbage_collect(dry_run: bool) -> Result<u64> {
     let root = Path::new(STORAGE_ROOT);
@@ -2165,6 +2089,19 @@ pub struct PreparedOverlayRootfs {
     pub rootfs_path: String,
 }
 
+/// Inputs for one foreground container command.
+pub struct RunCommandRequest<'a> {
+    pub image: &'a str,
+    pub command: &'a [String],
+    pub env: &'a [(String, String)],
+    pub workdir: Option<&'a str>,
+    pub user: Option<&'a str>,
+    pub mounts: &'a [(String, String, bool)],
+    pub timeout_ms: Option<u64>,
+    pub persistent_overlay_id: Option<&'a str>,
+    pub client_fd: Option<std::os::unix::io::RawFd>,
+}
+
 fn prepare_rootfs_for_ephemeral_run(image: &str) -> Result<PreparedOverlayRootfs> {
     let workload_id = format!(
         "run-{}-{}",
@@ -2188,31 +2125,21 @@ fn prepare_rootfs_for_ephemeral_run(image: &str) -> Result<PreparedOverlayRootfs
 /// When `persistent_overlay_id` is `Some`, the overlay persists across runs
 /// (filesystem changes accumulate). When `None`, an ephemeral overlay is
 /// created and destroyed after the run.
-pub fn run_command(
-    image: &str,
-    command: &[String],
-    env: &[(String, String)],
-    workdir: Option<&str>,
-    user: Option<&str>,
-    mounts: &[(String, String, bool)],
-    timeout_ms: Option<u64>,
-    persistent_overlay_id: Option<&str>,
-    client_fd: Option<std::os::unix::io::RawFd>,
-) -> Result<RunResult> {
+pub fn run_command(request: RunCommandRequest<'_>) -> Result<RunResult> {
     // Validate inputs
-    crate::oci::validate_image_reference(image).map_err(StorageError::new)?;
-    crate::oci::validate_env_vars(env).map_err(StorageError::new)?;
+    crate::oci::validate_image_reference(request.image).map_err(StorageError::new)?;
+    crate::oci::validate_env_vars(request.env).map_err(StorageError::new)?;
 
-    let prepared = match persistent_overlay_id {
-        Some(id) => prepare_for_run_persistent(image, id)?,
-        None => prepare_rootfs_for_ephemeral_run(image)?,
+    let prepared = match request.persistent_overlay_id {
+        Some(id) => prepare_for_run_persistent(request.image, id)?,
+        None => prepare_rootfs_for_ephemeral_run(request.image)?,
     };
-    debug!(rootfs = %prepared.rootfs_path, persistent = persistent_overlay_id.is_some(), "using overlay for command execution");
+    debug!(rootfs = %prepared.rootfs_path, persistent = request.persistent_overlay_id.is_some(), "using overlay for command execution");
 
     // Gather all steps to run a command in a single anon function
     let result = (|| {
         // Setup volume mounts (mount virtiofs to staging area)
-        let mounted_paths = setup_volume_mounts(&prepared.rootfs_path, mounts)?;
+        let mounted_paths = setup_volume_mounts(&prepared.rootfs_path, request.mounts)?;
 
         // Get bundle path
         let overlay_root = Path::new(STORAGE_ROOT)
@@ -2221,14 +2148,15 @@ pub fn run_command(
         let bundle_path = overlay_root.join("bundle");
 
         // Create OCI spec
-        let workdir_str = workdir.unwrap_or("/");
-        let identity = crate::oci::resolve_process_identity(Path::new(&prepared.rootfs_path), user)
-            .map_err(StorageError::new)?;
-        let mut spec = OciSpec::new(command, env, workdir_str, false, &identity);
+        let workdir_str = request.workdir.unwrap_or("/");
+        let identity =
+            crate::oci::resolve_process_identity(Path::new(&prepared.rootfs_path), request.user)
+                .map_err(StorageError::new)?;
+        let mut spec = OciSpec::new(request.command, request.env, workdir_str, false, &identity);
         spec.add_gpu_devices_if_available();
 
         // Add virtiofs bind mounts to OCI spec
-        for (tag, container_path, read_only) in mounts {
+        for (tag, container_path, read_only) in request.mounts {
             let virtiofs_mount = Path::new(paths::VIRTIOFS_MOUNT_ROOT).join(tag);
             spec.add_bind_mount(
                 &virtiofs_mount.to_string_lossy(),
@@ -2254,7 +2182,12 @@ pub fn run_command(
         let container_id = generate_container_id();
 
         // Run with crun
-        let result = run_with_crun(&bundle_path, &container_id, timeout_ms, client_fd);
+        let result = run_with_crun(
+            &bundle_path,
+            &container_id,
+            request.timeout_ms,
+            request.client_fd,
+        );
 
         // Note: virtiofs mounts are left in place for reuse
         // They will be cleaned up when the overlay is cleaned up or the VM shuts down
@@ -2264,7 +2197,7 @@ pub fn run_command(
     })();
 
     // Only clean up ephemeral overlays; persistent ones survive across runs
-    if persistent_overlay_id.is_none() {
+    if request.persistent_overlay_id.is_none() {
         let _ = cleanup_overlay(&prepared.workload_id);
     }
     result
@@ -3057,7 +2990,7 @@ fn get_disk_usage(path: &Path) -> Result<(u64, u64)> {
             let free = stat.f_bfree * stat.f_frsize;
             let used = total - free;
 
-            Ok((total as u64, used as u64))
+            Ok((total, used))
         }
     }
 

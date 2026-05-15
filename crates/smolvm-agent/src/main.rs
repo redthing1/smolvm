@@ -322,11 +322,11 @@ fn signal_ready_to_host() {
     ];
 
     for path in &paths {
-        if Path::new(path).parent().map_or(false, |p| p.exists()) {
-            if std::fs::write(path, content.as_bytes()).is_ok() {
-                debug!(path = path, "ready marker written");
-                return;
-            }
+        if Path::new(path).parent().is_some_and(|p| p.exists())
+            && std::fs::write(path, content.as_bytes()).is_ok()
+        {
+            debug!(path = path, "ready marker written");
+            return;
         }
     }
 }
@@ -1512,7 +1512,7 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
         } = request
         {
             // Drop any leftover session (Drop cleans its tmp file).
-            write_session = None;
+            drop(write_session.take());
             let (new_session, response) = handle_file_write_begin(path, mode, total_size);
             write_session = new_session;
             send_response(stream, &response)?;
@@ -1739,17 +1739,17 @@ fn handle_request(
                     persistent_overlay_id.as_deref(),
                 )
             } else {
-                handle_run(
-                    &image,
-                    &command,
-                    &env,
-                    workdir.as_deref(),
-                    user.as_deref(),
-                    &mounts,
+                handle_run(storage::RunCommandRequest {
+                    image: &image,
+                    command: &command,
+                    env: &env,
+                    workdir: workdir.as_deref(),
+                    user: user.as_deref(),
+                    mounts: &mounts,
                     timeout_ms,
-                    persistent_overlay_id.as_deref(),
+                    persistent_overlay_id: persistent_overlay_id.as_deref(),
                     client_fd,
-                )
+                })
             }
         }
 
@@ -3451,30 +3451,17 @@ fn handle_run_background(
     }
 }
 
-fn handle_run(
-    image: &str,
-    command: &[String],
-    env: &[(String, String)],
-    workdir: Option<&str>,
-    user: Option<&str>,
-    mounts: &[(String, String, bool)],
-    timeout_ms: Option<u64>,
-    persistent_overlay_id: Option<&str>,
-    client_fd: Option<std::os::unix::io::RawFd>,
-) -> AgentResponse {
-    info!(image = %image, command = ?command, mounts = ?mounts, timeout_ms = ?timeout_ms, persistent = persistent_overlay_id.is_some(), "running command");
+fn handle_run(request: storage::RunCommandRequest<'_>) -> AgentResponse {
+    info!(
+        image = %request.image,
+        command = ?request.command,
+        mounts = ?request.mounts,
+        timeout_ms = ?request.timeout_ms,
+        persistent = request.persistent_overlay_id.is_some(),
+        "running command"
+    );
 
-    match storage::run_command(
-        image,
-        command,
-        env,
-        workdir,
-        user,
-        mounts,
-        timeout_ms,
-        persistent_overlay_id,
-        client_fd,
-    ) {
+    match storage::run_command(request) {
         Ok(result) => AgentResponse::Completed {
             exit_code: result.exit_code,
             stdout: result.stdout,
@@ -4426,9 +4413,9 @@ mod tests {
 
         let got = std::fs::read(&target).unwrap();
         let mut expected = Vec::with_capacity(total);
-        expected.extend(std::iter::repeat(b'A').take(400));
-        expected.extend(std::iter::repeat(b'B').take(400));
-        expected.extend(std::iter::repeat(b'C').take(224));
+        expected.extend(std::iter::repeat_n(b'A', 400));
+        expected.extend(std::iter::repeat_n(b'B', 400));
+        expected.extend(std::iter::repeat_n(b'C', 224));
         assert_eq!(got, expected);
         assert!(staging_files_in(tmp.path()).is_empty());
     }

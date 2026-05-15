@@ -7,54 +7,15 @@
 
 use crate::data::storage::MountAccess;
 use crate::security::prepare::PreparedLaunch;
-use crate::{Error, Result};
-use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 /// Host paths that should appear in a generated launch filesystem view.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FilesystemViewRequest {
     entries: Vec<FilesystemViewSource>,
 }
 
 impl FilesystemViewRequest {
-    /// Build the requested filesystem view from prepared launch data.
-    pub(crate) fn from_prepared(prepared: &PreparedLaunch) -> Self {
-        let mut entries = Vec::new();
-
-        for (index, mount) in prepared.mounts.iter().enumerate() {
-            entries.push(FilesystemViewSource {
-                target: FilesystemViewTarget::UserMount(index),
-                source: mount.host_source.clone(),
-                kind: FilesystemViewKind::Directory,
-                access: FilesystemViewAccess::from_mount_access(mount.access),
-                requirement: FilesystemViewSourceRequirement::Required,
-            });
-        }
-
-        if let Some(mount) = &prepared.preloaded_image_mount {
-            entries.push(FilesystemViewSource {
-                target: FilesystemViewTarget::PreloadedImage,
-                source: mount.host_source.clone(),
-                kind: FilesystemViewKind::Directory,
-                access: FilesystemViewAccess::ReadOnly,
-                requirement: FilesystemViewSourceRequirement::Optional,
-            });
-        }
-
-        for (index, disk) in prepared.extra_disks.iter().enumerate() {
-            entries.push(FilesystemViewSource {
-                target: FilesystemViewTarget::ExtraDisk(index),
-                source: disk.original_path.clone(),
-                kind: FilesystemViewKind::RegularFile,
-                access: FilesystemViewAccess::from_read_only(disk.read_only),
-                requirement: FilesystemViewSourceRequirement::Required,
-            });
-        }
-
-        Self { entries }
-    }
-
     pub(crate) fn from_entries(entries: Vec<FilesystemViewSource>) -> Self {
         Self { entries }
     }
@@ -67,27 +28,23 @@ impl FilesystemViewRequest {
         &self.entries
     }
 
-    /// Add generated destination paths under `root`.
-    pub(crate) fn plan(self, root: PathBuf) -> Result<FilesystemViewSpec> {
+    /// Add deterministic generated destination paths under `root`.
+    pub(crate) fn plan(self, root: PathBuf) -> FilesystemViewSpec {
         let entries = self
             .entries
             .into_iter()
-            .map(|source| {
-                let destination = destination_for(&root, source.target);
-                ensure_under_root(&root, &destination)?;
-                Ok(FilesystemViewEntry {
-                    source,
-                    destination,
-                })
+            .map(|source| FilesystemViewEntry {
+                destination: destination_for(&root, source.target),
+                source,
             })
-            .collect::<Result<Vec<_>>>()?;
+            .collect();
 
-        Ok(FilesystemViewSpec { root, entries })
+        FilesystemViewSpec { root, entries }
     }
 }
 
 /// Fully planned generated filesystem view.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FilesystemViewSpec {
     root: PathBuf,
     entries: Vec<FilesystemViewEntry>,
@@ -97,30 +54,10 @@ impl FilesystemViewSpec {
     pub(crate) fn entries(&self) -> &[FilesystemViewEntry] {
         &self.entries
     }
-
-    /// Rewrite only VMM-facing paths in the prepared launch.
-    pub(crate) fn apply_to_prepared(&self, mut prepared: PreparedLaunch) -> PreparedLaunch {
-        for entry in &self.entries {
-            match entry.source.target {
-                FilesystemViewTarget::UserMount(index) => {
-                    prepared.mounts[index].source_for_vmm = entry.destination.clone();
-                }
-                FilesystemViewTarget::PreloadedImage => {
-                    if let Some(mount) = &mut prepared.preloaded_image_mount {
-                        mount.source_for_vmm = entry.destination.clone();
-                    }
-                }
-                FilesystemViewTarget::ExtraDisk(index) => {
-                    prepared.extra_disks[index].path_for_vmm = entry.destination.clone();
-                }
-            }
-        }
-        prepared
-    }
 }
 
 /// One host source requested for the generated view.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FilesystemViewSource {
     pub(crate) target: FilesystemViewTarget,
     pub(crate) source: PathBuf,
@@ -130,14 +67,14 @@ pub(crate) struct FilesystemViewSource {
 }
 
 /// One planned bind target in the generated view.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FilesystemViewEntry {
     pub(crate) source: FilesystemViewSource,
     pub(crate) destination: PathBuf,
 }
 
 /// The prepared launch field that receives the generated path.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FilesystemViewTarget {
     UserMount(usize),
     PreloadedImage,
@@ -145,7 +82,7 @@ pub(crate) enum FilesystemViewTarget {
 }
 
 /// Filesystem object type expected at the source path.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FilesystemViewKind {
     Directory,
     RegularFile,
@@ -161,7 +98,7 @@ impl FilesystemViewKind {
 }
 
 /// Access requested for the generated view path.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FilesystemViewAccess {
     ReadOnly,
     ReadWrite,
@@ -175,7 +112,7 @@ impl FilesystemViewAccess {
         }
     }
 
-    fn from_read_only(read_only: bool) -> Self {
+    pub(crate) fn from_read_only(read_only: bool) -> Self {
         if read_only {
             Self::ReadOnly
         } else {
@@ -189,10 +126,70 @@ impl FilesystemViewAccess {
 }
 
 /// Whether a missing source should fail materialization.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FilesystemViewSourceRequirement {
     Required,
     Optional,
+}
+
+/// Build the requested filesystem view from prepared launch data.
+pub(crate) fn request_from_prepared(prepared: &PreparedLaunch) -> FilesystemViewRequest {
+    let mut entries = Vec::new();
+
+    for (index, mount) in prepared.mounts.iter().enumerate() {
+        entries.push(FilesystemViewSource {
+            target: FilesystemViewTarget::UserMount(index),
+            source: mount.host_source.clone(),
+            kind: FilesystemViewKind::Directory,
+            access: FilesystemViewAccess::from_mount_access(mount.access),
+            requirement: FilesystemViewSourceRequirement::Required,
+        });
+    }
+
+    if let Some(mount) = &prepared.preloaded_image_mount {
+        entries.push(FilesystemViewSource {
+            target: FilesystemViewTarget::PreloadedImage,
+            source: mount.host_source.clone(),
+            kind: FilesystemViewKind::Directory,
+            access: FilesystemViewAccess::ReadOnly,
+            requirement: FilesystemViewSourceRequirement::Optional,
+        });
+    }
+
+    for (index, disk) in prepared.extra_disks.iter().enumerate() {
+        entries.push(FilesystemViewSource {
+            target: FilesystemViewTarget::ExtraDisk(index),
+            source: disk.original_path.clone(),
+            kind: FilesystemViewKind::RegularFile,
+            access: FilesystemViewAccess::from_read_only(disk.read_only),
+            requirement: FilesystemViewSourceRequirement::Required,
+        });
+    }
+
+    FilesystemViewRequest::from_entries(entries)
+}
+
+/// Rewrite only VMM-facing paths in the prepared launch.
+pub(crate) fn apply_to_prepared(
+    spec: &FilesystemViewSpec,
+    mut prepared: PreparedLaunch,
+) -> PreparedLaunch {
+    for entry in spec.entries() {
+        match entry.source.target {
+            FilesystemViewTarget::UserMount(index) => {
+                prepared.mounts[index].source_for_vmm = entry.destination.clone();
+            }
+            FilesystemViewTarget::PreloadedImage => {
+                if let Some(mount) = &mut prepared.preloaded_image_mount {
+                    mount.source_for_vmm = entry.destination.clone();
+                }
+            }
+            FilesystemViewTarget::ExtraDisk(index) => {
+                prepared.extra_disks[index].path_for_vmm = entry.destination.clone();
+            }
+        }
+    }
+    prepared
 }
 
 fn destination_for(root: &Path, target: FilesystemViewTarget) -> PathBuf {
@@ -205,21 +202,6 @@ fn destination_for(root: &Path, target: FilesystemViewTarget) -> PathBuf {
     }
 }
 
-fn ensure_under_root(root: &Path, destination: &Path) -> Result<()> {
-    if destination.starts_with(root) {
-        return Ok(());
-    }
-
-    Err(Error::agent(
-        "plan filesystem view paths",
-        format!(
-            "generated path escaped filesystem view root: {} outside {}",
-            destination.display(),
-            root.display()
-        ),
-    ))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -227,6 +209,7 @@ mod tests {
     use crate::data::resources::VmResources;
     use crate::data::storage::HostMount;
     use crate::security::policy::LaunchPolicy;
+    use std::path::PathBuf;
 
     #[test]
     fn view_spec_preserves_original_audit_paths() {
@@ -236,9 +219,9 @@ mod tests {
             vec![("/host/disk.raw".into(), true)],
         );
         let root = PathBuf::from("/runtime/view");
-        let request = FilesystemViewRequest::from_prepared(&prepared);
-        let spec = request.plan(root.clone()).unwrap();
-        let prepared = spec.apply_to_prepared(prepared);
+        let request = request_from_prepared(&prepared);
+        let spec = request.plan(root.clone());
+        let prepared = apply_to_prepared(&spec, prepared);
 
         assert_eq!(
             prepared.mounts[0].host_source,
@@ -266,9 +249,9 @@ mod tests {
     fn view_spec_uses_stable_generated_paths() {
         let prepared = prepared_launch("/host/project", None, Vec::new());
         let root = PathBuf::from("/runtime/view");
-        let request = FilesystemViewRequest::from_prepared(&prepared);
-        let spec = request.plan(root.clone()).unwrap();
-        let prepared = spec.apply_to_prepared(prepared);
+        let request = request_from_prepared(&prepared);
+        let spec = request.plan(root.clone());
+        let prepared = apply_to_prepared(&spec, prepared);
 
         assert_eq!(
             prepared.mounts[0].source_for_vmm,
@@ -279,7 +262,7 @@ mod tests {
     #[test]
     fn view_request_marks_preloaded_image_optional() {
         let prepared = prepared_launch("/host/project", Some("/host/image"), Vec::new());
-        let request = FilesystemViewRequest::from_prepared(&prepared);
+        let request = request_from_prepared(&prepared);
         let image = request
             .entries()
             .iter()

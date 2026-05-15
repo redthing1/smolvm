@@ -6,7 +6,7 @@
 //! runtime directory, and rewrites VMM-facing paths to that generated view.
 
 use crate::security::filesystem_view::{
-    FilesystemViewEntry, FilesystemViewKind, FilesystemViewRequest, FilesystemViewSource,
+    self, FilesystemViewEntry, FilesystemViewKind, FilesystemViewRequest, FilesystemViewSource,
     FilesystemViewSourceRequirement, FilesystemViewSpec,
 };
 use crate::security::hardening::Enforcement;
@@ -24,7 +24,7 @@ const JAIL_ROOT_COMPONENT: &str = "jails";
 pub(super) fn materialize(
     prepared: PreparedLaunch,
 ) -> Result<(PreparedLaunch, Enforcement, Option<JailGuard>)> {
-    let request = FilesystemViewRequest::from_prepared(&prepared);
+    let request = filesystem_view::request_from_prepared(&prepared);
     let runtime_dir = launch_runtime_dir(&prepared)?;
     let (report, mounted_view) = materialize_view_request(request, runtime_dir)?;
 
@@ -32,7 +32,7 @@ pub(super) fn materialize(
         return Ok((prepared, report, None));
     };
 
-    let prepared = view.apply_to_prepared(prepared);
+    let prepared = filesystem_view::apply_to_prepared(&view, prepared);
     Ok((prepared, report, Some(guard)))
 }
 
@@ -66,7 +66,7 @@ pub(crate) fn materialize_view_request(
     make_mounts_private()?;
 
     let mut guard = JailGuard::new(create_jail_root_in(runtime_dir)?);
-    let view = request.plan(guard.root().to_path_buf())?;
+    let view = request.plan(guard.root().to_path_buf());
 
     for entry in view.entries() {
         create_bind_target(entry)?;
@@ -82,6 +82,7 @@ pub(crate) fn materialize_view_request(
     Ok((Enforcement::Enforced, Some((view, guard))))
 }
 
+#[derive(Debug)]
 pub(crate) struct JailGuard {
     root: PathBuf,
     mounts: Vec<PathBuf>,
@@ -183,8 +184,7 @@ fn enter_private_mount_namespace() -> Result<Option<String>> {
     let error = std::io::Error::last_os_error();
     match error.raw_os_error() {
         Some(libc::EPERM) => Ok(Some(
-            "private mount namespace requires CAP_SYS_ADMIN; rootless helper not installed"
-                .to_string(),
+            "private mount namespace is unavailable to this unprivileged process".to_string(),
         )),
         Some(libc::EINVAL) | Some(libc::ENOSYS) => Ok(Some(format!(
             "private mount namespace is not supported by this kernel: {error}"
@@ -496,7 +496,7 @@ mod tests {
         std::os::unix::fs::symlink(&target, &link).unwrap();
 
         let prepared = prepared_launch(&link, None, Vec::new());
-        let request = FilesystemViewRequest::from_prepared(&prepared);
+        let request = filesystem_view::request_from_prepared(&prepared);
         let err = validate_view_sources(request).unwrap_err();
 
         assert!(err.to_string().contains("must not be a symlink"));
@@ -567,7 +567,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let missing_image = temp.path().join("missing-image");
         let prepared = prepared_launch_without_mounts(Some(&missing_image));
-        let request = FilesystemViewRequest::from_prepared(&prepared);
+        let request = filesystem_view::request_from_prepared(&prepared);
 
         let (report, mounted_view) = materialize_view_request(request, temp.path()).unwrap();
 

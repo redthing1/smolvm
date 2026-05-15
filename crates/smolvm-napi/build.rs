@@ -6,7 +6,6 @@
 
 #[cfg(target_os = "linux")]
 use std::path::Path;
-use std::process::Command;
 
 #[cfg(target_os = "linux")]
 fn is_lfs_pointer(path: &Path) -> bool {

@@ -3,8 +3,6 @@
 //! All filesystem paths used by the agent are defined here for consistency
 //! and easy modification.
 
-use std::path::PathBuf;
-
 // =============================================================================
 // Binary Paths
 // =============================================================================
@@ -27,17 +25,11 @@ pub const CRUN_CGROUP_MANAGER: &str = "disabled";
 // =============================================================================
 
 /// Root directory for virtiofs mounts from the host.
-pub const VIRTIOFS_MOUNT_ROOT: &str = "/mnt/virtiofs";
-
-// =============================================================================
-// Storage Paths
-// =============================================================================
-
-/// Root directory for all persistent storage.
-pub const STORAGE_ROOT: &str = "/storage";
-
-/// Directory for overlay filesystems.
-pub const OVERLAYS_DIR: &str = "/storage/overlays";
+///
+/// Keep this outside `/mnt`: users commonly mount host directories at `/mnt`,
+/// and using `/mnt/virtiofs` as an internal staging path makes `/mnt` an
+/// ancestor of the source mount for image-backed containers.
+pub const VIRTIOFS_MOUNT_ROOT: &str = "/run/smolvm/virtiofs";
 
 // =============================================================================
 // Container Runtime Paths
@@ -51,48 +43,6 @@ pub const CONTAINERS_LOGS_DIR: &str = "/storage/containers/logs";
 
 /// Directory for container exit code files.
 pub const CONTAINERS_EXIT_DIR: &str = "/storage/containers/exit";
-
-/// Path to the persistent container registry file.
-pub const REGISTRY_PATH: &str = "/storage/containers/registry.json";
-
-/// Path to the registry lock file.
-pub const REGISTRY_LOCK_PATH: &str = "/storage/containers/registry.lock";
-
-// =============================================================================
-// Timeouts (milliseconds)
-// =============================================================================
-
-/// Timeout for acquiring registry lock.
-pub const REGISTRY_LOCK_TIMEOUT_MS: u64 = 5000;
-
-// =============================================================================
-// Path Helper Functions
-// =============================================================================
-
-/// Get the runtime directory for a specific container.
-pub fn container_run_dir(container_id: &str) -> PathBuf {
-    PathBuf::from(CONTAINERS_RUN_DIR).join(container_id)
-}
-
-/// Get the log file path for a container.
-pub fn container_log_path(container_id: &str) -> PathBuf {
-    PathBuf::from(CONTAINERS_LOGS_DIR).join(format!("{}.log", container_id))
-}
-
-/// Get the exit code file path for a container.
-pub fn container_exit_path(container_id: &str) -> PathBuf {
-    PathBuf::from(CONTAINERS_EXIT_DIR).join(container_id)
-}
-
-/// Get the overlay directory for a workload.
-pub fn overlay_dir(workload_id: &str) -> PathBuf {
-    PathBuf::from(OVERLAYS_DIR).join(workload_id)
-}
-
-/// Get the bundle directory for a workload.
-pub fn bundle_dir(workload_id: &str) -> PathBuf {
-    overlay_dir(workload_id).join("bundle")
-}
 
 // =============================================================================
 // Filesystem Helpers
@@ -124,34 +74,11 @@ pub fn is_mount_point(_path: &std::path::Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     #[test]
-    fn test_container_paths() {
-        let id = "abc123";
-        assert_eq!(
-            container_run_dir(id),
-            PathBuf::from("/storage/containers/run/abc123")
-        );
-        assert_eq!(
-            container_log_path(id),
-            PathBuf::from("/storage/containers/logs/abc123.log")
-        );
-        assert_eq!(
-            container_exit_path(id),
-            PathBuf::from("/storage/containers/exit/abc123")
-        );
-    }
-
-    #[test]
-    fn test_overlay_paths() {
-        let wl = "workload-123";
-        assert_eq!(
-            overlay_dir(wl),
-            PathBuf::from("/storage/overlays/workload-123")
-        );
-        assert_eq!(
-            bundle_dir(wl),
-            PathBuf::from("/storage/overlays/workload-123/bundle")
-        );
+    fn virtiofs_staging_path_does_not_live_under_common_user_mount_target() {
+        let staging = PathBuf::from(VIRTIOFS_MOUNT_ROOT);
+        assert!(!staging.starts_with("/mnt"));
     }
 }

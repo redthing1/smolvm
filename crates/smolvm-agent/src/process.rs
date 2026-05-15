@@ -65,7 +65,7 @@ pub fn is_peer_closed(fd: std::os::unix::io::RawFd) -> bool {
         let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
         // EAGAIN/EWOULDBLOCK = no data but connection alive → peer still there.
         // Any other error (ECONNRESET, ENOTCONN, EBADF, etc.) → peer gone.
-        return !matches!(errno, libc::EAGAIN | libc::EWOULDBLOCK);
+        return errno != libc::EAGAIN && errno != libc::EWOULDBLOCK;
     }
     // rc > 0: there's data in the buffer — connection is alive.
     false
@@ -102,7 +102,8 @@ pub fn capture_child_output(child: &mut Child) -> ChildOutput {
 /// (default: 10ms).
 ///
 /// Handles EINTR (interrupted system call) by retrying the wait.
-pub fn wait_with_timeout(
+#[cfg(test)]
+fn wait_with_timeout(
     child: &mut Child,
     timeout_ms: Option<u64>,
     poll_interval_ms: Option<u64>,
@@ -167,7 +168,8 @@ fn try_wait_with_eintr(child: &mut Child) -> std::io::Result<Option<std::process
 /// killing it. This allows for custom cleanup (e.g., killing containers).
 ///
 /// Handles EINTR (interrupted system call) by retrying the wait.
-pub fn wait_with_timeout_and_cleanup<F>(
+#[cfg(test)]
+fn wait_with_timeout_and_cleanup<F>(
     child: &mut Child,
     timeout_ms: Option<u64>,
     on_timeout: F,
