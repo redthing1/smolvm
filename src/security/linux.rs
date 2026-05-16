@@ -3,9 +3,11 @@
 mod cgroup;
 mod jail;
 mod landlock;
+mod seccomp;
 
 use crate::security::hardening::{
     Enforcement, RunnerFilesystemReport, RunnerHardeningReport, RunnerResourceReport,
+    RunnerSyscallPolicy, RunnerSyscallReport,
 };
 use crate::security::materialize::FilesystemMaterializationReport;
 use crate::security::prepare::PreparedLaunch;
@@ -59,6 +61,14 @@ pub(super) fn apply_runner_resource_confinement(
     cgroup::apply(prepared)
 }
 
+pub(super) fn apply_runner_syscall_confinement(
+    policy: RunnerSyscallPolicy,
+) -> Result<RunnerSyscallReport> {
+    Ok(RunnerSyscallReport {
+        seccomp: seccomp::apply(policy)?,
+    })
+}
+
 fn set_no_new_privs() -> Result<()> {
     let ret = unsafe {
         libc::prctl(
@@ -73,6 +83,17 @@ fn set_no_new_privs() -> Result<()> {
         return Err(last_os_error("set no_new_privs"));
     }
 
+    if !no_new_privs_is_set()? {
+        return Err(Error::agent(
+            "apply runner hardening",
+            "set no_new_privs: verification returned false",
+        ));
+    }
+
+    Ok(())
+}
+
+fn no_new_privs_is_set() -> Result<bool> {
     let current = unsafe {
         libc::prctl(
             libc::PR_GET_NO_NEW_PRIVS,
@@ -82,14 +103,11 @@ fn set_no_new_privs() -> Result<()> {
             0 as libc::c_ulong,
         )
     };
-    if current != 1 {
-        return Err(Error::agent(
-            "apply runner hardening",
-            format!("set no_new_privs: verification returned {current}"),
-        ));
+    match current {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(last_os_error("get no_new_privs")),
     }
-
-    Ok(())
 }
 
 fn disable_core_dumps() -> Result<()> {

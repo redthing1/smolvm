@@ -133,6 +133,52 @@ impl RunnerResourceReport {
     }
 }
 
+/// Syscall confinement applied to the host-side VM runner process.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunnerSyscallReport {
+    /// Linux seccomp-BPF syscall filter.
+    pub seccomp: Enforcement,
+}
+
+/// Launch facts needed to build host-side syscall confinement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunnerSyscallPolicy {
+    wants_network: bool,
+}
+
+impl RunnerSyscallPolicy {
+    /// Build syscall policy from a fully prepared launch.
+    pub fn from_prepared(prepared: &PreparedLaunch) -> Self {
+        Self::from_network(prepared.network.wants_network())
+    }
+
+    /// Build syscall policy from an already prepared network decision.
+    pub const fn from_network(wants_network: bool) -> Self {
+        Self { wants_network }
+    }
+
+    /// Whether this launch needs host-side networking after VMM entry.
+    pub const fn wants_network(self) -> bool {
+        self.wants_network
+    }
+}
+
+impl RunnerSyscallReport {
+    /// Render this report as stable newline-delimited text.
+    pub fn render_text(&self) -> String {
+        format!("seccomp={}", self.seccomp.render())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn skipped_for_platform() -> Self {
+        Self {
+            seccomp: Enforcement::Skipped {
+                reason: "not a Linux host".to_string(),
+            },
+        }
+    }
+}
+
 /// Keeps resource confinement alive for the duration of the VM runner.
 pub struct RunnerResourceGuard {
     report: RunnerResourceReport,
@@ -210,6 +256,26 @@ pub fn apply_runner_resource_confinement(prepared: &PreparedLaunch) -> Result<Ru
     }
 }
 
+/// Apply syscall confinement for the current VM runner process.
+///
+/// This should run after launch setup has loaded and configured libkrun, but
+/// immediately before entering the VMM. That keeps dynamic loader and setup
+/// syscalls out of the filter while still constraining the long-lived VMM.
+pub fn apply_runner_syscall_confinement(
+    policy: RunnerSyscallPolicy,
+) -> Result<RunnerSyscallReport> {
+    #[cfg(target_os = "linux")]
+    {
+        crate::security::linux::apply_runner_syscall_confinement(policy)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = policy;
+        Ok(RunnerSyscallReport::skipped_for_platform())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -257,5 +323,14 @@ mod tests {
         assert!(text.contains("cgroup=enforced"));
         assert!(text.contains("pids=enforced"));
         assert!(text.contains("memory=skipped (not measured yet)"));
+    }
+
+    #[test]
+    fn runner_syscall_report_renders_seccomp_state() {
+        let report = RunnerSyscallReport {
+            seccomp: Enforcement::Enforced,
+        };
+
+        assert_eq!(report.render_text(), "seccomp=enforced");
     }
 }

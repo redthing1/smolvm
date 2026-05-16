@@ -722,6 +722,21 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             }
         }
 
+        let syscall_policy =
+            crate::security::hardening::RunnerSyscallPolicy::from_prepared(prepared);
+        let syscall_report =
+            match crate::security::hardening::apply_runner_syscall_confinement(syscall_policy) {
+                Ok(report) => report,
+                Err(e) => {
+                    krun_free_ctx(ctx);
+                    return Err(e);
+                }
+            };
+        tracing::debug!(
+            hardening = %syscall_report.render_text(),
+            "applied runner syscall confinement"
+        );
+
         // Start VM (this replaces the process on success). Keep resource
         // confinement alive until libkrun returns on failure or VM exit.
         let ret = krun_start_enter(ctx);

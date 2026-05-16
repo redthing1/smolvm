@@ -78,6 +78,13 @@ pub fn launch_agent_vm_dynamic(
     // Raise file descriptor limits
     raise_fd_limits();
 
+    let hardening_report = crate::security::hardening::apply_runner_baseline()
+        .map_err(|e| format!("failed to apply runner hardening: {e}"))?;
+    tracing::debug!(
+        hardening = %hardening_report.render_text(),
+        "applied runner hardening baseline"
+    );
+
     // Set library path so libkrun can find libkrunfw
     let lib_dir = config
         .rootfs_path
@@ -430,6 +437,19 @@ pub fn launch_agent_vm_dynamic(
             free_ctx_on_err!(e);
         }
     }
+
+    let syscall_policy = crate::security::hardening::RunnerSyscallPolicy::from_network(
+        prepared_network.wants_network(),
+    );
+    let syscall_report =
+        match crate::security::hardening::apply_runner_syscall_confinement(syscall_policy) {
+            Ok(report) => report,
+            Err(e) => free_ctx_on_err!(e),
+        };
+    tracing::debug!(
+        hardening = %syscall_report.render_text(),
+        "applied runner syscall confinement"
+    );
 
     // Start VM (never returns on success)
     // SAFETY: ctx is valid, all configuration has been set
