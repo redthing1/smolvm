@@ -5,7 +5,7 @@ pub const BYTES_PER_MIB: u64 = 1024 * 1024;
 pub const BYTES_PER_GIB: u64 = 1024 * 1024 * 1024;
 
 /// Name of the environment variable that overrides the directory used to
-/// locate bundled native libraries for smolvm.
+/// locate native runtime libraries for smolvm.
 ///
 /// If set, smolvm checks this directory before falling back to paths relative
 /// to the current executable. This is primarily used by embedded runtimes.

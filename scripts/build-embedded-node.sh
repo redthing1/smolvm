@@ -25,10 +25,7 @@ require_match() {
 
 LIBKRUN_BUNDLE="$(detect_lib_bundle)"
 
-if [[ ! -d "$LIBKRUN_BUNDLE" ]]; then
-    echo "Error: embedded library bundle not found: $LIBKRUN_BUNDLE" >&2
-    exit 1
-fi
+"$REPO_ROOT/scripts/build-runtime-libs.sh"
 
 if [[ "$(uname -s)" == "Linux" ]]; then
     require_match "$LIBKRUN_BUNDLE" "libkrun.so*"

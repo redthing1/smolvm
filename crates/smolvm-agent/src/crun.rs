@@ -88,6 +88,7 @@ impl CrunCommand {
     ///
     /// Returns immediately after the container process is started. The container
     /// continues running independently. Use `crun state` to check status.
+    #[allow(dead_code)]
     pub fn run_detach(bundle_dir: &Path, container_id: &str) -> Self {
         let mut c = Self::new();
         c.cmd.args([
@@ -168,6 +169,7 @@ impl CrunCommand {
     ///
     /// Returns all containers in a single invocation, much faster than
     /// calling `crun state` per container during reconciliation.
+    #[allow(dead_code)]
     pub fn list() -> Self {
         let mut c = Self::new();
         c.cmd.args(["list", "-f", "json"]);

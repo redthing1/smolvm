@@ -24,7 +24,17 @@ host_lib_dir() {
 [[ -d "$ROOTFS" ]] || die "$ROOTFS not found; run ./scripts/build.sh"
 
 LIB_DIR="$(host_lib_dir)"
-[[ -d "$LIB_DIR" ]] || die "$LIB_DIR not found; run git lfs pull or build libkrun/libkrunfw"
+[[ -d "$LIB_DIR" ]] || die "$LIB_DIR not found; run ./scripts/build-runtime-libs.sh"
+case "$(uname -s)" in
+  Linux)
+    [[ -e "$LIB_DIR/libkrun.so" ]] || die "$LIB_DIR/libkrun.so not found; run ./scripts/build-runtime-libs.sh"
+    [[ -e "$LIB_DIR/libkrunfw.so" ]] || die "$LIB_DIR/libkrunfw.so not found; run ./scripts/build-runtime-libs.sh"
+    ;;
+  Darwin)
+    [[ -e "$LIB_DIR/libkrun.dylib" ]] || die "$LIB_DIR/libkrun.dylib not found; run ./scripts/build-runtime-libs.sh"
+    [[ -e "$LIB_DIR/libkrunfw.5.dylib" || -e "$LIB_DIR/libkrunfw.dylib" ]] || die "$LIB_DIR/libkrunfw.dylib not found; run ./scripts/build-runtime-libs.sh"
+    ;;
+esac
 
 export SMOLVM_AGENT_ROOTFS="$ROOTFS"
 export SMOLVM_LIB_DIR="$LIB_DIR"

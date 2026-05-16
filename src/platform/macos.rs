@@ -76,15 +76,6 @@ impl VmExecutor for MacOsExecutor {
     fn dylib_extension(&self) -> &'static str {
         "dylib"
     }
-
-    fn library_search_paths(&self) -> &'static [&'static str] {
-        &[
-            "/opt/homebrew/lib",
-            "/usr/local/lib",
-            "/opt/homebrew/opt/libkrun/lib",
-            "/usr/local/opt/libkrun/lib",
-        ]
-    }
 }
 
 /// macOS Rosetta 2 support implementation.

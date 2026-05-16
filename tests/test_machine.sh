@@ -3448,9 +3448,9 @@ test_docker_in_vm() {
     # ── Assert: images persist across restart ─────────────────────────────────
     echo "phase: assert-persistence"
     output=$($SMOLVM machine exec --name "$vm_name" -- sh -c '
-        docker images | grep -q "^alpine " || { echo "FAIL: alpine image missing after restart"; docker images; exit 1; }
+        docker image inspect alpine:latest >/dev/null || { echo "FAIL: alpine image missing after restart"; docker images; exit 1; }
         echo "alpine-persists"
-        docker images | grep -q "smolvm-test-build" || { echo "FAIL: built image missing after restart"; docker images; exit 1; }
+        docker image inspect smolvm-test-build:latest >/dev/null || { echo "FAIL: built image missing after restart"; docker images; exit 1; }
         echo "built-image-persists"
         docker run --rm alpine echo "post-restart-run-ok"
     ' 2>&1) || {

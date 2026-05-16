@@ -55,11 +55,6 @@ pub trait VmExecutor: Send + Sync {
     ///
     /// Returns "dylib" on macOS, "so" on Linux.
     fn dylib_extension(&self) -> &'static str;
-
-    /// Get common library search paths for this platform.
-    ///
-    /// Used for finding libraries like libkrun at runtime.
-    fn library_search_paths(&self) -> &'static [&'static str];
 }
 
 /// Trait for Rosetta 2 support detection and configuration.

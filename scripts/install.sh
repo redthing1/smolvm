@@ -117,7 +117,7 @@ require_runtime_artifacts() {
 
   [[ -x "$bin" ]] || die "$bin not found or not executable; run ./scripts/build.sh"
   [[ -d "$rootfs" ]] || die "$rootfs not found; run ./scripts/build.sh"
-  [[ -d "$lib_dir" ]] || die "$lib_dir not found; run git lfs pull or build libkrun/libkrunfw"
+  [[ -d "$lib_dir" ]] || die "$lib_dir not found; run ./scripts/build.sh"
 
   case "$(uname -s)" in
     Linux)

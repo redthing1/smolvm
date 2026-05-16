@@ -149,7 +149,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
     let lib_dir = find_lib_dir().ok_or_else(|| {
         Error::agent(
             "find libraries",
-            "libkrun/libkrunfw not found. Install smolvm with bundled libraries or set SMOLVM_LIB_DIR.",
+            "libkrun/libkrunfw not found. Build runtime libraries or set SMOLVM_LIB_DIR.",
         )
     })?;
     let krun =

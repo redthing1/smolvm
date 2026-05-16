@@ -7,6 +7,9 @@ use std::io::Read;
 use std::process::Child;
 use std::time::{Duration, Instant};
 
+#[allow(dead_code)]
+type PipeDrain = Option<std::thread::JoinHandle<Vec<u8>>>;
+
 /// Exit code used when a command is killed due to timeout.
 pub const TIMEOUT_EXIT_CODE: i32 = 124;
 
@@ -98,6 +101,7 @@ pub fn is_peer_closed(_fd: std::os::unix::io::RawFd) -> bool {
 /// Linux), reading blocks until the process exits — which it cannot do while
 /// the pipe is full.  Prefer `spawn_pipe_drains` + `join_pipe_drains` when
 /// the process is still running.
+#[allow(dead_code)]
 pub fn capture_child_output(child: &mut Child) -> ChildOutput {
     let mut output = ChildOutput::default();
 
@@ -120,12 +124,8 @@ pub fn capture_child_output(child: &mut Child) -> ChildOutput {
 ///
 /// Returns `(stdout_drain, stderr_drain)` join handles.  Call
 /// `join_pipe_drains` to collect the output after the process has exited.
-pub fn spawn_pipe_drains(
-    child: &mut Child,
-) -> (
-    Option<std::thread::JoinHandle<Vec<u8>>>,
-    Option<std::thread::JoinHandle<Vec<u8>>>,
-) {
+#[allow(dead_code)]
+pub fn spawn_pipe_drains(child: &mut Child) -> (PipeDrain, PipeDrain) {
     let stdout_handle = child.stdout.take().map(|mut pipe| {
         std::thread::spawn(move || {
             let mut buf = Vec::new();
@@ -144,10 +144,8 @@ pub fn spawn_pipe_drains(
 }
 
 /// Collect output from pipe-drain threads started by `spawn_pipe_drains`.
-pub fn join_pipe_drains(
-    stdout_handle: Option<std::thread::JoinHandle<Vec<u8>>>,
-    stderr_handle: Option<std::thread::JoinHandle<Vec<u8>>>,
-) -> ChildOutput {
+#[allow(dead_code)]
+pub fn join_pipe_drains(stdout_handle: PipeDrain, stderr_handle: PipeDrain) -> ChildOutput {
     ChildOutput {
         stdout: stdout_handle
             .and_then(|h| h.join().ok())
@@ -369,8 +367,8 @@ where
                 let join_deadline = Instant::now() + READER_JOIN_TIMEOUT;
                 while Instant::now() < join_deadline {
                     drain_channels(&stdout_rx, &stderr_rx, &mut stdout_buf, &mut stderr_buf);
-                    let stdout_done = stdout_handle.as_ref().map_or(true, |h| h.is_finished());
-                    let stderr_done = stderr_handle.as_ref().map_or(true, |h| h.is_finished());
+                    let stdout_done = stdout_handle.as_ref().is_none_or(|h| h.is_finished());
+                    let stderr_done = stderr_handle.as_ref().is_none_or(|h| h.is_finished());
                     if stdout_done && stderr_done {
                         break;
                     }

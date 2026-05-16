@@ -4,7 +4,8 @@
 
 - Rust toolchain
 - Linux musl Rust target for the guest agent (for example: `rustup target add x86_64-unknown-linux-musl`)
-- [git-lfs](https://git-lfs.com) (required for library binaries)
+- C compiler, `make`, `curl`, `tar`, Python 3, `flex`, `bison`, and `bc` for building `libkrunfw`
+- `clang`/libclang, `pkg-config`, plus `epoxy`, `libdrm`, and `virglrenderer` development files for the `GPU=1` libkrun build
 - e2fsprogs (for storage template creation; `mkfs.ext4`; on macOS: `brew install e2fsprogs`)
 - LLVM (macOS only, for building libkrun: `brew install llvm`)
 - [cargo-make](https://github.com/sagiegurari/cargo-make) is optional
@@ -123,14 +124,27 @@ Other scripts:
 ./scripts/install.sh
 ```
 
-## Rebuilding Libraries
+## Runtime Libraries
 
-The pre-built library binaries in `lib/` cover most development workflows. If you
-need to rebuild them (after submodule updates, kernel config changes, or enabling
-new features), see:
+`libkrunfw` and `libkrun` are built from the checked-out submodules for the
+current host. The generated libraries are local build artifacts under `lib/`,
+not source-controlled inputs.
 
-- [Building libkrun](building-libkrun.md) — rebuild `lib/libkrun.dylib` (GPU support, blk, net)
-- [Building libkrunfw](building-libkrunfw-macos.md) — rebuild `lib/libkrunfw.5.dylib` (kernel blob)
+```bash
+# Build both runtime libraries
+./scripts/build-runtime-libs.sh
+
+# Or build one side
+./scripts/build-runtime-libs.sh libkrunfw
+./scripts/build-runtime-libs.sh libkrun
+```
+
+`./scripts/build.sh` runs this automatically before building the CLI and agent
+rootfs. Set `SMOLVM_BUILD_JOBS=8` if you want explicit make parallelism.
+
+GPU-enabled `libkrun` links against host GPU libraries such as virglrenderer and
+libepoxy. Those are host build/runtime dependencies, not binaries fetched or
+tracked by this repository.
 
 ## Troubleshooting
 

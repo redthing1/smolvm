@@ -1042,7 +1042,9 @@ mod tests {
         // file streams as two chunks); but SINGLE_SHOT > CHUNK would
         // be incoherent — a file slightly over the shot threshold
         // would need to stream as... a single oversized chunk.
-        assert!(FILE_WRITE_SINGLE_SHOT_MAX <= FILE_WRITE_CHUNK_SIZE);
+        const {
+            assert!(FILE_WRITE_SINGLE_SHOT_MAX <= FILE_WRITE_CHUNK_SIZE);
+        }
     }
 
     #[test]

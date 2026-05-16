@@ -4,21 +4,8 @@
 //! discovery logic from smolvm's build.rs so the .node binary can
 //! dynamically link libkrun at load time.
 
-#[cfg(target_os = "linux")]
-use std::path::Path;
-
-#[cfg(target_os = "linux")]
-fn is_lfs_pointer(path: &Path) -> bool {
-    if let Ok(metadata) = std::fs::metadata(path) {
-        if metadata.len() > 500 {
-            return false;
-        }
-    }
-    if let Ok(content) = std::fs::read_to_string(path) {
-        return content.starts_with("version https://git-lfs.github.com/spec/v1");
-    }
-    false
-}
+#[cfg(target_os = "macos")]
+use std::process::Command;
 
 fn link_krun() {
     #[cfg(target_os = "macos")]
@@ -40,7 +27,7 @@ fn link_libkrun() {
     println!("cargo:rerun-if-env-changed=LIBKRUN_BUNDLE");
     println!("cargo:rerun-if-env-changed=LIBKRUN_DIR");
 
-    // Option 1: Bundle libraries with the binary
+    // Option 1: Explicit runtime library directory.
     if let Ok(bundle_path) = std::env::var("LIBKRUN_BUNDLE") {
         println!("cargo:rustc-link-search=native={}", bundle_path);
         link_krun();
@@ -99,7 +86,7 @@ fn link_libkrun() {
         return;
     }
 
-    // Option 4: Bundled libraries in lib/linux-{arch}/ (Linux only)
+    // Option 4: Source-tree runtime libraries in lib/linux-{arch}/ (Linux only).
     #[cfg(target_os = "linux")]
     {
         let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
@@ -112,9 +99,9 @@ fn link_libkrun() {
         let lib_dir = smolvm_root.join(format!("lib/linux-{}", arch));
         let libkrun_path = lib_dir.join("libkrun.so");
 
-        if libkrun_path.exists() && !is_lfs_pointer(&libkrun_path) {
+        if libkrun_path.exists() {
             println!(
-                "cargo:warning=Using bundled Linux libraries from {}",
+                "cargo:warning=Using source-tree Linux libraries from {}",
                 lib_dir.display()
             );
             println!("cargo:rustc-link-search=native={}", lib_dir.display());
@@ -125,55 +112,5 @@ fn link_libkrun() {
         }
     }
 
-    // Option 5: System installation via pkg-config
-    if pkg_config::Config::new()
-        .atleast_version("1.0")
-        .probe("libkrun")
-        .is_ok()
-    {
-        return;
-    }
-
-    // Option 6: Common installation paths
-    #[cfg(target_os = "macos")]
-    {
-        let paths = [
-            "/opt/homebrew/lib",
-            "/usr/local/lib",
-            "/opt/homebrew/opt/libkrun/lib",
-            "/usr/local/opt/libkrun/lib",
-        ];
-
-        for path in paths {
-            if std::path::Path::new(path).join("libkrun.dylib").exists() {
-                println!("cargo:rustc-link-search=native={}", path);
-                link_krun();
-                println!("cargo:rustc-link-arg=-Wl,-rpath,{}", path);
-                return;
-            }
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        let paths = [
-            "/usr/lib",
-            "/usr/local/lib",
-            "/usr/lib64",
-            "/usr/local/lib64",
-            "/usr/lib/x86_64-linux-gnu",
-            "/usr/lib/aarch64-linux-gnu",
-        ];
-
-        for path in paths {
-            if std::path::Path::new(path).join("libkrun.so").exists() {
-                println!("cargo:rustc-link-search=native={}", path);
-                link_krun();
-                return;
-            }
-        }
-    }
-
-    // Fallback: let the linker figure it out
-    link_krun();
+    panic!("libkrun not found; run ./scripts/build-runtime-libs.sh or set LIBKRUN_BUNDLE");
 }

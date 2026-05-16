@@ -46,45 +46,23 @@ category = "Agent"
 script_runner = "bash"
 script = ["./scripts/rebuild-agent.sh"]
 
-[tasks.build-libkrunfw]
-description = "Build libkrunfw and update lib/"
+[tasks.runtime-libs]
+description = "Build libkrunfw and libkrun from submodules"
 category = "Build"
 script_runner = "bash"
-script = [
-'''
-set -euo pipefail
-ARCH=$(uname -m)
-FULL_VERSION=$(grep '^FULL_VERSION' libkrunfw/Makefile | cut -d= -f2 | tr -d ' ')
-KERNEL_SRC=$(grep '^KERNEL_VERSION' libkrunfw/Makefile | cut -d= -f2 | tr -d ' ')
+script = ["./scripts/build-runtime-libs.sh"]
 
-if [ -d "libkrunfw/${KERNEL_SRC}" ]; then
-  cp libkrunfw/config-libkrunfw_x86_64 "libkrunfw/${KERNEL_SRC}/.config"
-  make -C "libkrunfw/${KERNEL_SRC}" olddefconfig
-  rm -f libkrunfw/kernel.c
-fi
-
-make -C libkrunfw
-mkdir -p "lib/linux-${ARCH}"
-cp "libkrunfw/libkrunfw.so.${FULL_VERSION}" "lib/linux-${ARCH}/libkrunfw.so.${FULL_VERSION}"
-cd "lib/linux-${ARCH}"
-ln -sf "libkrunfw.so.${FULL_VERSION}" libkrunfw.so.5
-ln -sf libkrunfw.so.5 libkrunfw.so
-'''
-]
+[tasks.build-libkrunfw]
+description = "Build libkrunfw from submodule and update lib/"
+category = "Build"
+script_runner = "bash"
+script = ["./scripts/build-runtime-libs.sh libkrunfw"]
 
 [tasks.build-libkrun]
-description = "Build libkrun and update lib/"
+description = "Build libkrun from submodule and update lib/"
 category = "Build"
 script_runner = "bash"
-script = [
-'''
-set -euo pipefail
-ARCH=$(uname -m)
-make -C libkrun BLK=1 GPU=1
-mkdir -p "lib/linux-${ARCH}"
-cp libkrun/target/release/libkrun.so "lib/linux-${ARCH}/libkrun.so"
-'''
-]
+script = ["./scripts/build-runtime-libs.sh libkrun"]
 
 [tasks.test]
 description = "Run all tests"

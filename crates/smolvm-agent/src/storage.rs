@@ -33,6 +33,7 @@ const IMAGE_METADATA_FILENAME: &str = ".smolvm-image.json";
 const IMAGE_OCI_ARCHIVE_FILENAME: &str = ".smolvm-image.oci.tar";
 const MATERIALIZED_IMAGE_ROOTFS_DIR: &str = "imported-rootfs";
 const WORKSPACE_DIR: &str = "workspace";
+const DEFAULT_WORKSPACE_SYMLINK_TARGET: &str = "/storage/workspace";
 const DOCKER_HUB_AUTH_CONFIG_KEY: &str = "https://index.docker.io/v1/";
 const DOCKER_HUB_REGISTRY_ALIASES: &[&str] = &["docker.io", "index.docker.io"];
 
@@ -241,6 +242,52 @@ fn ensure_mount_target_under_root(rootfs: &Path, container_path: &str) -> Result
     }
 
     Ok(final_canon)
+}
+
+fn replace_default_workspace_symlink_for_mount(rootfs: &Path, container_path: &str) -> Result<()> {
+    let relative = validate_container_destination_path(container_path)?;
+    if relative != Path::new(WORKSPACE_DIR) {
+        return Ok(());
+    }
+
+    let root_canon = rootfs.canonicalize().map_err(|e| StorageError::ReadFile {
+        path: rootfs.display().to_string(),
+        cause: format!("failed to canonicalize rootfs: {}", e),
+    })?;
+    let target = root_canon.join(WORKSPACE_DIR);
+
+    let meta = match std::fs::symlink_metadata(&target) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => {
+            return Err(StorageError::ReadFile {
+                path: target.display().to_string(),
+                cause: err.to_string(),
+            });
+        }
+    };
+    if !meta.file_type().is_symlink() {
+        return Ok(());
+    }
+
+    let link_target = std::fs::read_link(&target).map_err(|e| StorageError::ReadFile {
+        path: target.display().to_string(),
+        cause: e.to_string(),
+    })?;
+    if link_target != Path::new(DEFAULT_WORKSPACE_SYMLINK_TARGET) {
+        return Ok(());
+    }
+
+    std::fs::remove_file(&target).map_err(|e| StorageError::RemoveFile {
+        path: target.display().to_string(),
+        cause: e.to_string(),
+    })?;
+    std::fs::create_dir(&target).map_err(|e| StorageError::CreateDir {
+        path: target.display().to_string(),
+        cause: e.to_string(),
+    })?;
+
+    Ok(())
 }
 
 const PRELOADED_IMAGE_ENV: &str = "SMOLVM_PRELOADED_IMAGE";
@@ -484,6 +531,8 @@ pub enum StorageError {
     // ========================================================================
     /// Failed to create a directory.
     CreateDir { path: String, cause: String },
+    /// Failed to remove a file.
+    RemoveFile { path: String, cause: String },
     /// Failed to remove a directory.
     RemoveDir { path: String, cause: String },
     /// Failed to read a file or directory.
@@ -650,6 +699,9 @@ impl std::fmt::Display for StorageError {
             // I/O errors
             StorageError::CreateDir { path, cause } => {
                 write!(f, "failed to create directory '{}': {}", path, cause)
+            }
+            StorageError::RemoveFile { path, cause } => {
+                write!(f, "failed to remove file '{}': {}", path, cause)
             }
             StorageError::RemoveDir { path, cause } => {
                 write!(f, "failed to remove directory '{}': {}", path, cause)
@@ -1517,6 +1569,7 @@ pub fn find_layer_path(image_digest: &str, layer_index: usize) -> Result<PathBuf
 /// DEPRECATED: Prefer streaming export via `find_layer_path()` + piped tar.
 /// This function creates a temp tar file that can fill the storage disk for
 /// large layers. Kept for backward compatibility.
+#[allow(dead_code)]
 pub fn export_layer(image_digest: &str, layer_index: usize) -> Result<PathBuf> {
     let layer_dir = find_layer_path(image_digest, layer_index)?;
     let layer_id = layer_dir
@@ -1554,6 +1607,7 @@ pub fn export_layer(image_digest: &str, layer_index: usize) -> Result<PathBuf> {
 }
 
 /// Get the layer digest for an image at a specific index.
+#[allow(dead_code)]
 pub fn get_layer_digest(image_digest: &str, layer_index: usize) -> Result<String> {
     let root = Path::new(STORAGE_ROOT);
     let manifests_dir = root.join(MANIFESTS_DIR);
@@ -2467,6 +2521,7 @@ fn setup_volume_mounts(rootfs: &str, mounts: &[(String, String, bool)]) -> Resul
         }
 
         // Now bind-mount into the container rootfs
+        replace_default_workspace_symlink_for_mount(rootfs_path, container_path)?;
         let target_path = ensure_mount_target_under_root(rootfs_path, container_path)?;
 
         // Check if already bind-mounted
@@ -3440,5 +3495,46 @@ mod tests {
 
         symlink(outside.path(), rootfs.join("link-out")).unwrap();
         assert!(ensure_mount_target_under_root(&rootfs, "/link-out/dir").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_default_workspace_symlink_is_replaced_for_mount() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let rootfs = root.path().join("rootfs");
+        std::fs::create_dir_all(&rootfs).unwrap();
+        symlink(DEFAULT_WORKSPACE_SYMLINK_TARGET, rootfs.join("workspace")).unwrap();
+
+        replace_default_workspace_symlink_for_mount(&rootfs, "/workspace").unwrap();
+
+        let meta = std::fs::symlink_metadata(rootfs.join("workspace")).unwrap();
+        assert!(meta.is_dir());
+        assert!(!meta.file_type().is_symlink());
+        assert_eq!(
+            ensure_mount_target_under_root(&rootfs, "/workspace").unwrap(),
+            rootfs.canonicalize().unwrap().join("workspace")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_non_default_workspace_symlink_is_not_replaced() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let rootfs = root.path().join("rootfs");
+        std::fs::create_dir_all(&rootfs).unwrap();
+        symlink(outside.path(), rootfs.join("workspace")).unwrap();
+
+        replace_default_workspace_symlink_for_mount(&rootfs, "/workspace").unwrap();
+
+        assert!(std::fs::symlink_metadata(rootfs.join("workspace"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(ensure_mount_target_under_root(&rootfs, "/workspace").is_err());
     }
 }

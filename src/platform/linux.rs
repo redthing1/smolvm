@@ -121,17 +121,6 @@ impl VmExecutor for LinuxExecutor {
     fn dylib_extension(&self) -> &'static str {
         "so"
     }
-
-    fn library_search_paths(&self) -> &'static [&'static str] {
-        &[
-            "/usr/lib",
-            "/usr/local/lib",
-            "/usr/lib64",
-            "/usr/local/lib64",
-            "/usr/lib/x86_64-linux-gnu",
-            "/usr/lib/aarch64-linux-gnu",
-        ]
-    }
 }
 
 /// Linux Rosetta support (stub - always unavailable).

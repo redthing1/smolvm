@@ -16,13 +16,11 @@
 # Build artifacts
 *.so
 *.a
+/lib/
 
 # Distribution build output
 /dist/smolvm-*/
 /dist/*.tar.gz
-
-# Bundled libraries are in the /lib (large binaries - download or build locally)
-# These are bundled into release tarballs by build-dist.sh
 
 # Agent rootfs is generated in target/ by build-agent-rootfs.sh
 

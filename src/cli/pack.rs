@@ -15,7 +15,8 @@ use smolvm::data::resources::DEFAULT_MICROVM_CPU_COUNT;
 /// via virtio balloon, so the host only commits what the guest actually uses.
 pub(crate) const PACK_DEFAULT_MEMORY_MIB: u32 = 8192;
 use smolvm::config::{RecordState, SmolvmConfig};
-use smolvm::platform::{Arch, Os, Platform, VmExecutor};
+use smolvm::platform::{Arch, Os, Platform};
+use smolvm::util::{libkrun_filename, libkrunfw_filename};
 use smolvm::Error;
 use smolvm_pack::assets::AssetCollector;
 use smolvm_pack::format::{PackManifest, PackMode};
@@ -877,8 +878,11 @@ impl PackCreateCmd {
             return Ok(dir);
         }
 
-        // Fallback: check common locations
-        let platform_lib = format!("lib/linux-{}", std::env::consts::ARCH);
+        let source_tree_lib = if cfg!(target_os = "linux") {
+            PathBuf::from(format!("lib/linux-{}", std::env::consts::ARCH))
+        } else {
+            PathBuf::from("lib")
+        };
         let candidates = [
             // Relative to executable
             std::env::current_exe()
@@ -892,24 +896,16 @@ impl PackCreateCmd {
                 p.parent()
                     .and_then(|d| d.parent())
                     .and_then(|d| d.parent())
-                    .map(|d| d.join(&platform_lib))
+                    .map(|d| d.join(&source_tree_lib))
             }),
             // Source tree (CWD)
-            Some(PathBuf::from("lib")),
-            Some(PathBuf::from("./lib")),
-            Some(PathBuf::from(&platform_lib)),
-            // Homebrew
-            Some(PathBuf::from("/opt/homebrew/lib")),
-            Some(PathBuf::from("/usr/local/lib")),
+            Some(source_tree_lib.clone()),
         ];
 
-        let lib_name = format!(
-            "libkrun.{}",
-            smolvm::platform::vm_executor().dylib_extension()
-        );
-
         for candidate in candidates.into_iter().flatten() {
-            if candidate.join(&lib_name).exists() {
+            if candidate.join(libkrun_filename()).exists()
+                && candidate.join(libkrunfw_filename()).exists()
+            {
                 debug!(lib_dir = %candidate.display(), "found library directory");
                 return Ok(candidate);
             }

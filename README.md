@@ -112,7 +112,7 @@ More examples: [python](examples/python-app) · [node](examples/node-app) · [do
 How It Works
 ------------
 
-Each workload gets real hardware isolation — its own kernel on [Hypervisor.framework](https://developer.apple.com/documentation/hypervisor) (macOS) or KVM (Linux). [libkrun](https://github.com/containers/libkrun) VMM with custom kernel: [libkrunfw](https://github.com/smol-machines/libkrunfw). Pack it into a `.smolmachine` and it runs anywhere the host architecture matches, with zero dependencies.
+Each workload gets real hardware isolation — its own kernel on [Hypervisor.framework](https://developer.apple.com/documentation/hypervisor) (macOS) or KVM (Linux). [libkrun](https://github.com/containers/libkrun) VMM with custom kernel: [libkrunfw](https://github.com/smol-machines/libkrunfw). Pack it into a `.smolmachine` and it runs anywhere the host architecture matches, with runtime libraries built from this source tree.
 
 Images use the [OCI](https://opencontainers.org/) format — the same open standard Docker uses. Any image on Docker Hub, ghcr.io, or other OCI registries can be pulled and booted as a microVM. No Docker daemon required.
 
@@ -161,7 +161,7 @@ ANGLE (Intel, Vulkan 1.4 (Virtio-GPU Venus (Intel(R) UHD Graphics ...)), venus)
 
 ### Host requirements
 
-**macOS** — virglrenderer and MoltenVK are included in the local install. No extra installs needed.
+**macOS** — build the runtime libraries from source and provide the host GPU stack (`virglrenderer`, MoltenVK, and libepoxy) through your local source/package workflow. The repository does not track prebuilt GPU dylibs.
 
 **Linux** — virglrenderer and a host Vulkan driver must be installed from the system package manager:
 
@@ -199,7 +199,7 @@ Development
 ### Build from source
 
 Source builds need Rust, the matching Linux musl Rust target for the guest
-agent, `git-lfs`, `mkfs.ext4`, basic Unix build tools, and KVM/HVF access to run
+agent, `mkfs.ext4`, basic Unix build tools, and KVM/HVF access to run
 VMs.
 
 ```bash

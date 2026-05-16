@@ -2656,6 +2656,7 @@ fn handle_interactive_run(
 /// duplicating the identity-resolve → spec-build → mount-wiring → write sequence.
 /// The only caller-controlled variation is `tty` (detached: always `false`).
 #[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
 fn write_oci_bundle(
     rootfs_path: &std::path::Path,
     bundle_path: &std::path::Path,
@@ -3080,6 +3081,7 @@ pub fn resolve_main_container(_persistent_overlay_id: Option<&str>) -> Option<St
 /// controlling terminal setup (setsid + TIOCSCTTY) inside the container.
 /// In foreground `crun run` mode, this doesn't require `--console-socket`.
 #[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
 fn spawn_interactive_command(
     rootfs: &str,
     command: &[String],

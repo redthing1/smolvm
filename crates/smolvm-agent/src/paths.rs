@@ -51,15 +51,18 @@ pub const CONTAINERS_EXIT_DIR: &str = "/storage/containers/exit";
 // =============================================================================
 
 /// Root directory for all persistent storage.
+#[allow(dead_code)]
 pub const STORAGE_ROOT: &str = "/storage";
 
 /// Directory for overlay filesystems.
 pub const OVERLAYS_DIR: &str = "/storage/overlays";
 
 /// Path to the persistent container registry file.
+#[allow(dead_code)]
 pub const REGISTRY_PATH: &str = "/storage/containers/registry.json";
 
 /// Path to the registry lock file.
+#[allow(dead_code)]
 pub const REGISTRY_LOCK_PATH: &str = "/storage/containers/registry.lock";
 
 // =============================================================================
@@ -67,6 +70,7 @@ pub const REGISTRY_LOCK_PATH: &str = "/storage/containers/registry.lock";
 // =============================================================================
 
 /// Timeout for acquiring registry lock.
+#[allow(dead_code)]
 pub const REGISTRY_LOCK_TIMEOUT_MS: u64 = 5000;
 
 // =============================================================================
@@ -74,16 +78,19 @@ pub const REGISTRY_LOCK_TIMEOUT_MS: u64 = 5000;
 // =============================================================================
 
 /// Get the runtime directory for a specific container.
+#[allow(dead_code)]
 pub fn container_run_dir(container_id: &str) -> PathBuf {
     PathBuf::from(CONTAINERS_RUN_DIR).join(container_id)
 }
 
 /// Get the log file path for a container.
+#[allow(dead_code)]
 pub fn container_log_path(container_id: &str) -> PathBuf {
     PathBuf::from(CONTAINERS_LOGS_DIR).join(format!("{}.log", container_id))
 }
 
 /// Get the exit code file path for a container.
+#[allow(dead_code)]
 pub fn container_exit_path(container_id: &str) -> PathBuf {
     PathBuf::from(CONTAINERS_EXIT_DIR).join(container_id)
 }
@@ -94,6 +101,7 @@ pub fn overlay_dir(workload_id: &str) -> PathBuf {
 }
 
 /// Get the bundle directory for a workload.
+#[allow(dead_code)]
 pub fn bundle_dir(workload_id: &str) -> PathBuf {
     overlay_dir(workload_id).join("bundle")
 }
