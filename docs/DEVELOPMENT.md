@@ -123,6 +123,15 @@ Other scripts:
 ./scripts/install.sh
 ```
 
+## Rebuilding Libraries
+
+The pre-built library binaries in `lib/` cover most development workflows. If you
+need to rebuild them (after submodule updates, kernel config changes, or enabling
+new features), see:
+
+- [Building libkrun](building-libkrun.md) — rebuild `lib/libkrun.dylib` (GPU support, blk, net)
+- [Building libkrunfw](building-libkrunfw-macos.md) — rebuild `lib/libkrunfw.5.dylib` (kernel blob)
+
 ## Troubleshooting
 
 **Database lock errors** ("Database already open"):

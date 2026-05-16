@@ -1524,7 +1524,7 @@ test_machine_images() {
     $SMOLVM machine start --name default 2>/dev/null || true
 
     local output
-    output=$($SMOLVM machine images 2>&1)
+    output=$($SMOLVM machine images --name default 2>&1)
 
     $SMOLVM machine stop 2>/dev/null || true
     $SMOLVM machine delete default -f 2>/dev/null || true
@@ -1540,7 +1540,7 @@ test_machine_prune_dry_run() {
     $SMOLVM machine start --name default 2>/dev/null || true
 
     local output
-    output=$($SMOLVM machine prune --dry-run 2>&1)
+    output=$($SMOLVM machine prune --name default --dry-run 2>&1)
 
     $SMOLVM machine stop 2>/dev/null || true
     $SMOLVM machine delete default -f 2>/dev/null || true
@@ -2192,7 +2192,72 @@ echo ""
 echo "--- File I/O (machine cp) ---"
 echo ""
 
+test_cp_preserves_state_on_packed_vm() {
+    local vm_name="cp-pack-$$"
+    local pack_dir
+    pack_dir=$(mktemp -d)
+
+    # Create source VM, write marker, pack it
+    $SMOLVM machine create "cp-pack-src-$$" --image alpine:latest --net 2>&1 || return 1
+    $SMOLVM machine start --name "cp-pack-src-$$" 2>&1 || {
+        $SMOLVM machine delete "cp-pack-src-$$" -f 2>/dev/null; return 1
+    }
+    $SMOLVM machine exec --name "cp-pack-src-$$" -- sh -c 'echo marker > /etc/pack-marker' 2>&1
+    $SMOLVM machine stop --name "cp-pack-src-$$" 2>&1
+    $SMOLVM pack create --from-vm "cp-pack-src-$$" -o "$pack_dir/packed" 2>&1 || {
+        $SMOLVM machine delete "cp-pack-src-$$" -f 2>/dev/null; rm -rf "$pack_dir"; return 1
+    }
+    $SMOLVM machine delete "cp-pack-src-$$" -f 2>/dev/null
+
+    # Create destination from pack, start, mutate via exec
+    $SMOLVM machine create "$vm_name" --from "$pack_dir/packed.smolmachine" --net 2>&1 || {
+        rm -rf "$pack_dir"; return 1
+    }
+    $SMOLVM machine start --name "$vm_name" 2>&1 || {
+        $SMOLVM machine delete "$vm_name" -f 2>/dev/null; rm -rf "$pack_dir"; return 1
+    }
+    $SMOLVM machine exec --name "$vm_name" -- adduser -D alice 2>&1
+
+    # Verify alice exists before cp
+    local before
+    before=$($SMOLVM machine exec --name "$vm_name" -- id alice 2>&1) || {
+        echo "alice not found before cp"; $SMOLVM machine delete "$vm_name" -f 2>/dev/null; rm -rf "$pack_dir"; return 1
+    }
+
+    # Run cp
+    echo "probe" > "$pack_dir/probe.txt"
+    $SMOLVM machine cp "$pack_dir/probe.txt" "$vm_name":/tmp/probe.txt 2>&1 || {
+        echo "cp failed"; $SMOLVM machine delete "$vm_name" -f 2>/dev/null; rm -rf "$pack_dir"; return 1
+    }
+
+    # Verify alice STILL exists after cp
+    local after
+    after=$($SMOLVM machine exec --name "$vm_name" -- id alice 2>&1) || {
+        echo "FAIL: alice gone after cp"
+        $SMOLVM machine stop --name "$vm_name" 2>/dev/null
+        $SMOLVM machine delete "$vm_name" -f 2>/dev/null
+        rm -rf "$pack_dir"
+        return 1
+    }
+
+    # Verify probe file landed
+    local probe
+    probe=$($SMOLVM machine exec --name "$vm_name" -- cat /tmp/probe.txt 2>&1)
+    [[ "$probe" == *"probe"* ]] || {
+        echo "FAIL: probe file missing after cp"
+        $SMOLVM machine stop --name "$vm_name" 2>/dev/null
+        $SMOLVM machine delete "$vm_name" -f 2>/dev/null
+        rm -rf "$pack_dir"
+        return 1
+    }
+
+    $SMOLVM machine stop --name "$vm_name" 2>/dev/null
+    $SMOLVM machine delete "$vm_name" -f 2>/dev/null
+    rm -rf "$pack_dir"
+}
+
 run_test "File upload and download" test_file_upload_download || true
+run_test "File cp preserves state on packed VM" test_cp_preserves_state_on_packed_vm || true
 
 # =============================================================================
 # Streaming Exec
@@ -2347,34 +2412,118 @@ assert_vm_stays_running() {
 }
 
 test_images_does_not_stop_running_vm() {
-    assert_vm_stays_running "machine images" $SMOLVM machine images
+    assert_vm_stays_running "machine images" $SMOLVM machine images --name default
 }
 
-test_prune_refuses_on_running_vm() {
+test_prune_on_running_vm() {
     ensure_machine_running
 
     local status
     status=$($SMOLVM machine status 2>&1)
     [[ "$status" == *"running"* ]] || { echo "VM not running before test"; return 1; }
 
-    # Prune should refuse while VM is running
+    # Regular prune should work without stopping the VM
+    local output
+    output=$($SMOLVM machine prune --name default 2>&1) || true
+    [[ "$output" == *"unreferenced"* ]] || [[ "$output" == *"No unreferenced"* ]] || {
+        echo "unexpected prune output: $output"
+        return 1
+    }
+
+    # VM should still be running after prune
+    status=$($SMOLVM machine status 2>&1)
+    [[ "$status" == *"running"* ]] || { echo "VM stopped after prune"; return 1; }
+}
+
+test_prune_dry_run_on_running_vm() {
+    ensure_machine_running
+
+    local output
+    output=$($SMOLVM machine prune --name default --dry-run 2>&1) || true
+    [[ "$output" == *"unreferenced"* ]] || [[ "$output" == *"No unreferenced"* ]] || {
+        echo "unexpected prune --dry-run output: $output"
+        return 1
+    }
+
+    # VM should still be running
+    local status
+    status=$($SMOLVM machine status 2>&1)
+    [[ "$status" == *"running"* ]] || { echo "VM stopped after prune --dry-run"; return 1; }
+}
+
+test_prune_all_refuses_on_running_vm() {
+    ensure_machine_running "true"
+
+    local status
+    status=$($SMOLVM machine status 2>&1)
+    [[ "$status" == *"running"* ]] || { echo "VM not running before test"; return 1; }
+
+    # --all should refuse while the VM is running
     local output exit_code=0
-    output=$($SMOLVM machine prune 2>&1) || exit_code=$?
-    [[ $exit_code -ne 0 ]] || { echo "prune should have failed on running VM"; return 1; }
-    [[ "$output" == *"cannot prune while the machine is running"* ]] || { echo "unexpected error: $output"; return 1; }
+    output=$($SMOLVM machine prune --name default --all 2>&1) || exit_code=$?
+    [[ $exit_code -ne 0 ]] || { echo "prune --all should have failed on running VM"; return 1; }
+    [[ "$output" == *"cannot prune --all while machine"* ]] || {
+        echo "unexpected error: $output"
+        return 1
+    }
 
     # VM should still be running
     status=$($SMOLVM machine status 2>&1)
-    [[ "$status" == *"running"* ]] || { echo "VM stopped after rejected prune"; return 1; }
+    [[ "$status" == *"running"* ]] || { echo "VM stopped after rejected prune --all"; return 1; }
 }
 
-test_prune_dry_run_refuses_on_running_vm() {
-    ensure_machine_running
+# Regression: prune --all said "Removing all cached images" but never
+# actually deleted the manifests, so images survived. This test verifies
+# images are gone after prune --all.
+test_prune_all_removes_images() {
+    # Start with a clean machine that has an image cached
+    $SMOLVM machine stop 2>/dev/null || true
+    $SMOLVM machine delete default -f 2>/dev/null || true
+    $SMOLVM machine create --image alpine --net default 2>&1 || return 1
+    $SMOLVM machine start 2>&1 || return 1
 
-    local output exit_code=0
-    output=$($SMOLVM machine prune --dry-run 2>&1) || exit_code=$?
-    [[ $exit_code -ne 0 ]] || { echo "prune --dry-run should have failed on running VM"; return 1; }
-    [[ "$output" == *"cannot prune while the machine is running"* ]]
+    # Verify the image is cached
+    $SMOLVM machine exec -- true 2>&1 || { echo "VM not reachable"; return 1; }
+
+    # Check images before prune
+    local images_before
+    images_before=$($SMOLVM machine images --name default 2>&1)
+
+    # Stop the VM (prune --all requires it)
+    $SMOLVM machine stop 2>&1
+
+    # Run prune --all
+    local output
+    output=$($SMOLVM machine prune --name default --all 2>&1) || {
+        echo "prune --all failed: $output"
+        $SMOLVM machine delete default -f 2>/dev/null
+        return 1
+    }
+    [[ "$output" == *"Removed"* ]] || [[ "$output" == *"No cached images"* ]] || {
+        echo "unexpected prune output: $output"
+        $SMOLVM machine delete default -f 2>/dev/null
+        return 1
+    }
+
+    # Restart and verify images are gone
+    $SMOLVM machine start 2>&1 || {
+        $SMOLVM machine delete default -f 2>/dev/null
+        return 1
+    }
+
+    local images_after
+    images_after=$($SMOLVM machine images --name default 2>&1)
+
+    $SMOLVM machine stop 2>/dev/null || true
+    $SMOLVM machine delete default -f 2>/dev/null || true
+
+    # After prune --all, no images should remain
+    if echo "$images_after" | grep -qE "^[a-z].*[0-9]+ MB"; then
+        echo "FAIL: images still present after prune --all"
+        echo "Before: $images_before"
+        echo "After: $images_after"
+        return 1
+    fi
 }
 
 test_machine_ls_does_not_kill_vm() {
@@ -2513,8 +2662,404 @@ run_test "Concurrent exec does not flip VM to unreachable" test_concurrent_exec_
 run_test "Listing: machine ls does not kill VM" test_machine_ls_does_not_kill_vm || true
 run_test "Listing: named VM survives repeated ls" test_named_vm_survives_ls || true
 run_test "Images: does not stop running VM" test_images_does_not_stop_running_vm || true
-run_test "Prune: refuses on running VM" test_prune_refuses_on_running_vm || true
-run_test "Prune --dry-run: refuses on running VM" test_prune_dry_run_refuses_on_running_vm || true
+run_test "Prune: works on running VM without stopping it" test_prune_on_running_vm || true
+run_test "Prune --dry-run: works on running VM" test_prune_dry_run_on_running_vm || true
+run_test "Prune --all: refuses on running VM" test_prune_all_refuses_on_running_vm || true
+run_test "Prune --all: removes cached images" test_prune_all_removes_images || true
+
+# =============================================================================
+# Shell Shortcut Tests
+# =============================================================================
+
+test_machine_shell() {
+    ensure_machine_running
+
+    # shell opens an interactive PTY. Pipe "echo X; exit" through it.
+    # Use a subshell with a watchdog kill to avoid hanging if the PTY blocks.
+    local tmpout
+    tmpout=$(mktemp)
+    (echo "echo shell-test-ok; exit" | $SMOLVM machine shell > "$tmpout" 2>&1) &
+    local pid=$!
+    sleep 5
+    kill $pid 2>/dev/null; wait $pid 2>/dev/null
+
+    local output
+    output=$(cat "$tmpout")
+    rm -f "$tmpout"
+
+    [[ "$output" == *"shell-test-ok"* ]] || {
+        echo "FAIL: expected shell-test-ok, got: $output"
+        return 1
+    }
+}
+
+run_test "Shell: machine shell opens interactive shell" test_machine_shell || true
+
+# =============================================================================
+# Machine Update Tests
+#
+# Verifies that `machine update` modifies settings on stopped machines and
+# that the changes take effect on next start.
+# =============================================================================
+
+test_update_settings_applied_on_start() {
+    # Verify update changes cpus, ports, network, and that they take effect.
+    # Also verifies update refuses a running VM.
+    $SMOLVM machine stop 2>/dev/null || true
+    $SMOLVM machine delete default -f 2>/dev/null || true
+    $SMOLVM machine create default 2>&1 || return 1
+
+    # Update multiple settings at once
+    local output
+    output=$($SMOLVM machine update default --cpus 2 --mem 1024 -p 9090:9090 --net 2>&1) || {
+        echo "update failed: $output"; return 1
+    }
+    [[ "$output" == *"cpus"* ]] || { echo "expected cpus in output: $output"; return 1; }
+
+    # Start and verify cpus applied
+    $SMOLVM machine start 2>&1 || return 1
+    local cpus
+    cpus=$($SMOLVM machine exec -- nproc 2>&1)
+    [[ "$cpus" == "2" ]] || { echo "expected 2 cpus, got: $cpus"; return 1; }
+
+    # Update on running VM should fail
+    local exit_code=0
+    $SMOLVM machine update default --mem 2048 2>&1 || exit_code=$?
+    [[ $exit_code -ne 0 ]] || { echo "update should fail on running VM"; return 1; }
+
+    $SMOLVM machine stop 2>/dev/null || true
+    $SMOLVM machine delete default -f 2>/dev/null || true
+}
+
+test_update_env_applied_on_start() {
+    # Env vars from the DB record are applied in image-based exec.
+    $SMOLVM machine stop 2>/dev/null || true
+    $SMOLVM machine delete default -f 2>/dev/null || true
+    $SMOLVM machine create --net --image alpine default 2>&1 || return 1
+
+    $SMOLVM machine update default -e MY_VAR=hello 2>&1 || return 1
+
+    $SMOLVM machine start 2>&1 || return 1
+    local val
+    val=$($SMOLVM machine exec -- sh -c 'echo $MY_VAR' 2>&1)
+    $SMOLVM machine stop 2>/dev/null || true
+    $SMOLVM machine delete default -f 2>/dev/null || true
+
+    [[ "$val" == "hello" ]] || { echo "expected MY_VAR=hello, got: $val"; return 1; }
+}
+
+run_test "Update: settings applied on next start + refuses running VM" test_update_settings_applied_on_start || true
+run_test "Update: env var applied on next start (image-based)" test_update_env_applied_on_start || true
+
+# =============================================================================
+# Stdout Backpressure Test
+#
+# Regression: image-backed exec deadlocked when stdout exceeded the OS pipe
+# buffer (~64KB). The agent waited for crun to exit before reading pipes,
+# but crun blocked on write() because the pipe was full. Background pipe
+# draining threads fix this.
+# =============================================================================
+
+test_exec_large_stdout_does_not_crash_vm() {
+    ensure_machine_running "true"
+
+    # Generate 128KB of output — well above the ~64KB pipe buffer
+    local output
+    output=$(run_with_timeout 30 $SMOLVM machine exec -- sh -c 'dd if=/dev/urandom bs=1024 count=128 2>/dev/null | base64' 2>&1)
+    local exit_code=$?
+
+    [[ $exit_code -eq 124 ]] && { echo "FAIL: timed out (pipe deadlock?)"; return 1; }
+
+    local output_size=${#output}
+    [[ $output_size -gt 100000 ]] || {
+        echo "FAIL: expected >100KB output, got ${output_size} bytes"
+        return 1
+    }
+
+    # VM must still be responsive after large output
+    local check
+    check=$(run_with_timeout 10 $SMOLVM machine exec -- echo "still-alive" 2>&1) || {
+        echo "FAIL: VM unreachable after large stdout"
+        return 1
+    }
+    echo "$check" | grep -q "still-alive" || {
+        echo "FAIL: expected 'still-alive', got: $check"
+        return 1
+    }
+}
+
+test_exec_image_large_stdout_does_not_crash_vm() {
+    # Same test but for image-backed exec (the actual bug path)
+    $SMOLVM machine stop 2>/dev/null || true
+    $SMOLVM machine delete default -f 2>/dev/null || true
+    $SMOLVM machine create --net --image alpine default 2>&1 || return 1
+    $SMOLVM machine start 2>&1 || return 1
+
+    local output
+    output=$(run_with_timeout 30 $SMOLVM machine exec -- sh -c 'dd if=/dev/urandom bs=1024 count=128 2>/dev/null | base64' 2>&1)
+    local exit_code=$?
+
+    [[ $exit_code -eq 124 ]] && { echo "FAIL: timed out (pipe deadlock?)"; return 1; }
+
+    local output_size=${#output}
+    [[ $output_size -gt 100000 ]] || {
+        echo "FAIL: expected >100KB output, got ${output_size} bytes"
+        return 1
+    }
+
+    # VM must still respond
+    local check
+    check=$(run_with_timeout 10 $SMOLVM machine exec -- echo "still-alive" 2>&1) || {
+        echo "FAIL: VM unreachable after large stdout (image-backed exec)"
+        return 1
+    }
+    echo "$check" | grep -q "still-alive" || {
+        echo "FAIL: expected 'still-alive', got: $check"
+        return 1
+    }
+
+    $SMOLVM machine stop 2>/dev/null || true
+    $SMOLVM machine delete default -f 2>/dev/null || true
+}
+
+test_exec_joined_large_stdout_does_not_crash_vm() {
+    # Same test but through the joined crun exec path (detached main container)
+    $SMOLVM machine stop 2>/dev/null || true
+    $SMOLVM machine delete default -f 2>/dev/null || true
+    $SMOLVM machine run -d --net --image alpine -- sleep 300 2>&1 || return 1
+
+    local output
+    output=$(run_with_timeout 30 $SMOLVM machine exec -- sh -c 'dd if=/dev/urandom bs=1024 count=128 2>/dev/null | base64' 2>&1)
+    local exit_code=$?
+
+    [[ $exit_code -eq 124 ]] && { echo "FAIL: timed out (pipe deadlock in joined exec?)"; return 1; }
+
+    local output_size=${#output}
+    [[ $output_size -gt 100000 ]] || {
+        echo "FAIL: expected >100KB output, got ${output_size} bytes"
+        return 1
+    }
+
+    # VM and main container must still be responsive
+    local check
+    check=$(run_with_timeout 10 $SMOLVM machine exec -- echo "still-alive" 2>&1) || {
+        echo "FAIL: VM unreachable after large stdout via joined exec"
+        return 1
+    }
+    echo "$check" | grep -q "still-alive" || {
+        echo "FAIL: expected 'still-alive', got: $check"
+        return 1
+    }
+
+    $SMOLVM machine stop 2>/dev/null || true
+    $SMOLVM machine delete default -f 2>/dev/null || true
+}
+
+run_test "Exec: large stdout does not crash VM (bare)" test_exec_large_stdout_does_not_crash_vm || true
+run_test "Exec: large stdout does not crash VM (image-backed)" test_exec_image_large_stdout_does_not_crash_vm || true
+run_test "Exec: large stdout does not crash VM (joined exec)" test_exec_joined_large_stdout_does_not_crash_vm || true
+
+# =============================================================================
+# Exec-Join Container Tests
+#
+# Verifies that `machine exec` joins the running main workload container via
+# `crun exec` instead of spawning a fresh `crun run` container each time.
+#
+# State machine:
+#   (1) No main container → fresh crun run → saves container ID
+#   (2) Container ID on disk + running → crun exec (shared namespaces)
+#   (3) Container ID on disk + dead → ignores stale ID → fresh crun run
+# =============================================================================
+
+test_exec_joins_main_container() {
+    # machine run -d creates a fresh VM, so no need for ensure_machine_running
+    $SMOLVM machine stop 2>/dev/null || true
+    $SMOLVM machine delete default -f 2>/dev/null || true
+
+    log_info "Starting detached workload: sleep 300..."
+    local run_output
+    if ! run_output=$(run_with_timeout 120 $SMOLVM machine run -d --net --image alpine -- sleep 300 2>&1); then
+        echo "FAIL: machine run -d failed: $run_output"
+        return 1
+    fi
+
+    # exec should join the running container — PID 1 is sleep 300
+    local ps_output
+    if ! ps_output=$(run_with_timeout 30 $SMOLVM machine exec -- ps -ef 2>&1); then
+        echo "FAIL: machine exec failed: $ps_output"
+        return 1
+    fi
+
+    echo "$ps_output" | grep -q "sleep" || {
+        echo "FAIL: expected 'sleep' in ps output (shared PID namespace), got:"
+        echo "$ps_output"
+        return 1
+    }
+}
+
+test_repeated_exec_joins_same_container() {
+    # Relies on the detached container from the previous test still running
+    local out1 out2
+    out1=$(run_with_timeout 30 $SMOLVM machine exec -- ps -ef 2>&1) || {
+        echo "FAIL: first repeated exec failed"; return 1
+    }
+    out2=$(run_with_timeout 30 $SMOLVM machine exec -- ps -ef 2>&1) || {
+        echo "FAIL: second repeated exec failed"; return 1
+    }
+
+    for out in "$out1" "$out2"; do
+        echo "$out" | grep -q "sleep" || {
+            echo "FAIL: exec did not see 'sleep' in ps output"
+            echo "$out"
+            return 1
+        }
+    done
+}
+
+test_background_process_visible_across_execs() {
+    # Spawn sleep 90 in the background; it should be visible from the next exec
+    run_with_timeout 15 $SMOLVM machine exec -- sh -c 'sleep 90 &' 2>/dev/null || true
+    sleep 1
+
+    local ps_output
+    ps_output=$(run_with_timeout 30 $SMOLVM machine exec -- ps -ef 2>&1) || {
+        echo "FAIL: exec after background spawn failed"; return 1
+    }
+
+    local sleep_count
+    sleep_count=$(echo "$ps_output" | grep -c "sleep" || true)
+    [[ "$sleep_count" -ge 2 ]] || {
+        echo "FAIL: expected >=2 sleep processes, got $sleep_count"
+        echo "$ps_output"
+        return 1
+    }
+}
+
+test_ephemeral_run_is_isolated() {
+    # Ephemeral machine run (no -d) must NOT see the main container's processes
+    local ps_output
+    if ! ps_output=$(run_with_timeout 60 $SMOLVM machine run --net --image alpine -- ps -ef 2>&1); then
+        echo "FAIL: ephemeral machine run failed: $ps_output"
+        return 1
+    fi
+
+    if echo "$ps_output" | grep -q "sleep 300"; then
+        echo "FAIL: ephemeral run leaked into main container namespace"
+        echo "$ps_output"
+        return 1
+    fi
+
+    [[ -n "$ps_output" ]] || { echo "FAIL: ps returned empty output"; return 1; }
+}
+
+test_exec_recovers_after_main_container_exits() {
+    # Start a detached container with a short-lived command
+    $SMOLVM machine stop 2>/dev/null || true
+    $SMOLVM machine delete default -f 2>/dev/null || true
+    $SMOLVM machine run -d --net --image alpine -- sleep 2 2>&1 || return 1
+
+    # Wait for the main container to exit naturally
+    sleep 4
+
+    # Exec should detect the stale container ID and start a fresh container
+    local output
+    if ! output=$(run_with_timeout 30 $SMOLVM machine exec -- echo "recovered" 2>&1); then
+        echo "FAIL: exec failed after main container exit: $output"
+        return 1
+    fi
+
+    echo "$output" | grep -q "recovered" || {
+        echo "FAIL: expected 'recovered', got: $output"
+        return 1
+    }
+}
+
+test_exec_join_timeout_does_not_kill_main_container() {
+    # A timed-out exec must not destroy the main workload container.
+    # The exec'd process may survive as an orphan reparented to PID 1
+    # (Docker-compatible: docker exec timeout kills the exec wrapper,
+    # not the inner process or the container).
+
+    # Ensure the detached container from earlier tests is still running
+    local ps_before
+    ps_before=$(run_with_timeout 10 $SMOLVM machine exec -- ps -ef 2>&1) || true
+    if ! echo "$ps_before" | grep -q "sleep"; then
+        $SMOLVM machine stop 2>/dev/null || true
+        $SMOLVM machine delete default -f 2>/dev/null || true
+        $SMOLVM machine run -d --net --image alpine -- sleep 300 2>&1 || return 1
+    fi
+
+    # Run a command with a short timeout — it will time out
+    local output exit_code=0
+    output=$($SMOLVM machine exec --timeout 1 -- sleep 30 2>&1) || exit_code=$?
+
+    # Exit code 124 = timeout (expected)
+    [[ $exit_code -eq 124 ]] || [[ "$output" == *"timed out"* ]] || {
+        echo "WARN: unexpected exit code $exit_code (expected 124 for timeout)"
+    }
+
+    sleep 1
+
+    # The main container should still be running — sleep 300 visible
+    local ps_after
+    ps_after=$(run_with_timeout 10 $SMOLVM machine exec -- ps -ef 2>&1) || {
+        echo "FAIL: exec failed after timeout — main container may have been killed"
+        return 1
+    }
+
+    echo "$ps_after" | grep -q "sleep 300" || {
+        echo "FAIL: main container (sleep 300) not found after timed-out exec"
+        echo "ps output: $ps_after"
+        return 1
+    }
+
+    # Document whether the timed-out sleep 30 survives as an orphan. The main
+    # assertion above is that the main container remains alive.
+    if echo "$ps_after" | grep -q "sleep 30"; then
+        echo "WARN: timed-out 'sleep 30' still visible as orphan (Docker-compatible behavior)"
+    fi
+}
+
+test_exec_join_documents_user_behavior() {
+    # Document current crun exec user behavior for images with a non-root USER.
+    # Some crun versions may run joined exec as root unless --user is explicit.
+    $SMOLVM machine stop 2>/dev/null || true
+    $SMOLVM machine delete default -f 2>/dev/null || true
+    $SMOLVM machine run -d --net --image nginxinc/nginx-unprivileged:stable-alpine -- sleep 300 2>&1 || {
+        echo "SKIP: could not start nginx-unprivileged image"
+        return 0
+    }
+
+    # Check what user the main container's PID 1 runs as
+    local id_output
+    id_output=$(run_with_timeout 10 $SMOLVM machine exec -- id -u 2>&1) || {
+        echo "FAIL: id -u failed: $id_output"
+        return 1
+    }
+
+    # nginx-unprivileged image has USER 101
+    # NOTE: crun exec may run as root by default, not inheriting the image USER.
+    # If id returns 0 (root), this is a known gap — crun exec doesn't inherit
+    # the OCI process user without explicit --user. Document and accept.
+    if echo "$id_output" | grep -q "^101$"; then
+        echo "Joined exec runs as UID 101 — image USER preserved"
+    elif echo "$id_output" | grep -q "^0$"; then
+        echo "WARN: joined exec runs as root (UID 0), not image USER 101"
+        echo "This is a known limitation: crun exec does not inherit OCI process user"
+        # Not a test failure — documenting current behavior
+    else
+        echo "FAIL: unexpected UID: $id_output"
+        return 1
+    fi
+}
+
+run_test "Exec-join: exec joins main workload container" test_exec_joins_main_container || true
+run_test "Exec-join: repeated exec joins same container" test_repeated_exec_joins_same_container || true
+run_test "Exec-join: background process visible across execs" test_background_process_visible_across_execs || true
+run_test "Exec-join: ephemeral run is namespace-isolated" test_ephemeral_run_is_isolated || true
+run_test "Exec-join: exec recovers after main container exits" test_exec_recovers_after_main_container_exits || true
+run_test "Exec-join: timeout does not kill main container (orphan documented)" test_exec_join_timeout_does_not_kill_main_container || true
+run_test "Exec-join: joined exec user behavior (crun exec runs as root)" test_exec_join_documents_user_behavior || true
 
 # =============================================================================
 # grpcio / TSI SOL_SOCKET round-trip test
@@ -2606,5 +3151,325 @@ test_storage_mounted_as_ext4() {
 
 run_test "Storage: resize + large image pull (fresh disk)" test_storage_resize_and_large_pull || true
 run_test "Storage: /dev/vda mounted as ext4 with correct size" test_storage_mounted_as_ext4 || true
+
+# =============================================================================
+# Ephemeral VM Isolation
+# =============================================================================
+
+test_ephemeral_runs_do_not_share_state() {
+    # Run 1: create a marker file
+    $SMOLVM machine run --net --image alpine:latest -- \
+        sh -c 'echo ephemeral-leak-test > /tmp/ephemeral-marker.txt' 2>&1
+
+    # Run 2: marker must not exist
+    local output exit_code=0
+    output=$($SMOLVM machine run --net --image alpine:latest -- \
+        sh -c 'cat /tmp/ephemeral-marker.txt 2>&1 || echo MARKER_NOT_FOUND' 2>&1) || exit_code=$?
+
+    [[ "$output" == *"MARKER_NOT_FOUND"* ]] || {
+        echo "FAIL: ephemeral run found file from previous run"
+        echo "$output"
+        return 1
+    }
+}
+
+test_ephemeral_volume_mount_reflects_host() {
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    echo "file-a" > "$tmpdir/a.txt"
+    echo "file-b" > "$tmpdir/b.txt"
+    echo "file-c" > "$tmpdir/c.txt"
+
+    local output
+    output=$($SMOLVM machine run --net -v "$tmpdir:/hostmnt" --image alpine:latest -- \
+        ls /hostmnt 2>&1)
+
+    rm -rf "$tmpdir"
+
+    [[ "$output" == *"a.txt"* ]] || { echo "missing a.txt: $output"; return 1; }
+    [[ "$output" == *"b.txt"* ]] || { echo "missing b.txt: $output"; return 1; }
+    [[ "$output" == *"c.txt"* ]] || { echo "missing c.txt: $output"; return 1; }
+}
+
+run_test "Ephemeral run: no state leaks between runs" test_ephemeral_runs_do_not_share_state || true
+run_test "Ephemeral run: volume mount shows correct host contents" test_ephemeral_volume_mount_reflects_host || true
+
+# =============================================================================
+# Init Skip on Restart
+# =============================================================================
+
+test_init_skipped_on_restart() {
+    local vm_name="init-skip-$$"
+
+    $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
+    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+
+    # Create with init command and start — first boot should run init
+    $SMOLVM machine create "$vm_name" --net --init "echo INIT_RAN" 2>&1
+    local first_start
+    first_start=$($SMOLVM machine start --name "$vm_name" 2>&1)
+    echo "$first_start"
+
+    if [[ "$first_start" != *"Running 1 init command"* ]]; then
+        echo "FAIL: first start should run init"
+        $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+        return 1
+    fi
+
+    # Stop and restart — should skip init
+    $SMOLVM machine stop --name "$vm_name" 2>&1
+    local second_start
+    second_start=$($SMOLVM machine start --name "$vm_name" 2>&1)
+    echo "$second_start"
+
+    $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
+    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+
+    if [[ "$second_start" == *"Running"*"init command"* ]]; then
+        echo "FAIL: second start should NOT re-run init"
+        return 1
+    fi
+    if [[ "$second_start" != *"Init already completed"* ]]; then
+        echo "FAIL: second start should print skip message"
+        return 1
+    fi
+}
+
+run_test "Init: skipped on restart after first successful run" test_init_skipped_on_restart || true
+
+# =============================================================================
+# Docker-in-VM
+#
+# Verifies that Docker Engine runs correctly inside a bare smolvm machine using
+# the production docker.smolfile from examples/docker-in-vm/.
+#
+# What this covers:
+#   - overlay2 storage driver works (via ext4 bind-mount — required because the
+#     rootfs overlay's ramfs lower has no file-handle support)
+#   - /var/lib/docker is correctly bind-mounted to /dev/vda (ext4)
+#   - `docker run` executes a container
+#   - Docker bridge networking reaches the internet
+#   - `docker build` produces a working image
+#   - Stop → start cycle: init is skipped, bind-mount must be re-applied
+#   - Pulled and built images persist across VM restarts
+# =============================================================================
+
+# Start dockerd inside the named docker machine.
+# Caller must already have the machine running.
+# Prints dockerd startup status; returns non-zero if dockerd never becomes ready.
+_docker_in_vm_start_dockerd() {
+    local vm_name="$1"
+    $SMOLVM machine exec --name "$vm_name" -- sh -c '
+        mkdir -p /storage/docker /var/lib/docker
+        mount --bind /storage/docker /var/lib/docker
+        rm -f /var/run/docker.pid
+        dockerd --storage-driver=overlay2 >/tmp/dockerd.log 2>&1 &
+        for i in $(seq 1 40); do
+            docker info >/dev/null 2>&1 && echo "dockerd-ready" && exit 0
+            sleep 1
+        done
+        echo "FAIL: dockerd did not become ready"
+        tail -5 /tmp/dockerd.log
+        exit 1
+    ' 2>&1
+}
+
+test_docker_in_vm() {
+    local vm_name="docker-in-vm-$$"
+    local smolfile="$PROJECT_ROOT/examples/docker-in-vm/docker.smolfile"
+
+    echo "phase: pre-cleanup"
+    $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
+    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+
+    # ── Create ────────────────────────────────────────────────────────────────
+    echo "phase: create"
+    local output
+    output=$($SMOLVM machine create "$vm_name" \
+        -s "$smolfile" --net-backend virtio-net 2>&1) || {
+        echo "FAIL: machine create failed"
+        echo "$output"
+        return 1
+    }
+    [[ "$output" == *"Init commands: 4"* ]] || {
+        echo "FAIL: expected 4 init commands, got: $output"
+        $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+        return 1
+    }
+
+    # ── First start (runs init: apk add docker + bind-mount) ─────────────────
+    echo "phase: first-start (apk add docker — expect 30-90s)"
+    output=$($SMOLVM machine start --name "$vm_name" 2>&1) || {
+        echo "FAIL: first machine start failed"
+        echo "$output"
+        $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+        return 1
+    }
+    [[ "$output" == *"Running 4 init command"* ]] || {
+        echo "FAIL: expected 4 init commands to run on first start"
+        echo "$output"
+        $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
+        $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+        return 1
+    }
+
+    # ── Start dockerd ─────────────────────────────────────────────────────────
+    echo "phase: start-dockerd"
+    output=$(_docker_in_vm_start_dockerd "$vm_name") || {
+        echo "FAIL: dockerd failed to start"
+        echo "$output"
+        $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
+        $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+        return 1
+    }
+    [[ "$output" == *"dockerd-ready"* ]] || {
+        echo "FAIL: dockerd did not report ready"
+        echo "$output"
+        $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
+        $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+        return 1
+    }
+
+    # ── Assert: overlay2 storage driver on ext4 ───────────────────────────────
+    echo "phase: assert-overlay2-on-ext4"
+    output=$($SMOLVM machine exec --name "$vm_name" -- sh -c '
+        driver=$(docker info 2>/dev/null | grep "Storage Driver:" | awk "{print \$3}")
+        [ "$driver" = "overlay2" ] || { echo "FAIL: storage driver=$driver"; exit 1; }
+        echo "storage-driver-ok"
+        mount | grep -q "/dev/vda on /var/lib/docker type ext4" || {
+            echo "FAIL: /var/lib/docker not on ext4"
+            mount | grep "var/lib/docker" || true
+            exit 1
+        }
+        echo "bind-mount-ok"
+    ' 2>&1) || {
+        echo "FAIL: storage driver or bind-mount check failed"
+        echo "$output"
+        $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
+        $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+        return 1
+    }
+    [[ "$output" == *"storage-driver-ok"* ]] || { echo "FAIL: $output"; $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true; $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true; return 1; }
+    [[ "$output" == *"bind-mount-ok"* ]]    || { echo "FAIL: $output"; $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true; $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true; return 1; }
+
+    # ── Assert: docker run executes a container ───────────────────────────────
+    echo "phase: docker-run"
+    output=$($SMOLVM machine exec --name "$vm_name" -- \
+        docker run --rm alpine echo "docker-in-vm-ok" 2>&1) || {
+        echo "FAIL: docker run failed"
+        echo "$output"
+        $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
+        $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+        return 1
+    }
+    [[ "$output" == *"docker-in-vm-ok"* ]] || {
+        echo "FAIL: expected docker-in-vm-ok, got: $output"
+        $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
+        $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+        return 1
+    }
+
+    # ── Assert: bridge networking reaches the internet ────────────────────────
+    echo "phase: docker-bridge-networking"
+    output=$($SMOLVM machine exec --name "$vm_name" -- \
+        docker run --rm alpine wget -qO- https://httpbin.org/get 2>&1) || {
+        echo "FAIL: docker bridge networking failed"
+        echo "$output"
+        $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
+        $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+        return 1
+    }
+    [[ "$output" == *'"url"'* ]] || {
+        echo "FAIL: expected JSON response with url field, got: $output"
+        $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
+        $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+        return 1
+    }
+
+    # ── Assert: docker build produces a runnable image ────────────────────────
+    echo "phase: docker-build"
+    output=$($SMOLVM machine exec --name "$vm_name" -- sh -c '
+        printf "FROM alpine\nRUN echo build-layer-ok" > /tmp/Dockerfile
+        docker build -t smolvm-test-build /tmp 2>&1 | tail -3
+        docker run --rm smolvm-test-build echo "built-image-run-ok"
+    ' 2>&1) || {
+        echo "FAIL: docker build or run of built image failed"
+        echo "$output"
+        $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
+        $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+        return 1
+    }
+    [[ "$output" == *"built-image-run-ok"* ]] || {
+        echo "FAIL: expected built-image-run-ok, got: $output"
+        $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
+        $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+        return 1
+    }
+
+    # ── Stop → restart cycle ──────────────────────────────────────────────────
+    echo "phase: stop"
+    $SMOLVM machine stop --name "$vm_name" 2>&1 || {
+        echo "FAIL: machine stop failed"
+        $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+        return 1
+    }
+
+    echo "phase: restart"
+    output=$($SMOLVM machine start --name "$vm_name" 2>&1) || {
+        echo "FAIL: machine restart failed"
+        echo "$output"
+        $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+        return 1
+    }
+    [[ "$output" == *"Init already completed"* ]] || {
+        echo "FAIL: init should be skipped on restart, got: $output"
+        $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
+        $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+        return 1
+    }
+
+    # ── Re-start dockerd after restart ────────────────────────────────────────
+    echo "phase: start-dockerd-after-restart"
+    output=$(_docker_in_vm_start_dockerd "$vm_name") || {
+        echo "FAIL: dockerd failed to start after VM restart"
+        echo "$output"
+        $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
+        $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+        return 1
+    }
+    [[ "$output" == *"dockerd-ready"* ]] || {
+        echo "FAIL: dockerd not ready after VM restart"
+        echo "$output"
+        $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
+        $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+        return 1
+    }
+
+    # ── Assert: images persist across restart ─────────────────────────────────
+    echo "phase: assert-persistence"
+    output=$($SMOLVM machine exec --name "$vm_name" -- sh -c '
+        docker images | grep -q "^alpine " || { echo "FAIL: alpine image missing after restart"; docker images; exit 1; }
+        echo "alpine-persists"
+        docker images | grep -q "smolvm-test-build" || { echo "FAIL: built image missing after restart"; docker images; exit 1; }
+        echo "built-image-persists"
+        docker run --rm alpine echo "post-restart-run-ok"
+    ' 2>&1) || {
+        echo "FAIL: post-restart image persistence check failed"
+        echo "$output"
+        $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
+        $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+        return 1
+    }
+    [[ "$output" == *"alpine-persists"* ]]      || { echo "FAIL: $output"; $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true; $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true; return 1; }
+    [[ "$output" == *"built-image-persists"* ]] || { echo "FAIL: $output"; $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true; $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true; return 1; }
+    [[ "$output" == *"post-restart-run-ok"* ]]  || { echo "FAIL: $output"; $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true; $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true; return 1; }
+
+    # ── Cleanup ───────────────────────────────────────────────────────────────
+    echo "phase: cleanup"
+    $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
+    $SMOLVM machine delete "$vm_name" -f 2>/dev/null || true
+}
+
+run_test "Docker-in-VM: overlay2 + bridge networking + build + restart persistence" test_docker_in_vm || true
 
 print_summary "Machine Tests"

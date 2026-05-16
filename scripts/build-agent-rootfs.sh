@@ -172,6 +172,7 @@ APK_PACKAGES=(
     "crun"
     "util-linux"
     "libcap"
+    "seatd"
 )
 
 # Determine if this is a cross-arch build
@@ -220,9 +221,15 @@ install_packages_apk_static() {
         fi
     done < "$OUTPUT_DIR/etc/apk/world"
 
+    # --no-scripts: skip pre/post-install scripts and triggers.
+    # When cross-building (e.g. aarch64 rootfs on x86_64 host), those scripts
+    # are aarch64 ELF binaries that the host kernel can't exec, causing exit
+    # code 127. The minirootfs already ships busybox symlinks, and seatd runs
+    # as root in the VM so the 'seat' group creation is not required.
     "${apk_cmd[@]}" \
         --root "$OUTPUT_DIR" \
         --no-cache \
+        --allow-untrusted \
         --no-scripts \
         --arch "$ALPINE_ARCH" \
         add --upgrade --no-chown "${rootfs_world[@]}" "${APK_PACKAGES[@]}"
@@ -356,6 +363,9 @@ ln -sf /usr/local/bin/smolvm-agent "$OUTPUT_DIR/sbin/init"
 
 # Create resolv.conf
 echo "nameserver 1.1.1.1" > "$OUTPUT_DIR/etc/resolv.conf"
+
+# Remove seatd socket if baked in during build (build artifact, not runtime state)
+rm -f "$OUTPUT_DIR/run/seatd.sock"
 
 PROFILE="release-small"
 

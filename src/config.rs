@@ -297,17 +297,18 @@ impl SmolvmConfig {
     }
 
     /// Update a VM record in place (persists immediately to database).
-    pub fn update_vm<F>(&mut self, id: &str, f: F) -> Option<()>
+    ///
+    /// Returns `None` if the record doesn't exist, `Some(Err)` if the DB write
+    /// fails, `Some(Ok)` on success. Callers that need fail-closed semantics
+    /// should check both.
+    pub fn update_vm<F>(&mut self, id: &str, f: F) -> Option<crate::Result<()>>
     where
         F: FnOnce(&mut VmRecord),
     {
         if let Some(record) = self.vms.get_mut(id) {
             f(record);
             // Persist to database
-            if let Err(e) = self.db.insert_vm(id, record) {
-                tracing::warn!(error = %e, vm = %id, "failed to persist VM update");
-            }
-            Some(())
+            Some(self.db.insert_vm(id, record))
         } else {
             None
         }
@@ -381,9 +382,14 @@ pub struct VmRecord {
     #[serde(default)]
     pub last_exit_code: Option<i32>,
 
-    /// Commands to run on every VM start (via `sh -c`).
+    /// Commands to run on first VM start (via `sh -c`).
     #[serde(default)]
     pub init: Vec<String>,
+
+    /// Whether init commands have already completed successfully.
+    /// Set to true after first successful run; reset when init commands change.
+    #[serde(default)]
+    pub init_completed: bool,
 
     /// Environment variables for init commands.
     #[serde(default)]
@@ -504,6 +510,7 @@ impl VmRecord {
             restart: RestartConfig::default(),
             last_exit_code: None,
             init: Vec::new(),
+            init_completed: false,
             env: Vec::new(),
             workdir: None,
             storage_gb: None,
@@ -553,6 +560,7 @@ impl VmRecord {
             restart,
             last_exit_code: None,
             init: Vec::new(),
+            init_completed: false,
             env: Vec::new(),
             workdir: None,
             storage_gb: None,

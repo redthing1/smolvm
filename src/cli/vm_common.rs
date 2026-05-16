@@ -758,32 +758,63 @@ pub fn start_vm_named(name: &str) -> smolvm::Result<()> {
     // would hit the bare Alpine agent and fail with "not found".
     let mut client = smolvm::agent::AgentClient::connect_with_retry(manager.vsock_socket())?;
 
-    let image_info = load_record_image_info(&mut client, &record)?;
+    // On first boot, pull the image and run init commands. On subsequent
+    // starts, skip both — image manifests/layers persist on the storage disk
+    // and the container overlay is remounted (not recreated).
+    if !record.init_completed {
+        let image_info = load_record_image_info(&mut client, &record)?;
 
-    // Run init commands if configured (before reporting success).
-    // `run_init_commands` branches on image: container path for
-    // image-based VMs, bare-agent path for plain VMs.
-    if let Err(e) = run_init_commands(
-        &mut client,
-        &record.init,
-        InitRunContext {
-            image: record.image.as_deref(),
-            image_info: image_info.as_ref(),
-            env: &record.env,
-            workdir: record.workdir.as_deref(),
-            record_mounts: &record.mounts,
-            overlay_id: name,
-        },
-    ) {
-        if let Err(stop_err) = manager.stop() {
-            tracing::warn!(error = %stop_err, "failed to stop machine after init failure");
+        if let Err(e) = run_init_commands(
+            &mut client,
+            &record.init,
+            InitRunContext {
+                image: record.image.as_deref(),
+                image_info: image_info.as_ref(),
+                env: &record.env,
+                workdir: record.workdir.as_deref(),
+                record_mounts: &record.mounts,
+                overlay_id: name,
+            },
+        ) {
+            if let Err(stop_err) = manager.stop() {
+                tracing::warn!(error = %stop_err, "failed to stop machine after init failure");
+            }
+            return Err(e);
         }
-        return Err(e);
+
+        // Mark init as completed so subsequent starts skip pull + init.
+        // Done before workload start so a CMD failure doesn't re-trigger init.
+        if !record.init.is_empty() || record.image.is_some() {
+            let _ = db.update_vm(name, |r| {
+                r.init_completed = true;
+            });
+        }
+    } else if !record.init.is_empty() {
+        println!(
+            "Init already completed, skipping {} command(s)",
+            record.init.len()
+        );
     }
 
-    if record.image.is_some() {
-        // Image-based machine: VM is running, image pulled and cached,
-        // init done. Sits idle until `machine exec` is called.
+    if let Some(ref img) = record.image {
+        // Image-based machine: start background CMD if configured.
+        let mut cmd = record.entrypoint.clone();
+        cmd.extend(record.cmd.clone());
+        if !cmd.is_empty() {
+            let mount_bindings =
+                crate::cli::parsers::record_mounts_to_runconfig_bindings(&record.mounts);
+            let bg_config = smolvm::agent::RunConfig::new(img, cmd)
+                .with_env(record.env.clone())
+                .with_workdir(record.workdir.clone())
+                .with_mounts(mount_bindings)
+                .with_persistent_overlay(Some(name.to_string()));
+            if let Err(e) = client.run_background(bg_config) {
+                if let Err(stop_err) = manager.stop() {
+                    tracing::warn!(error = %stop_err, "failed to stop machine after CMD launch failure");
+                }
+                return Err(smolvm::Error::agent("start background CMD", format!("{e}")));
+            }
+        }
         println!("Machine '{}' running (PID: {})", name, pid.unwrap_or(0));
     } else {
         // No image — bare VM mode. Run entrypoint+cmd if configured.
@@ -830,7 +861,7 @@ pub fn persist_named_running(
     name: &str,
     pid: Option<i32>,
     overrides: Option<DefaultVmOverrides>,
-) {
+) -> smolvm::Result<()> {
     if config.get_vm(name).is_none() {
         let record = VmRecord::new(
             name.to_string(),
@@ -840,13 +871,10 @@ pub fn persist_named_running(
             vec![],
             false,
         );
-        if let Err(e) = config.insert_vm(name.to_string(), record) {
-            tracing::warn!(error = %e, vm = %name, "failed to insert VM record");
-            return;
-        }
+        config.insert_vm(name.to_string(), record)?;
     }
     let pid_start_time = pid.and_then(smolvm::process::process_start_time);
-    if config
+    config
         .update_vm(name, |r| {
             r.state = RecordState::Running;
             r.pid = pid;
@@ -862,6 +890,7 @@ pub fn persist_named_running(
                 r.overlay_gb = o.overlay_gb;
                 r.allowed_cidrs = o.allowed_cidrs.clone();
                 r.init = o.init.clone();
+                r.init_completed = false;
                 r.env = o.env.clone();
                 r.workdir = o.workdir.clone();
                 r.image = o.image.clone();
@@ -871,12 +900,18 @@ pub fn persist_named_running(
                 r.ssh_agent = o.ssh_agent;
                 r.egress_policy_hosts = o.egress_policy_hosts.clone();
                 r.source_imported_image = o.source_imported_image.clone();
+                r.gpu = if o.gpu { Some(true) } else { None };
+                r.gpu_vram_mib = o.gpu_vram_mib;
             }
         })
-        .is_none()
-    {
-        tracing::warn!(vm = %name, "failed to update VM record (record missing after insert)");
-    }
+        .ok_or_else(|| smolvm::Error::config(
+            "persist machine record",
+            format!("VM record for '{}' missing after insert", name),
+        ))?
+        // Flatten: Option<Result<()>> → the ok_or_else above handles None,
+        // now propagate the inner Result (DB write failure).
+        ?;
+    Ok(())
 }
 
 /// Config overrides for a VM record.
@@ -900,6 +935,8 @@ pub struct DefaultVmOverrides {
     pub ssh_agent: bool,
     pub egress_policy_hosts: Option<Vec<String>>,
     pub source_imported_image: Option<String>,
+    pub gpu: bool,
+    pub gpu_vram_mib: Option<u32>,
 }
 
 /// Check if any running VM already binds to the same host ports.
@@ -961,7 +998,7 @@ pub fn start_vm_default() -> smolvm::Result<()> {
     manager.ensure_running()?;
 
     let mut config = SmolvmConfig::load()?;
-    persist_named_running(&mut config, "default", manager.child_pid(), None);
+    persist_named_running(&mut config, "default", manager.child_pid(), None)?;
 
     // Pull image (if persisted via `machine run -d -s`) before running
     // init, then run init through the shared runner — same fix as
@@ -1331,27 +1368,98 @@ pub fn list_vms(verbose: bool, json: bool) -> smolvm::Result<()> {
 ///
 /// The VM must be stopped before resizing. Only expansion is supported
 /// (no shrinking to prevent data loss).
+/// Expand physical disk files for a VM. Does NOT update the DB record —
+/// the caller is responsible for persisting the new sizes.
+///
+/// Returns a list of human-readable change descriptions for display.
+/// Validates no-shrink and performs the physical I/O.
+pub fn expand_disks(
+    name: &str,
+    record: &smolvm::config::VmRecord,
+    new_storage_gb: Option<u64>,
+    new_overlay_gb: Option<u64>,
+) -> smolvm::Result<Vec<String>> {
+    use smolvm::data::disk::{Overlay, Storage};
+    use smolvm::storage::{expand_disk, DEFAULT_OVERLAY_SIZE_GIB, DEFAULT_STORAGE_SIZE_GIB};
+
+    let current_storage_gb = record.storage_gb.unwrap_or(DEFAULT_STORAGE_SIZE_GIB);
+    let current_overlay_gb = record.overlay_gb.unwrap_or(DEFAULT_OVERLAY_SIZE_GIB);
+
+    // Validate no shrinking
+    if let Some(s) = new_storage_gb {
+        if s < current_storage_gb {
+            return Err(smolvm::Error::config(
+                "resize",
+                format!(
+                    "storage disk cannot be shrunk from {} GiB to {} GiB. Only expanding is supported to prevent data loss.",
+                    current_storage_gb, s
+                ),
+            ));
+        }
+    }
+    if let Some(o) = new_overlay_gb {
+        if o < current_overlay_gb {
+            return Err(smolvm::Error::config(
+                "resize",
+                format!(
+                    "overlay disk cannot be shrunk from {} GiB to {} GiB. Only expanding is supported to prevent data loss.",
+                    current_overlay_gb, o
+                ),
+            ));
+        }
+    }
+
+    let manager = AgentManager::for_vm(name)
+        .map_err(|e| smolvm::Error::agent("get agent manager", e.to_string()))?;
+
+    let mut changes = Vec::new();
+
+    if let Some(storage_gb) = new_storage_gb {
+        if storage_gb > current_storage_gb {
+            let storage_path = manager.storage_path();
+            expand_disk::<Storage>(storage_path, storage_gb)
+                .map_err(|e| smolvm::Error::storage("expand storage disk", e.to_string()))?;
+            changes.push(format!(
+                "  storage: {} GiB → {} GiB",
+                current_storage_gb, storage_gb
+            ));
+        }
+    }
+
+    if let Some(overlay_gb) = new_overlay_gb {
+        if overlay_gb > current_overlay_gb {
+            let overlay_path = manager.overlay_path();
+            expand_disk::<Overlay>(overlay_path, overlay_gb)
+                .map_err(|e| smolvm::Error::storage("expand overlay disk", e.to_string()))?;
+            changes.push(format!(
+                "  overlay: {} GiB → {} GiB",
+                current_overlay_gb, overlay_gb
+            ));
+        }
+    }
+
+    Ok(changes)
+}
+
+/// Legacy wrapper: expand disks AND update the DB in one call.
+/// Used by the hidden `machine resize` backward-compat command.
 pub fn resize_vm(
     name: &str,
     new_storage_gb: Option<u64>,
     new_overlay_gb: Option<u64>,
 ) -> smolvm::Result<()> {
     use smolvm::config::RecordState;
-    use smolvm::data::disk::{Overlay, Storage};
     use smolvm::db::SmolvmDb;
-    use smolvm::storage::{expand_disk, DEFAULT_OVERLAY_SIZE_GIB, DEFAULT_STORAGE_SIZE_GIB};
 
-    // Get VM record from database
     let db = SmolvmDb::open()?;
     let record = db
         .get_vm(name)?
         .ok_or_else(|| smolvm::Error::vm_not_found(name))?
         .clone();
 
-    // Check state - VM must be stopped (Created state also allowed for never-started VMs)
     let actual_state = record.actual_state();
     match actual_state {
-        RecordState::Stopped | RecordState::Created => {} // OK to resize
+        RecordState::Stopped | RecordState::Created => {}
         _ => {
             return Err(smolvm::Error::InvalidState {
                 expected: "stopped".into(),
@@ -1360,74 +1468,8 @@ pub fn resize_vm(
         }
     }
 
-    // Get current disk sizes (use defaults if not set)
-    let current_storage_gb = record.storage_gb.unwrap_or(DEFAULT_STORAGE_SIZE_GIB);
-    let current_overlay_gb = record.overlay_gb.unwrap_or(DEFAULT_OVERLAY_SIZE_GIB);
+    let changes = expand_disks(name, &record, new_storage_gb, new_overlay_gb)?;
 
-    // Determine target sizes
-    let target_storage_gb = new_storage_gb.unwrap_or(current_storage_gb);
-    let target_overlay_gb = new_overlay_gb.unwrap_or(current_overlay_gb);
-
-    // Validate no shrinking
-    if target_storage_gb < current_storage_gb {
-        return Err(smolvm::Error::config(
-            "resize",
-            format!(
-                "storage disk cannot be shrunk from {} GiB to {} GiB. Only expanding is supported to prevent data loss.",
-                current_storage_gb, target_storage_gb
-            ),
-        ));
-    }
-    if target_overlay_gb < current_overlay_gb {
-        return Err(smolvm::Error::config(
-            "resize",
-            format!(
-                "overlay disk cannot be shrunk from {} GiB to {} GiB. Only expanding is supported to prevent data loss.",
-                current_overlay_gb, target_overlay_gb
-            ),
-        ));
-    }
-
-    // Get agent manager for disk paths
-    let manager = AgentManager::for_vm(name)
-        .map_err(|e| smolvm::Error::agent("get agent manager", e.to_string()))?;
-
-    // Print resize header
-    println!("Resizing machine '{}'...", name);
-
-    // Expand storage disk if requested and changed
-    if let Some(storage_gb) = new_storage_gb {
-        if storage_gb > current_storage_gb {
-            print!(
-                "  Storage: {} GiB → {} GiB (expanding disk...)",
-                current_storage_gb, storage_gb
-            );
-            std::io::Write::flush(&mut std::io::stdout()).ok();
-
-            let storage_path = manager.storage_path();
-            expand_disk::<Storage>(storage_path, storage_gb)
-                .map_err(|e| smolvm::Error::storage("expand storage disk", e.to_string()))?;
-            println!(" done");
-        }
-    }
-
-    // Expand overlay disk if requested and changed
-    if let Some(overlay_gb) = new_overlay_gb {
-        if overlay_gb > current_overlay_gb {
-            print!(
-                "  Overlay: {} GiB → {} GiB (expanding disk...)",
-                current_overlay_gb, overlay_gb
-            );
-            std::io::Write::flush(&mut std::io::stdout()).ok();
-
-            let overlay_path = manager.overlay_path();
-            expand_disk::<Overlay>(overlay_path, overlay_gb)
-                .map_err(|e| smolvm::Error::storage("expand overlay disk", e.to_string()))?;
-            println!(" done");
-        }
-    }
-
-    // Update database record with new sizes
     db.update_vm(name, |r| {
         if let Some(s) = new_storage_gb {
             r.storage_gb = Some(s);
@@ -1437,9 +1479,15 @@ pub fn resize_vm(
         }
     })?;
 
-    println!();
-    println!("Machine '{}' resized successfully.", name);
-    println!("Disk changes are applied immediately; filesystem will expand on next boot.");
+    if changes.is_empty() {
+        println!("No disk changes needed.");
+    } else {
+        println!("Resized machine '{}':", name);
+        for c in &changes {
+            println!("{}", c);
+        }
+        println!("Filesystem will expand on next boot.");
+    }
 
     Ok(())
 }
@@ -1512,6 +1560,10 @@ pub fn cleanup_orphaned_ephemeral_vms() {
         if is_orphan {
             tracing::debug!(name = %name, pid = ?record.pid, "cleaning up orphaned ephemeral VM");
             let _ = db.remove_vm(name);
+            let dir = smolvm::agent::vm_data_dir(name);
+            if dir.exists() {
+                let _ = std::fs::remove_dir_all(&dir);
+            }
         }
     }
 }

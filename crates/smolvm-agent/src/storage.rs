@@ -276,39 +276,46 @@ pub fn init_preloaded_image_dir() -> Option<PathBuf> {
     }
 
     // Mount virtiofs using direct syscall (avoids ~3-5ms fork+exec overhead)
-    let src = std::ffi::CString::new(tag).ok()?;
-    let dst = std::ffi::CString::new(mount_point.to_str()?).ok()?;
-    let fstype = std::ffi::CString::new("virtiofs").unwrap();
-    // SAFETY: mount virtiofs with valid CString arguments
-    let rc = unsafe {
-        libc::mount(
-            src.as_ptr(),
-            dst.as_ptr(),
-            fstype.as_ptr(),
-            0,
-            std::ptr::null(),
-        )
-    };
+    #[cfg(target_os = "linux")]
+    {
+        let src = std::ffi::CString::new(tag).ok()?;
+        let dst = std::ffi::CString::new(mount_point.to_str()?).ok()?;
+        let fstype = std::ffi::CString::new("virtiofs").unwrap();
+        // SAFETY: mount virtiofs with valid CString arguments
+        let rc = unsafe {
+            libc::mount(
+                src.as_ptr(),
+                dst.as_ptr(),
+                fstype.as_ptr(),
+                0,
+                std::ptr::null(),
+            )
+        };
 
-    if rc != 0 {
-        let err = std::io::Error::last_os_error();
-        warn!(error = %err, tag = %tag, "failed to mount preloaded image virtiofs");
-        return None;
+        if rc != 0 {
+            let err = std::io::Error::last_os_error();
+            warn!(error = %err, tag = %tag, "failed to mount preloaded image virtiofs");
+            return None;
+        }
+        info!(mount_point = %mount_point.display(), "preloaded image data mounted successfully");
+
+        // List contents for debugging (only at debug level to avoid boot overhead)
+        if let Ok(entries) = std::fs::read_dir(&mount_point) {
+            let entry_names: Vec<_> = entries
+                .filter_map(|e| e.ok())
+                .filter(|e| e.path().is_dir())
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .collect();
+            debug!(entry_count = entry_names.len(), entries = ?entry_names, "preloaded image data available");
+        }
+
+        Some(mount_point)
     }
-
-    info!(mount_point = %mount_point.display(), "preloaded image data mounted successfully");
-
-    // List contents for debugging (only at debug level to avoid boot overhead)
-    if let Ok(entries) = std::fs::read_dir(&mount_point) {
-        let entry_names: Vec<_> = entries
-            .filter_map(|e| e.ok())
-            .filter(|e| e.path().is_dir())
-            .map(|e| e.file_name().to_string_lossy().to_string())
-            .collect();
-        debug!(entry_count = entry_names.len(), entries = ?entry_names, "preloaded image data available");
+    #[cfg(not(target_os = "linux"))]
+    {
+        warn!("preloaded image virtiofs mount not supported on non-Linux");
+        None
     }
-
-    Some(mount_point)
 }
 
 /// Get the preloaded image data directory if available.
@@ -1505,6 +1512,100 @@ pub fn find_layer_path(image_digest: &str, layer_index: usize) -> Result<PathBuf
     Ok(layer_dir)
 }
 
+/// Export a layer as a tar file on the storage disk.
+///
+/// DEPRECATED: Prefer streaming export via `find_layer_path()` + piped tar.
+/// This function creates a temp tar file that can fill the storage disk for
+/// large layers. Kept for backward compatibility.
+pub fn export_layer(image_digest: &str, layer_index: usize) -> Result<PathBuf> {
+    let layer_dir = find_layer_path(image_digest, layer_index)?;
+    let layer_id = layer_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unknown");
+
+    let root = Path::new(STORAGE_ROOT);
+    let tmp_dir = root.join("tmp");
+    std::fs::create_dir_all(&tmp_dir)?;
+    let tar_path = tmp_dir.join(format!("layer-{}.tar", &layer_id[..12.min(layer_id.len())]));
+
+    info!(
+        layer_id = %layer_id,
+        output = %tar_path.display(),
+        "exporting layer as tar (temp file)"
+    );
+
+    let status = Command::new("tar")
+        .args(["-cf"])
+        .arg(&tar_path)
+        .arg("-C")
+        .arg(&layer_dir)
+        .arg(".")
+        .status()?;
+
+    if !status.success() {
+        return Err(StorageError::new(format!(
+            "failed to create tar archive for layer {}",
+            layer_id
+        )));
+    }
+
+    Ok(tar_path)
+}
+
+/// Get the layer digest for an image at a specific index.
+pub fn get_layer_digest(image_digest: &str, layer_index: usize) -> Result<String> {
+    let root = Path::new(STORAGE_ROOT);
+    let manifests_dir = root.join(MANIFESTS_DIR);
+
+    if !manifests_dir.exists() {
+        return Err(StorageError::NoImagesFound);
+    }
+
+    for entry in std::fs::read_dir(&manifests_dir)? {
+        let entry = entry?;
+        let content = std::fs::read_to_string(entry.path())?;
+        if let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&content) {
+            if let Some(config) = manifest.get("config") {
+                if let Some(digest) = config.get("digest").and_then(|d| d.as_str()) {
+                    if digest == image_digest {
+                        if let Some(layers) = manifest["layers"].as_array() {
+                            if layer_index < layers.len() {
+                                if let Some(layer_digest) = layers[layer_index]["digest"].as_str() {
+                                    return Ok(layer_digest.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Err(StorageError::new(format!(
+        "layer {} not found for image {}",
+        layer_index, image_digest
+    )))
+}
+
+/// Remove all image manifests and configs, making all layers unreferenced.
+///
+/// Call this before `garbage_collect()` to implement `prune --all`.
+pub fn purge_all_images() -> Result<()> {
+    let root = Path::new(STORAGE_ROOT);
+    let manifests_dir = root.join(MANIFESTS_DIR);
+    let configs_dir = root.join(CONFIGS_DIR);
+
+    if manifests_dir.exists() {
+        std::fs::remove_dir_all(&manifests_dir)?;
+    }
+    if configs_dir.exists() {
+        std::fs::remove_dir_all(&configs_dir)?;
+    }
+
+    Ok(())
+}
+
 /// Run garbage collection.
 pub fn garbage_collect(dry_run: bool) -> Result<u64> {
     let root = Path::new(STORAGE_ROOT);
@@ -1863,8 +1964,10 @@ fn prepare_overlay_from_preloaded_image(
         .map(|path| path.display().to_string())
         .collect();
 
-    // Use shared overlay setup logic
-    OverlaySetup::new(workload_id)?.execute(lowerdirs)
+    // Use shared overlay setup logic — execute_or_remount preserves the
+    // upper layer from a previous session (e.g., packages installed via exec)
+    // instead of recreating the overlay from scratch.
+    OverlaySetup::new(workload_id)?.execute_or_remount(lowerdirs)
 }
 
 /// Build lowerdir list from a pulled OCI image's layers.
@@ -2178,6 +2281,21 @@ pub fn run_command(request: RunCommandRequest<'_>) -> Result<RunResult> {
         spec.write_to(&bundle_path)
             .map_err(|e| StorageError::new(format!("failed to write OCI spec: {}", e)))?;
 
+        // If a main workload container is running for this overlay, join it
+        // via crun exec instead of creating a fresh isolated container.
+        if let Some(cid) = crate::resolve_main_container(request.persistent_overlay_id) {
+            let result = run_exec_in_container(
+                &cid,
+                request.command,
+                request.env,
+                request.workdir,
+                request.timeout_ms,
+                request.client_fd,
+            );
+            let _ = mounted_paths;
+            return result;
+        }
+
         // Generate unique container ID for this execution
         let container_id = generate_container_id();
 
@@ -2255,6 +2373,7 @@ pub fn spawn_in_overlay(
     }
 
     crate::ssh_agent::inject_into_container(&mut spec);
+    spec.add_gpu_devices_if_available();
 
     spec.write_to(&bundle_path)
         .map_err(|e| StorageError::new(format!("failed to write OCI spec: {}", e)))?;
@@ -2328,6 +2447,7 @@ pub fn setup_mounts(rootfs: &str, mounts: &[(String, String, bool)]) -> Result<(
 }
 
 /// Setup volume mounts by mounting virtiofs and bind-mounting into the rootfs.
+#[cfg(target_os = "linux")]
 fn setup_volume_mounts(rootfs: &str, mounts: &[(String, String, bool)]) -> Result<Vec<PathBuf>> {
     let mut mounted_paths = Vec::new();
     let rootfs_path = Path::new(rootfs);
@@ -2487,7 +2607,12 @@ fn path_to_cstring(path: &Path, context: &str) -> Result<CString> {
     })
 }
 
-/// Check if a path is a mountpoint.
+/// Stub for non-Linux platforms.
+#[cfg(not(target_os = "linux"))]
+fn setup_volume_mounts(_rootfs: &str, _mounts: &[(String, String, bool)]) -> Result<Vec<PathBuf>> {
+    Ok(Vec::new())
+}
+
 /// Check if a path is a mountpoint (delegates to paths::is_mount_point).
 fn is_mountpoint(path: &Path) -> bool {
     paths::is_mount_point(path)
@@ -2497,6 +2622,65 @@ fn is_mountpoint(path: &Path) -> bool {
 ///
 /// This uses `crun run` which creates, starts, waits, and deletes the container
 /// in a single operation. Stdout and stderr are captured.
+/// Join a running container via `crun exec` (non-interactive).
+fn run_exec_in_container(
+    container_id: &str,
+    command: &[String],
+    env: &[(String, String)],
+    workdir: Option<&str>,
+    timeout_ms: Option<u64>,
+    client_fd: Option<std::os::unix::io::RawFd>,
+) -> Result<RunResult> {
+    info!(container_id = %container_id, command = ?command, "joining container via crun exec");
+
+    let mut child = CrunCommand::exec(container_id, env, command, workdir, false)
+        .stdin_null()
+        .capture_output()
+        .spawn()
+        .map_err(|e| StorageError::new(format!("crun exec failed: {}", e)))?;
+
+    // On timeout/disconnect, kill only the exec'd process — NOT the main
+    // container. The main container hosts the shared namespace for all execs;
+    // a timed-out `exec -- sleep 10` must not destroy the workload.
+    let exec_pid = child.id();
+    let result = crate::process::wait_with_timeout_cleanup_and_liveness(
+        &mut child,
+        timeout_ms,
+        client_fd,
+        || unsafe {
+            libc::kill(exec_pid as libc::pid_t, libc::SIGKILL);
+        },
+    )?;
+
+    match result {
+        WaitResult::Completed { exit_code, output } => Ok(RunResult {
+            exit_code,
+            stdout: output.stdout,
+            stderr: output.stderr,
+        }),
+        WaitResult::TimedOut { output, timeout_ms } => {
+            let mut stderr = output.stderr;
+            stderr.extend_from_slice(
+                format!("\ncommand timed out after {}ms", timeout_ms).as_bytes(),
+            );
+            Ok(RunResult {
+                exit_code: 124,
+                stdout: output.stdout,
+                stderr,
+            })
+        }
+        WaitResult::ClientDisconnected { output } => {
+            let mut stderr = output.stderr;
+            stderr.extend_from_slice(b"\nclient disconnected");
+            Ok(RunResult {
+                exit_code: 137,
+                stdout: output.stdout,
+                stderr,
+            })
+        }
+    }
+}
+
 fn run_with_crun(
     bundle_dir: &Path,
     container_id: &str,

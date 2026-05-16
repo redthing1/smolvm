@@ -15,7 +15,7 @@ smolvm machine create --net myvm
 smolvm machine start --name myvm
 smolvm machine exec --name myvm -- apk add python3   # installs persist
 smolvm machine exec --name myvm -- which python3      # still there
-smolvm machine exec --name myvm -it -- /bin/sh
+smolvm machine shell --name myvm               # interactive shell (auto-starts if stopped)
 smolvm machine stop --name myvm
 smolvm machine delete myvm
 
@@ -45,12 +45,14 @@ smolvm machine exec --name my-vm -- pip install requests
 | Goal | Command |
 |------|---------|
 | Run a one-off command in isolation | `smolvm machine run --net --image IMAGE -- CMD` |
-| Interactive shell | `smolvm machine run --net -it --image IMAGE -- /bin/sh` |
+| Interactive shell (ephemeral) | `smolvm machine run --net -it --image IMAGE -- /bin/sh` |
+| Interactive shell (persistent) | `smolvm machine shell --name NAME` |
 | Persistent dev environment | `machine create` → `machine start` → `machine exec` |
 | Ship software as a binary | `smolvm pack create --image IMAGE -o OUTPUT` |
 | Fast persistent machine from packed artifact | `machine create NAME --from FILE.smolmachine` |
 | Use git/ssh with private keys safely | Add `--ssh-agent` to run or create |
 | Minimal VM without image | `smolvm machine run -s Smolfile` (bare VM) |
+| Change mounts/ports/resources on existing VM | `machine update NAME -v ./src:/app -p 8080:8080` |
 | Declarative VM config | Create a Smolfile, use `--smolfile`/`-s` flag |
 
 ### Persistence Model
@@ -69,6 +71,7 @@ All commands use named flags (no positional args except `machine create NAME` an
 ```
 smolvm machine run --image IMAGE [-- COMMAND]     # ephemeral
 smolvm machine exec --name NAME [-- COMMAND]      # run in existing VM
+smolvm machine shell [--name NAME]                # interactive shell (auto-starts)
 smolvm machine create NAME [OPTIONS]              # create persistent
 smolvm machine create NAME --from FILE.smolmachine  # from packed artifact
 smolvm machine start [--name NAME]                # start (default: "default")
@@ -76,6 +79,7 @@ smolvm machine stop [--name NAME]                 # stop
 smolvm machine delete NAME [-f]                   # delete
 smolvm machine status [--name NAME]               # check state
 smolvm machine ls [--json]                        # list all
+smolvm machine update NAME [OPTIONS]              # modify stopped machine settings
 smolvm machine cp SRC DST                         # copy files (host↔VM)
 smolvm machine exec --stream --name NAME -- CMD   # streaming output
 smolvm machine monitor [--name NAME]              # foreground health + restart
@@ -108,12 +112,12 @@ Default registry: `registry.smolmachines.com`. Digest references require `sha256
 | Flag | Short | Used on | Description |
 |------|-------|---------|-------------|
 | `--image` | `-I` | run, create, pack create | OCI image |
-| `--name` | `-n` | run, start, stop, status, exec, resize | Machine name (default: "default") |
+| `--name` | `-n` | run, start, stop, status, exec, update | Machine name (default: "default") |
 | `--net` | | run, create | Enable outbound networking (off by default) |
 | `--gpu` | | run, create | Enable GPU acceleration (Vulkan via virtio-gpu) |
 | `--gpu-vram` | | run, create | GPU shared-memory region size in MiB (default: 4096). Ignored without `--gpu`. |
-| `--volume` | `-v` | run, create | Mount host dir: `HOST:GUEST[:ro]` |
-| `--port` | `-p` | run, create | Port mapping: `HOST:GUEST` |
+| `--volume` | `-v` | run, create, update | Mount host dir: `HOST:GUEST[:ro]` |
+| `--port` | `-p` | run, create, update | Port mapping: `HOST:GUEST` |
 | `--smolfile` | `-s` | run, create, pack create | Load config from Smolfile |
 | `--interactive` | `-i` | run, exec | Keep stdin open |
 | `--tty` | `-t` | run, exec | Allocate pseudo-TTY |
@@ -418,6 +422,7 @@ OpenAPI spec: `smolvm serve openapi`
 ## Important Behaviors
 
 - **Observational commands don't stop running VMs.** `machine images`, `machine status`, `machine ls` and similar read-only commands leave a running VM in its current state. If the VM was already running before the command, it stays running after.
-- **`machine prune` requires the VM to be stopped.** Pruning layers while a VM has active containers could break things. Stop the VM first with `machine stop`, then prune.
+- **`machine prune` works on a running VM.** Regular prune only removes unreferenced layers and is safe while containers are active. `prune --all` requires the VM to be stopped first since it deletes manifests for layers that may be in use.
 - **`machine exec` persists filesystem changes.** Package installs, config edits, and file writes inside `exec` survive across sessions. This works for both bare VMs and image-based VMs (created with `--image`).
+- **`machine update` modifies a stopped machine.** Add/remove mounts, ports, env vars, or change CPU/memory without recreating the VM. Changes take effect on next `machine start`. Requires the machine to be stopped.
 - **`machine run` is always ephemeral.** The VM is created, the command runs, and everything is cleaned up. No state carries over.

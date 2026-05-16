@@ -90,14 +90,22 @@ pub enum MachineCmd {
     #[command(visible_alias = "list")]
     Ls(LsCmd),
 
-    /// Resize a machine's disk resources
+    /// Resize a machine's disk resources (use `update` instead)
+    #[command(hide = true)]
     Resize(ResizeCmd),
+
+    /// Modify settings on a stopped machine (mounts, ports, resources, disks)
+    Update(UpdateCmd),
 
     /// List cached images and storage usage
     Images(ImagesCmd),
 
     /// Remove unused images and layers to free disk space
     Prune(PruneCmd),
+
+    /// Open an interactive shell in a machine (starts it if stopped)
+    #[command(visible_alias = "sh")]
+    Shell(ShellCmd),
 
     /// Copy files between host and machine
     Cp(CpCmd),
@@ -137,8 +145,10 @@ impl MachineCmd {
             MachineCmd::Status(cmd) => cmd.run(),
             MachineCmd::Ls(cmd) => cmd.run(),
             MachineCmd::Resize(cmd) => cmd.run(),
+            MachineCmd::Update(cmd) => cmd.run(),
             MachineCmd::Images(cmd) => cmd.run(),
             MachineCmd::Prune(cmd) => cmd.run(),
+            MachineCmd::Shell(cmd) => cmd.run(),
             MachineCmd::Cp(cmd) => cmd.run(),
             MachineCmd::Monitor(cmd) => cmd.run(),
             MachineCmd::NetworkTest(cmd) => cmd.run(),
@@ -308,13 +318,10 @@ impl RunCmd {
         use smolvm::Error;
 
         let requested_name = self.name.clone();
-        if !self.detach && requested_name.is_some() {
-            eprintln!("warning: --name is ignored without -d");
-        }
         let vm_name = if self.detach {
             requested_name.unwrap_or_else(|| "default".to_string())
         } else {
-            "default".to_string()
+            smolvm::util::generate_machine_name()
         };
 
         if self.name.is_some() && vm_name != "default" && self.detach {
@@ -413,7 +420,8 @@ impl RunCmd {
             memory_mib: params.mem,
             network: params.net,
             network_backend: params.network_backend,
-            gpu: self.gpu,
+            // CLI --gpu wins; Smolfile gpu = true also enables it.
+            gpu: self.gpu || params.gpu,
             gpu_vram_mib: self.gpu_vram_mib.or(params.gpu_vram_mib),
             storage_gib: params.storage_gb,
             overlay_gib: params.overlay_gb,
@@ -430,12 +438,11 @@ impl RunCmd {
             AgentManager::for_vm_with_sizes(&vm_name, params.storage_gb, params.overlay_gb)
                 .map_err(|e| Error::agent("create agent manager", e.to_string()))?;
 
-        let mode = if self.detach {
-            "persistent"
+        if self.detach {
+            println!("Starting persistent machine...");
         } else {
-            "ephemeral"
-        };
-        println!("Starting {} machine...", mode);
+            println!("Starting ephemeral machine ({})...", vm_name);
+        }
 
         let imported_image = vm_common::resolve_imported_image(image.as_deref())?;
         let imported_image_data_dir = imported_image
@@ -610,28 +617,21 @@ impl RunCmd {
                 params.workdir.as_deref(),
             );
             if self.detach {
-                // Detach mode: kick the resolved command off in the background
-                // inside the image's overlay rootfs, and persist the record so
-                // subsequent `machine exec` sessions see the same filesystem
-                // (same overlay ID as the exec path below).
-                // Skip when the command is just the idle default — there's
-                // nothing useful to dispatch.
-                let is_idle = command.is_empty()
-                    || command
-                        == DEFAULT_IDLE_CMD
-                            .iter()
-                            .map(|s| s.to_string())
-                            .collect::<Vec<_>>();
-                if !is_idle {
-                    let bg_config = smolvm::agent::RunConfig::new(img, command.clone())
-                        .with_env(env.clone())
-                        .with_workdir(params.workdir.clone())
+                // Start the main workload container first. If this fails, the
+                // VM is stopped and no DB record is written — a retry won't
+                // hit "machine already exists."
+                {
+                    let run_config = smolvm::agent::RunConfig::new(img.clone(), command.clone())
+                        .with_env(defaults.env.clone())
+                        .with_workdir(defaults.workdir.clone())
+                        .with_user(defaults.user.clone())
                         .with_mounts(mount_bindings.clone())
                         .with_persistent_overlay(Some(vm_name.clone()));
-                    let pid = client.run_background(bg_config)?;
-                    tracing::info!(pid = pid, "background workload started");
+                    client.run_container_detached(run_config)?;
                 }
 
+                // Container started — persist the DB record. If this fails,
+                // stop the VM to avoid an orphan that lifecycle commands can't find.
                 {
                     use smolvm::config::SmolvmConfig;
                     use vm_common::DefaultVmOverrides;
@@ -647,7 +647,7 @@ impl RunCmd {
                         .collect();
                     let port_tuples: Vec<(u16, u16)> =
                         params.port.iter().map(|p| (p.host, p.guest)).collect();
-                    if let Ok(mut config) = SmolvmConfig::load() {
+                    let persist_result = SmolvmConfig::load().and_then(|mut config| {
                         vm_common::persist_named_running(
                             &mut config,
                             &vm_name,
@@ -676,8 +676,17 @@ impl RunCmd {
                                 source_imported_image: imported_image
                                     .as_ref()
                                     .map(|image| image.key.clone()),
+                                gpu: self.gpu || params.gpu,
+                                gpu_vram_mib: self.gpu_vram_mib.or(params.gpu_vram_mib),
                             }),
-                        );
+                        )
+                    });
+                    if let Err(e) = persist_result {
+                        let _ = manager.stop();
+                        return Err(Error::config(
+                            "persist machine record",
+                            format!("VM started but record could not be saved: {}. VM stopped to avoid orphan.", e),
+                        ));
                     }
                 }
 
@@ -733,9 +742,10 @@ impl RunCmd {
                     exit_code
                 };
 
-                // Ephemeral run — command finished, kill VM immediately.
+                // Ephemeral run — tear down VM and its data directory.
                 vm_common::deregister_ephemeral_vm(&ephemeral_name);
                 manager.kill();
+                manager.cleanup_data_dir();
                 std::process::exit(exit_code);
             }
         } else {
@@ -753,7 +763,8 @@ impl RunCmd {
                             .map(|s| s.to_string())
                             .collect::<Vec<_>>();
                 if !is_idle {
-                    let pid = client.vm_exec_background(command, env, params.workdir.clone())?;
+                    let pid =
+                        client.vm_exec_background(command, env.clone(), params.workdir.clone())?;
                     tracing::info!(pid = pid, "background workload started");
                 }
 
@@ -773,34 +784,35 @@ impl RunCmd {
                         .collect();
                     let port_tuples: Vec<(u16, u16)> =
                         params.port.iter().map(|p| (p.host, p.guest)).collect();
-                    if let Ok(mut config) = SmolvmConfig::load() {
-                        vm_common::persist_named_running(
-                            &mut config,
-                            &vm_name,
-                            manager.child_pid(),
-                            Some(DefaultVmOverrides {
-                                cpus: params.cpus,
-                                mem: params.mem,
-                                mounts: mount_tuples,
-                                ports: port_tuples,
-                                network: params.net,
-                                network_backend: params.network_backend,
-                                storage_gb: params.storage_gb,
-                                overlay_gb: params.overlay_gb,
-                                allowed_cidrs: params.allowed_cidrs.clone(),
-                                init: params.init.clone(),
-                                env: parse_env_list(&params.env),
-                                workdir: params.workdir.clone(),
-                                image: None,
-                                image_user: None,
-                                entrypoint: params.entrypoint.clone(),
-                                cmd: params.cmd.clone(),
-                                ssh_agent: self.ssh_agent || params.ssh_agent,
-                                egress_policy_hosts: params.egress_policy_hosts.clone(),
-                                source_imported_image: None,
-                            }),
-                        );
-                    }
+                    let mut config = SmolvmConfig::load()?;
+                    vm_common::persist_named_running(
+                        &mut config,
+                        &vm_name,
+                        manager.child_pid(),
+                        Some(DefaultVmOverrides {
+                            cpus: params.cpus,
+                            mem: params.mem,
+                            mounts: mount_tuples,
+                            ports: port_tuples,
+                            network: params.net,
+                            network_backend: params.network_backend,
+                            storage_gb: params.storage_gb,
+                            overlay_gb: params.overlay_gb,
+                            allowed_cidrs: params.allowed_cidrs.clone(),
+                            init: params.init.clone(),
+                            env: env.clone(),
+                            workdir: params.workdir.clone(),
+                            image: None,
+                            image_user: None,
+                            entrypoint: params.entrypoint.clone(),
+                            cmd: params.cmd.clone(),
+                            ssh_agent: self.ssh_agent || params.ssh_agent,
+                            egress_policy_hosts: params.egress_policy_hosts.clone(),
+                            source_imported_image: None,
+                            gpu: self.gpu || params.gpu,
+                            gpu_vram_mib: self.gpu_vram_mib.or(params.gpu_vram_mib),
+                        }),
+                    )?;
                 }
 
                 if vm_name == "default" {
@@ -847,9 +859,10 @@ impl RunCmd {
                     flush_output();
                     exit_code
                 };
-                // Ephemeral run — command finished, kill VM immediately.
+                // Ephemeral run — tear down VM and its data directory.
                 vm_common::deregister_ephemeral_vm(&ephemeral_name);
                 manager.kill();
+                manager.cleanup_data_dir();
                 std::process::exit(exit_code);
             }
         }
@@ -1046,6 +1059,12 @@ impl ExecCmd {
             vm_common::print_output_and_exit(&manager, exit_code, &stdout, &stderr);
         } else {
             // Bare VM: exec directly in the VM rootfs.
+            // Merge record env (from create/update) with CLI env, same as image path.
+            let env = vm_common::merge_env_overrides(
+                record.as_ref().map(|r| r.env.as_slice()).unwrap_or(&[]),
+                &env,
+            );
+
             if self.stream {
                 let exit_code = client.vm_exec_streaming_with(
                     self.command.clone(),
@@ -1075,6 +1094,42 @@ impl ExecCmd {
                 client.vm_exec(self.command.clone(), env, workdir.clone(), self.timeout)?;
             vm_common::print_output_and_exit(&manager, exit_code, &stdout, &stderr);
         }
+    }
+}
+
+// ============================================================================
+// Shell Command
+// ============================================================================
+
+/// Open an interactive shell in a machine.
+///
+/// Shortcut for `machine exec -it -- /bin/sh`. Starts the machine if stopped.
+///
+/// Examples:
+///   smolvm machine shell
+///   smolvm machine shell --name myvm
+///   smolvm machine sh --name myvm
+#[derive(Args, Debug)]
+pub struct ShellCmd {
+    /// Target machine (default: "default")
+    #[arg(long, short = 'n', value_name = "NAME")]
+    pub name: Option<String>,
+}
+
+impl ShellCmd {
+    pub fn run(self) -> smolvm::Result<()> {
+        // Delegate to exec with -it -- /bin/sh
+        ExecCmd {
+            command: vec!["/bin/sh".to_string()],
+            name: self.name,
+            workdir: None,
+            env: vec![],
+            timeout: None,
+            interactive: true,
+            tty: true,
+            stream: false,
+        }
+        .run()
     }
 }
 
@@ -1538,6 +1593,309 @@ impl ResizeCmd {
 }
 
 // ============================================================================
+// Update Command
+// ============================================================================
+
+/// Modify settings on a stopped machine.
+///
+/// Changes are applied to the DB record and take effect on the next
+/// `machine start`. The machine must be stopped.
+///
+/// Examples:
+///   smolvm machine update myvm -v ./src:/app -p 8080:8080
+///   smolvm machine update myvm --cpus 4 --mem 4096
+///   smolvm machine update myvm --remove-volume ./src:/app
+///   smolvm machine update myvm --net -e DEBUG=1
+#[derive(Args, Debug)]
+pub struct UpdateCmd {
+    /// Machine to update
+    #[arg(value_name = "NAME")]
+    pub name: String,
+
+    /// Add volume mount (HOST:GUEST[:ro])
+    #[arg(short = 'v', long = "volume", value_name = "HOST:GUEST[:ro]")]
+    pub volume: Vec<String>,
+
+    /// Remove volume mount (HOST:GUEST)
+    #[arg(long, value_name = "HOST:GUEST")]
+    pub remove_volume: Vec<String>,
+
+    /// Add port mapping (HOST:GUEST)
+    #[arg(short = 'p', long = "port", value_parser = PortMapping::parse, value_name = "HOST:GUEST")]
+    pub port: Vec<PortMapping>,
+
+    /// Remove port mapping (HOST:GUEST)
+    #[arg(long, value_parser = PortMapping::parse, value_name = "HOST:GUEST")]
+    pub remove_port: Vec<PortMapping>,
+
+    /// Set vCPU count
+    #[arg(long, value_name = "N")]
+    pub cpus: Option<u8>,
+
+    /// Set memory in MiB
+    #[arg(long, value_name = "MiB")]
+    pub mem: Option<u32>,
+
+    /// Enable outbound network access
+    #[arg(long)]
+    pub net: bool,
+
+    /// Disable outbound network access
+    #[arg(long, conflicts_with = "net")]
+    pub no_net: bool,
+
+    /// Add/replace environment variable (KEY=VALUE)
+    #[arg(short = 'e', long = "env", value_name = "KEY=VALUE")]
+    pub env: Vec<String>,
+
+    /// Remove environment variable by key
+    #[arg(long, value_name = "KEY")]
+    pub remove_env: Vec<String>,
+
+    /// Set working directory
+    #[arg(short = 'w', long, value_name = "DIR")]
+    pub workdir: Option<String>,
+
+    /// Enable GPU acceleration
+    #[arg(long)]
+    pub gpu: bool,
+
+    /// Disable GPU acceleration
+    #[arg(long, conflicts_with = "gpu")]
+    pub no_gpu: bool,
+
+    /// Storage disk size in GiB (expand only)
+    #[arg(long, value_name = "GiB")]
+    pub storage: Option<u64>,
+
+    /// Overlay disk size in GiB (expand only)
+    #[arg(long, value_name = "GiB")]
+    pub overlay: Option<u64>,
+}
+
+impl UpdateCmd {
+    pub fn run(self) -> smolvm::Result<()> {
+        use smolvm::config::RecordState;
+        use smolvm::data::storage::HostMount;
+
+        let db = smolvm::db::SmolvmDb::open()?;
+        let record = db.get_vm(&self.name)?.ok_or_else(|| {
+            smolvm::Error::config("update", format!("machine '{}' not found", self.name))
+        })?;
+
+        // Must be stopped (same check as resize)
+        let state = record.actual_state();
+        match state {
+            RecordState::Stopped | RecordState::Created => {}
+            _ => {
+                return Err(smolvm::Error::InvalidState {
+                    expected: "stopped".into(),
+                    actual: format!("{:?}", state),
+                });
+            }
+        }
+
+        // Validate proposed resource values using the same logic as machine start.
+        // Construct a temporary VmResources with the new values (falling back to
+        // the record's current values) and run validate() — single source of truth.
+        let proposed = smolvm::agent::VmResources {
+            cpus: self.cpus.unwrap_or(record.cpus),
+            memory_mib: self.mem.unwrap_or(record.mem),
+            ..record.vm_resources()
+        };
+        proposed.validate()?;
+
+        // Validate env specs have KEY=VALUE format with non-empty key
+        for spec in &self.env {
+            match spec.split_once('=') {
+                Some((key, _)) if !key.is_empty() => {}
+                _ => {
+                    return Err(smolvm::Error::config(
+                        "update",
+                        format!("invalid env format '{}': expected KEY=VALUE", spec),
+                    ));
+                }
+            }
+        }
+
+        // Parse and validate new mounts (after state check so
+        // "machine is running" takes priority over "directory not found")
+        let new_mounts = HostMount::parse(&self.volume)?;
+
+        // Validate no duplicate host ports after proposed changes
+        {
+            let mut final_ports: Vec<PortMapping> = record
+                .ports
+                .iter()
+                .filter(|&&(h, g)| {
+                    !self
+                        .remove_port
+                        .iter()
+                        .any(|rm| rm.host == h && rm.guest == g)
+                })
+                .map(|&(h, g)| PortMapping::new(h, g))
+                .collect();
+            for p in &self.port {
+                if !final_ports
+                    .iter()
+                    .any(|existing| existing.host == p.host && existing.guest == p.guest)
+                {
+                    final_ports.push(*p);
+                }
+            }
+            PortMapping::check_duplicates(&final_ports)
+                .map_err(|e| smolvm::Error::config("update", e))?;
+        }
+
+        // Expand physical disk files before the DB write. If expansion fails,
+        // no DB changes are made — the record stays consistent.
+        let mut changes: Vec<String> = Vec::new();
+        if self.storage.is_some() || self.overlay.is_some() {
+            let disk_changes =
+                vm_common::expand_disks(&self.name, &record, self.storage, self.overlay)?;
+            changes.extend(disk_changes);
+        }
+
+        // Single DB transaction: all settings + disk sizes together.
+        db.update_vm(&self.name, |r| {
+            // Disk sizes (must match the physical expansion above)
+            if let Some(s) = self.storage {
+                r.storage_gb = Some(s);
+            }
+            if let Some(o) = self.overlay {
+                r.overlay_gb = Some(o);
+            }
+            // Volumes: add new, remove specified.
+            // Canonicalize the remove spec's source path so ./src matches
+            // the stored /absolute/path/to/src.
+            for rm in &self.remove_volume {
+                let canonical_rm = if let Some((rm_src, rm_tgt)) = rm.split_once(':') {
+                    let resolved = std::fs::canonicalize(rm_src)
+                        .unwrap_or_else(|_| std::path::PathBuf::from(rm_src));
+                    format!("{}:{}", resolved.display(), rm_tgt)
+                } else {
+                    rm.clone()
+                };
+                let before = r.mounts.len();
+                r.mounts.retain(|(src, tgt, _)| {
+                    let spec = format!("{}:{}", src, tgt);
+                    spec != canonical_rm && spec != *rm
+                });
+                if r.mounts.len() < before {
+                    changes.push(format!("  removed volume: {}", rm));
+                }
+            }
+            for m in &new_mounts {
+                let tuple = m.to_storage_tuple();
+                if !r
+                    .mounts
+                    .iter()
+                    .any(|(s, t, _)| *s == tuple.0 && *t == tuple.1)
+                {
+                    changes.push(format!(
+                        "  added volume: {}:{}{}",
+                        tuple.0,
+                        tuple.1,
+                        if tuple.2 { ":ro" } else { "" }
+                    ));
+                    r.mounts.push(tuple);
+                }
+            }
+
+            // Ports: add new, remove specified
+            for rm in &self.remove_port {
+                let before = r.ports.len();
+                r.ports.retain(|&(h, g)| h != rm.host || g != rm.guest);
+                if r.ports.len() < before {
+                    changes.push(format!("  removed port: {}:{}", rm.host, rm.guest));
+                }
+            }
+            for p in &self.port {
+                let tuple = p.to_tuple();
+                if !r.ports.contains(&tuple) {
+                    changes.push(format!("  added port: {}:{}", tuple.0, tuple.1));
+                    r.ports.push(tuple);
+                }
+            }
+
+            // Resources
+            if let Some(cpus) = self.cpus {
+                changes.push(format!("  cpus: {} → {}", r.cpus, cpus));
+                r.cpus = cpus;
+            }
+            if let Some(mem) = self.mem {
+                changes.push(format!("  memory: {} MiB → {} MiB", r.mem, mem));
+                r.mem = mem;
+            }
+
+            // Network
+            if self.net {
+                changes.push("  network: enabled".to_string());
+                r.network = true;
+            }
+            if self.no_net {
+                changes.push("  network: disabled".to_string());
+                r.network = false;
+                // Clear egress policy — allow_cidrs and allow_hosts imply
+                // networking. Leaving them set would re-enable egress on start.
+                if r.allowed_cidrs.is_some() {
+                    changes.push("  cleared allow_cidrs".to_string());
+                    r.allowed_cidrs = None;
+                }
+                if r.egress_policy_hosts.is_some() {
+                    changes.push("  cleared allow_hosts".to_string());
+                    r.egress_policy_hosts = None;
+                }
+            }
+
+            // Env vars
+            for rm_key in &self.remove_env {
+                let before = r.env.len();
+                r.env.retain(|(k, _)| k != rm_key);
+                if r.env.len() < before {
+                    changes.push(format!("  removed env: {}", rm_key));
+                }
+            }
+            for spec in &self.env {
+                if let Some((key, val)) = spec.split_once('=') {
+                    r.env.retain(|(k, _)| k != key);
+                    r.env.push((key.to_string(), val.to_string()));
+                    changes.push(format!("  env: {}={}", key, val));
+                }
+            }
+
+            // Workdir
+            if let Some(ref wd) = self.workdir {
+                changes.push(format!("  workdir: {}", wd));
+                r.workdir = Some(wd.clone());
+            }
+
+            // GPU
+            if self.gpu {
+                changes.push("  gpu: enabled".to_string());
+                r.gpu = Some(true);
+            }
+            if self.no_gpu {
+                changes.push("  gpu: disabled".to_string());
+                r.gpu = Some(false);
+            }
+        })?;
+
+        if changes.is_empty() {
+            println!("No changes specified.");
+        } else {
+            println!("Updated machine '{}':", self.name);
+            for change in &changes {
+                println!("{}", change);
+            }
+            println!("\nStart with: smolvm machine start --name {}", self.name);
+        }
+
+        Ok(())
+    }
+}
+
+// ============================================================================
 // Data Dir Command
 // ============================================================================
 
@@ -1617,10 +1975,14 @@ impl NetworkTestCmd {
 /// sizes and layer counts. Also displays total storage usage.
 ///
 /// Examples:
-///   smolvm machine images
-///   smolvm machine images --json
+///   smolvm machine images --name myvm
+///   smolvm machine images --name myvm --json
 #[derive(Args, Debug)]
 pub struct ImagesCmd {
+    /// Machine to query
+    #[arg(long, required = true, value_name = "NAME")]
+    pub name: String,
+
     /// Output in JSON format
     #[arg(long)]
     pub json: bool,
@@ -1628,17 +1990,28 @@ pub struct ImagesCmd {
 
 impl ImagesCmd {
     pub fn run(self) -> smolvm::Result<()> {
-        let manager = AgentManager::new_default()?;
+        // Validate VM exists before creating storage (for_vm creates dirs).
+        let db = smolvm::db::SmolvmDb::open()?;
+        let record = db.get_vm(&self.name)?.ok_or_else(|| {
+            smolvm::Error::config("images", format!("machine '{}' not found", self.name))
+        })?;
 
-        let mut client = if manager.try_connect_existing().is_some() {
-            // VM was already running — don't stop it when we're done
+        let manager =
+            AgentManager::for_vm_with_sizes(&self.name, record.storage_gb, record.overlay_gb)?;
+
+        let started_for_query = if manager.try_connect_existing().is_some() {
             manager.detach();
-            AgentClient::connect_with_retry(manager.vsock_socket())?
+            false
         } else {
-            println!("Starting machine to query storage...");
+            if self.json {
+                eprintln!("Starting machine '{}' to query storage...", self.name);
+            } else {
+                println!("Starting machine '{}' to query storage...", self.name);
+            }
             manager.start()?;
-            AgentClient::connect_with_retry(manager.vsock_socket())?
+            true
         };
+        let mut client = AgentClient::connect_with_retry(manager.vsock_socket())?;
 
         let status = client.storage_status()?;
         let images = client.list_images()?;
@@ -1689,6 +2062,10 @@ impl ImagesCmd {
             }
         }
 
+        if started_for_query {
+            let _ = manager.stop();
+        }
+
         Ok(())
     }
 }
@@ -1703,11 +2080,15 @@ impl ImagesCmd {
 /// Use --dry-run to see what would be removed without actually deleting.
 ///
 /// Examples:
-///   smolvm machine prune --dry-run
-///   smolvm machine prune
-///   smolvm machine prune --all
+///   smolvm machine prune --name myvm --dry-run
+///   smolvm machine prune --name myvm
+///   smolvm machine prune --name myvm --all
 #[derive(Args, Debug)]
 pub struct PruneCmd {
+    /// Machine to prune
+    #[arg(long, required = true, value_name = "NAME")]
+    pub name: String,
+
     /// Show what would be removed without actually removing
     #[arg(long)]
     pub dry_run: bool,
@@ -1719,17 +2100,36 @@ pub struct PruneCmd {
 
 impl PruneCmd {
     pub fn run(self) -> smolvm::Result<()> {
-        let manager = AgentManager::new_default()?;
+        // Validate VM exists before creating storage (for_vm creates dirs).
+        let db = smolvm::db::SmolvmDb::open()?;
+        let record = db.get_vm(&self.name)?.ok_or_else(|| {
+            smolvm::Error::config("prune", format!("machine '{}' not found", self.name))
+        })?;
 
-        if manager.try_connect_existing().is_some() {
+        let manager =
+            AgentManager::for_vm_with_sizes(&self.name, record.storage_gb, record.overlay_gb)?;
+
+        // Regular prune (unreferenced layers only) is safe on a running VM —
+        // referenced layers can't be collected. --all deletes manifests for
+        // layers that may be in active use, so it requires a stop first.
+        let already_running = manager.try_connect_existing().is_some();
+        let started_for_prune;
+
+        if already_running && self.all {
+            manager.detach();
             return Err(smolvm::Error::agent(
                 "prune",
-                "cannot prune while the machine is running. Stop it first with 'smolvm machine stop'",
+                format!("cannot prune --all while machine '{}' is running. Stop it first with: smolvm machine stop --name {}", self.name, self.name),
             ));
+        } else if already_running {
+            started_for_prune = false;
+            manager.detach();
+        } else {
+            println!("Starting machine...");
+            manager.start()?;
+            started_for_prune = true;
         }
 
-        println!("Starting machine...");
-        manager.start()?;
         let mut client = AgentClient::connect_with_retry(manager.vsock_socket())?;
 
         if self.all {
@@ -1758,12 +2158,16 @@ impl PruneCmd {
                 }
             } else {
                 println!("Removing all cached images...");
-                let freed = client.garbage_collect(false)?;
-                println!("Freed {} of unreferenced layers", format_bytes(freed));
+                let freed = client.garbage_collect(false, true)?;
+                println!(
+                    "Removed {} images, freed {}",
+                    images.len(),
+                    format_bytes(freed)
+                );
             }
         } else if self.dry_run {
             println!("Scanning for unreferenced layers...");
-            let would_free = client.garbage_collect(true)?;
+            let would_free = client.garbage_collect(true, false)?;
 
             if would_free > 0 {
                 println!(
@@ -1775,13 +2179,19 @@ impl PruneCmd {
             }
         } else {
             println!("Removing unreferenced layers...");
-            let freed = client.garbage_collect(false)?;
+            let freed = client.garbage_collect(false, false)?;
 
             if freed > 0 {
                 println!("Freed {}", format_bytes(freed));
             } else {
                 println!("No unreferenced layers to remove.");
             }
+        }
+
+        // Only stop the VM if we started it for this prune operation.
+        // If the user's machine was already running, leave it running.
+        if started_for_prune {
+            let _ = manager.stop();
         }
 
         Ok(())
@@ -1842,7 +2252,7 @@ impl CpCmd {
             .and_then(|r| r.image.clone())
         {
             let overlay_id = format!("persistent-{}", machine_name);
-            let _ = client.prepare_overlay(&image, &overlay_id);
+            client.prepare_overlay(&image, &overlay_id)?;
         }
 
         if is_upload {

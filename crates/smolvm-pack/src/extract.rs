@@ -73,7 +73,20 @@ fn safe_unpack<R: Read>(archive: &mut tar::Archive<R>, dest: &Path) -> std::io::
                                 ),
                             ));
                         }
+                        // Skip hardlinks whose target was skipped (e.g.,
+                        // overlayfs whiteout char devices). The target does
+                        // not exist on disk, so creating the hardlink would
+                        // fail and abort the rest of extraction.
+                        if !normalized.exists() {
+                            continue;
+                        }
                     }
+                }
+                tar::EntryType::Char | tar::EntryType::Block => {
+                    // Device nodes appear in overlayfs upper-layer exports from
+                    // Debian-based images. They cannot be created without root
+                    // and are not needed in the host-side extracted cache.
+                    continue;
                 }
                 other => {
                     return Err(std::io::Error::new(
@@ -374,7 +387,17 @@ pub fn extract_sidecar(
         remove_dir_all_writable(cache_dir)?;
     }
 
-    extract_sidecar_inner(sidecar_path, cache_dir, footer, debug)
+    let result = extract_sidecar_inner(sidecar_path, cache_dir, footer, debug);
+
+    // If extraction failed mid-stream, partially extracted files remain on
+    // disk without a completion marker. Subsequent retries hit the same
+    // error at the same tar entry, never completing. Clean up the partial
+    // directory so the next attempt starts fresh.
+    if result.is_err() && cache_dir.exists() && !is_extracted(cache_dir) {
+        let _ = fs::remove_dir_all(cache_dir);
+    }
+
+    result
     // Lock released on drop of lock_file
 }
 
@@ -1640,5 +1663,227 @@ mod tests {
             result.unwrap_err().to_string().contains("disallowed type"),
             "error should mention disallowed type"
         );
+    }
+
+    #[test]
+    fn test_safe_unpack_skips_char_and_block_devices() {
+        // Char/Block entries appear in overlayfs exports from Debian images
+        // (e.g., update-alternatives). They should be skipped, not rejected.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let dest_raw = temp_dir.path().join("out");
+        fs::create_dir_all(&dest_raw).unwrap();
+        let dest = dest_raw.canonicalize().unwrap();
+
+        let mut builder = tar::Builder::new(Vec::new());
+
+        // Regular file before device entries
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_size(5);
+        header.set_mode(0o644);
+        header.set_path("before.txt").unwrap();
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "before.txt", &b"hello"[..])
+            .unwrap();
+
+        // Char device entry (should be skipped)
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Char);
+        header.set_size(0);
+        header.set_mode(0o644);
+        header.set_path("etc/alternatives/pager.1.gz").unwrap();
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "etc/alternatives/pager.1.gz", &b""[..])
+            .unwrap();
+
+        // Block device entry (should be skipped)
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Block);
+        header.set_size(0);
+        header.set_mode(0o644);
+        header.set_path("dev/sda").unwrap();
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "dev/sda", &b""[..])
+            .unwrap();
+
+        // Regular file after device entries (must survive)
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_size(5);
+        header.set_mode(0o644);
+        header.set_path("after.txt").unwrap();
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "after.txt", &b"world"[..])
+            .unwrap();
+
+        let tar_data = builder.into_inner().unwrap();
+
+        let mut archive = tar::Archive::new(tar_data.as_slice());
+        let result = safe_unpack(&mut archive, &dest);
+        assert!(
+            result.is_ok(),
+            "Char/Block entries should be skipped: {:?}",
+            result.err()
+        );
+
+        // Files before AND after device entries are extracted
+        assert_eq!(
+            fs::read_to_string(dest.join("before.txt")).unwrap(),
+            "hello"
+        );
+        assert_eq!(fs::read_to_string(dest.join("after.txt")).unwrap(), "world");
+
+        // Device entries are not created
+        assert!(!dest.join("etc/alternatives/pager.1.gz").exists());
+        assert!(!dest.join("dev/sda").exists());
+    }
+
+    #[test]
+    fn test_safe_unpack_skips_hardlink_to_whiteout() {
+        // Overlayfs exports from Fedora produce hardlinks to char-device
+        // whiteout entries (e.g., .build-id symlinks referencing replaced
+        // base-layer files). The whiteout is skipped, so the hardlink target
+        // doesn't exist — the hardlink must be skipped too.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let dest_raw = temp_dir.path().join("out");
+        fs::create_dir_all(&dest_raw).unwrap();
+        let dest = dest_raw.canonicalize().unwrap();
+
+        let mut builder = tar::Builder::new(Vec::new());
+
+        // Char device whiteout (will be skipped)
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Char);
+        header.set_size(0);
+        header.set_mode(0o000);
+        header.set_path("usr/lib/.build-id/84/target").unwrap();
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "usr/lib/.build-id/84/target", &b""[..])
+            .unwrap();
+
+        // Hardlink to the skipped whiteout (should also be skipped)
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Link);
+        header.set_size(0);
+        header.set_mode(0o000);
+        header.set_path("usr/lib/.build-id/d9/link").unwrap();
+        header.set_link_name("usr/lib/.build-id/84/target").unwrap();
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "usr/lib/.build-id/d9/link", &b""[..])
+            .unwrap();
+
+        // Regular file after (must survive)
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_size(2);
+        header.set_mode(0o644);
+        header.set_path("ok.txt").unwrap();
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "ok.txt", &b"ok"[..])
+            .unwrap();
+
+        let tar_data = builder.into_inner().unwrap();
+
+        let mut archive = tar::Archive::new(tar_data.as_slice());
+        let result = safe_unpack(&mut archive, &dest);
+        assert!(
+            result.is_ok(),
+            "hardlink to skipped whiteout should be skipped: {:?}",
+            result.err()
+        );
+
+        // Whiteout and hardlink are not created
+        assert!(!dest.join("usr/lib/.build-id/84/target").exists());
+        assert!(!dest.join("usr/lib/.build-id/d9/link").exists());
+        // Regular file survives
+        assert_eq!(fs::read_to_string(dest.join("ok.txt")).unwrap(), "ok");
+    }
+
+    #[test]
+    fn test_safe_unpack_readonly_parent_dir_does_not_block_children() {
+        // Reproduces the Fedora extraction bug: a mode-555 directory entry
+        // appears before its children in the tar. Without deferred permissions,
+        // creating files inside the read-only directory fails.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let dest_raw = temp_dir.path().join("out");
+        fs::create_dir_all(&dest_raw).unwrap();
+        let dest = dest_raw.canonicalize().unwrap();
+
+        let mut builder = tar::Builder::new(Vec::new());
+
+        // Parent directory with restrictive mode (read-only, no write)
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Directory);
+        header.set_size(0);
+        header.set_mode(0o555); // read + execute only, no write
+        header.set_path("usr/lib64/pm-utils/").unwrap();
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "usr/lib64/pm-utils/", &b""[..])
+            .unwrap();
+
+        // Child directory inside the read-only parent
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Directory);
+        header.set_size(0);
+        header.set_mode(0o555);
+        header.set_path("usr/lib64/pm-utils/module.d/").unwrap();
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "usr/lib64/pm-utils/module.d/", &b""[..])
+            .unwrap();
+
+        // File inside the nested read-only directory
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_size(4);
+        header.set_mode(0o644);
+        header
+            .set_path("usr/lib64/pm-utils/module.d/test.conf")
+            .unwrap();
+        header.set_cksum();
+        builder
+            .append_data(
+                &mut header,
+                "usr/lib64/pm-utils/module.d/test.conf",
+                &b"data"[..],
+            )
+            .unwrap();
+
+        let tar_data = builder.into_inner().unwrap();
+
+        let mut archive = tar::Archive::new(tar_data.as_slice());
+        let result = safe_unpack(&mut archive, &dest);
+        assert!(
+            result.is_ok(),
+            "read-only parent should not block children: {:?}",
+            result.err()
+        );
+
+        // Child directory and file must exist
+        assert!(dest.join("usr/lib64/pm-utils/module.d").is_dir());
+        assert_eq!(
+            fs::read_to_string(dest.join("usr/lib64/pm-utils/module.d/test.conf")).unwrap(),
+            "data"
+        );
+
+        // Final permissions should be restored to the tar's mode (555)
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(dest.join("usr/lib64/pm-utils"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o555, "deferred directory mode should be 555");
+        }
     }
 }
