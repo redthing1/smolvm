@@ -479,29 +479,30 @@ impl RunCmd {
         // (image:tag, registry/image) here avoids an unnecessary boot round-trip.
         {
             let resolved_image = self.image.as_deref().or(params.image.as_deref());
-            if resolved_image.is_none() && !self.command.is_empty() {
-                if is_likely_image_ref(&self.command[0]) {
-                    let cmd0 = &self.command[0];
-                    // Strip the "--" separator that trailing_var_arg includes
-                    // in the vec so the suggestion doesn't show a double "--".
-                    let rest: Vec<&str> = self.command[1..]
-                        .iter()
-                        .filter(|s| s.as_str() != "--")
-                        .map(|s| s.as_str())
-                        .collect();
-                    let suggestion = if rest.is_empty() {
-                        format!("smolvm machine run --image {cmd0}")
-                    } else {
-                        format!("smolvm machine run --image {cmd0} -- {}", rest.join(" "))
-                    };
-                    return Err(Error::config(
-                        "machine run",
-                        format!(
-                            "'{cmd0}' looks like a container image reference, not a command.\n\
-                             To run a container, use --image:\n  {suggestion}"
-                        ),
-                    ));
-                }
+            if resolved_image.is_none()
+                && !self.command.is_empty()
+                && is_likely_image_ref(&self.command[0])
+            {
+                let cmd0 = &self.command[0];
+                // Strip the "--" separator that trailing_var_arg includes
+                // in the vec so the suggestion doesn't show a double "--".
+                let rest: Vec<&str> = self.command[1..]
+                    .iter()
+                    .filter(|s| s.as_str() != "--")
+                    .map(|s| s.as_str())
+                    .collect();
+                let suggestion = if rest.is_empty() {
+                    format!("smolvm machine run --image {cmd0}")
+                } else {
+                    format!("smolvm machine run --image {cmd0} -- {}", rest.join(" "))
+                };
+                return Err(Error::config(
+                    "machine run",
+                    format!(
+                        "'{cmd0}' looks like a container image reference, not a command.\n\
+                         To run a container, use --image:\n  {suggestion}"
+                    ),
+                ));
             }
         }
 
@@ -919,8 +920,8 @@ impl RunCmd {
                 } else {
                     // Capture for error context before command is moved into vm_exec.
                     let cmd0 = command.first().cloned().unwrap_or_default();
-                    let (exit_code, stdout, stderr) =
-                        client.vm_exec(command, env, params.workdir.clone(), self.timeout)
+                    let (exit_code, stdout, stderr) = client
+                        .vm_exec(command, env, params.workdir.clone(), self.timeout)
                         .map_err(|e| {
                             // In bare VM mode a spawn ENOENT often means the user
                             // forgot --image and passed the image name as a positional.
@@ -1001,9 +1002,7 @@ mod tests {
     // cases before a VM is booted.
     #[test]
     fn run_image_ref_as_positional_lands_in_command_vec() {
-        let cli = TestMachineCli::parse_from([
-            "machine", "run", "ubuntu:22.04", "--", "bash",
-        ]);
+        let cli = TestMachineCli::parse_from(["machine", "run", "ubuntu:22.04", "--", "bash"]);
         let MachineCmd::Run(cmd) = cli.command else {
             panic!("expected machine run command");
         };
