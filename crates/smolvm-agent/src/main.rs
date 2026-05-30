@@ -2742,6 +2742,36 @@ fn handle_interactive_run(
 #[cfg(target_os = "linux")]
 const CONSOLE_SOCKET_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// Resolve the command for a container run.
+///
+/// If the caller supplied a command, use it verbatim. Otherwise fall back to
+/// the image's OCI `ENTRYPOINT` + `CMD` (read from the stored image config),
+/// so an image can run its own init without the caller having to know it.
+/// Errors if no command was given and the image defines neither.
+#[cfg(target_os = "linux")]
+fn resolve_image_command(
+    image: &str,
+    command: Vec<String>,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    if !command.is_empty() {
+        return Ok(command);
+    }
+    match storage::query_image(image)? {
+        Some(info) => {
+            let mut resolved = info.entrypoint;
+            resolved.extend(info.cmd);
+            if resolved.is_empty() {
+                return Err(format!(
+                    "no command given and image '{image}' defines no entrypoint or cmd"
+                )
+                .into());
+            }
+            Ok(resolved)
+        }
+        None => Err(format!("image not found: {image}").into()),
+    }
+}
+
 /// Write an OCI bundle (`config.json`) and return a freshly generated container ID.
 ///
 /// Shared by [`handle_run_detached`] and [`spawn_interactive_command`] to avoid
@@ -2810,7 +2840,7 @@ fn handle_run_detached(
 
     ensure_storage_mounted();
 
-    let (image, command, env, workdir, user, mounts, persistent_overlay_id) = match request {
+    let (image, mut command, env, workdir, user, mounts, persistent_overlay_id) = match request {
         AgentRequest::Run {
             image,
             command,
@@ -2838,14 +2868,9 @@ fn handle_run_detached(
         }
     };
 
-    // Validate inputs before creating any overlay state.
-    if command.is_empty() {
-        send_response(
-            stream,
-            &AgentResponse::error("empty command", error_codes::INVALID_REQUEST),
-        )?;
-        return Ok(());
-    }
+    // An empty command is allowed here: it means "run the image's own
+    // ENTRYPOINT/CMD". We resolve it from the image config below, after the
+    // image has been prepared (so its config is guaranteed present).
 
     let overlay_id = match persistent_overlay_id {
         Some(id) => id,
@@ -2875,6 +2900,23 @@ fn handle_run_detached(
             return Ok(());
         }
     };
+
+    // Resolve the command from the image's OCI ENTRYPOINT+CMD when the caller
+    // gave none — this is what lets service-style images (whose ENTRYPOINT
+    // orchestrates a supervised stack) run as their authors intended.
+    if command.is_empty() {
+        command = match resolve_image_command(&image, command) {
+            Ok(c) => c,
+            Err(e) => {
+                send_response(
+                    stream,
+                    &AgentResponse::error(e.to_string(), error_codes::INVALID_REQUEST),
+                )?;
+                return Ok(());
+            }
+        };
+        info!(image = %image, command = ?command, "resolved command from image config");
+    }
 
     if let Err(e) = storage::setup_mounts(&prepared.rootfs_path, &mounts) {
         send_response(

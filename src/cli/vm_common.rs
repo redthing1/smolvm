@@ -753,24 +753,27 @@ pub fn start_vm_named(
     }
 
     if let Some(ref img) = record.image {
-        // Image-based machine: start background CMD if configured.
+        // Image-based machine: launch the workload container in the background.
+        // The command is the user-configured entrypoint+cmd if set; otherwise
+        // it is left empty and the agent resolves the image's own
+        // ENTRYPOINT+CMD. This lets service-style images (which orchestrate a
+        // supervised stack from their entrypoint) start as their authors
+        // intended, not just images given an explicit command.
         let mut cmd = record.entrypoint.clone();
         cmd.extend(record.cmd.clone());
-        if !cmd.is_empty() {
-            let mount_bindings =
-                crate::cli::parsers::record_mounts_to_runconfig_bindings(&record.mounts);
-            let bg_config = smolvm::agent::RunConfig::new(img, cmd)
-                .with_env(record.env.clone())
-                .with_workdir(record.workdir.clone())
-                .with_user(record.user.clone())
-                .with_mounts(mount_bindings)
-                .with_persistent_overlay(Some(name.to_string()));
-            if let Err(e) = client.run_container_detached(bg_config) {
-                if let Err(stop_err) = manager.stop() {
-                    tracing::warn!(error = %stop_err, "failed to stop machine after CMD launch failure");
-                }
-                return Err(smolvm::Error::agent("start background CMD", format!("{e}")));
+        let mount_bindings =
+            crate::cli::parsers::record_mounts_to_runconfig_bindings(&record.mounts);
+        let bg_config = smolvm::agent::RunConfig::new(img, cmd)
+            .with_env(record.env.clone())
+            .with_workdir(record.workdir.clone())
+            .with_user(record.user.clone())
+            .with_mounts(mount_bindings)
+            .with_persistent_overlay(Some(name.to_string()));
+        if let Err(e) = client.run_container_detached(bg_config) {
+            if let Err(stop_err) = manager.stop() {
+                tracing::warn!(error = %stop_err, "failed to stop machine after CMD launch failure");
             }
+            return Err(smolvm::Error::agent("start background CMD", format!("{e}")));
         }
         println!("Machine '{}' running (PID: {})", name, pid.unwrap_or(0));
     } else {
