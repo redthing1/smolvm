@@ -1034,10 +1034,11 @@ pub fn stop_vm_named(name: &str) -> smolvm::Result<()> {
                 println!("Stopping machine '{}'...", name);
                 manager.stop()?;
                 println!("Machine '{}' stopped", name);
-            } else {
-                println!("Machine '{}' not found or not running", name);
+                return Ok(());
             }
-            return Ok(());
+            // Not in config and no running VM with this name — genuinely
+            // not found. Exit non-zero, consistent with status/start/delete.
+            return Err(smolvm::Error::vm_not_found(name));
         }
     };
 

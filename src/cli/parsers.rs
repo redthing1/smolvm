@@ -27,6 +27,16 @@ pub fn parse_gpu_vram_mib(s: &str) -> Result<u32, String> {
     Ok(v)
 }
 
+/// Parse and validate an image reference. Rejects empty/whitespace-only
+/// values at CLI parse time so `--image ""` errors immediately instead of
+/// creating an unusable machine that only fails once the VM starts.
+pub fn parse_image(s: &str) -> Result<String, String> {
+    if s.trim().is_empty() {
+        return Err("image reference must not be empty".to_string());
+    }
+    Ok(s.to_string())
+}
+
 // Env parsing delegated to the library.
 pub use smolvm::util::{parse_env_list, parse_env_spec};
 

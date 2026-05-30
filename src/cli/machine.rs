@@ -12,7 +12,7 @@
 use crate::cli::flush_output;
 use crate::cli::format_bytes;
 use crate::cli::parsers::{
-    mounts_to_virtiofs_bindings, parse_cidr, parse_duration, parse_env_list,
+    mounts_to_virtiofs_bindings, parse_cidr, parse_duration, parse_env_list, parse_image,
 };
 use crate::cli::vm_common::{self, DeleteVmOptions};
 use clap::{Args, Subcommand};
@@ -237,7 +237,7 @@ impl MachineCmd {
 pub struct RunCmd {
     /// Container image (e.g., alpine, ubuntu:22.04, ghcr.io/org/image).
     /// Optional when a Smolfile provides the image, or for bare VM mode.
-    #[arg(short = 'I', long, value_name = "IMAGE")]
+    #[arg(short = 'I', long, value_name = "IMAGE", value_parser = parse_image)]
     pub image: Option<String>,
 
     /// Name a persistent machine when used with --detach.
@@ -1305,7 +1305,7 @@ pub struct CreateCmd {
     pub name: Option<String>,
 
     /// Container image (e.g., alpine, python:3.12-alpine)
-    #[arg(short = 'I', long, value_name = "IMAGE")]
+    #[arg(short = 'I', long, value_name = "IMAGE", value_parser = parse_image)]
     pub image: Option<String>,
 
     /// Number of virtual CPUs
@@ -2078,6 +2078,13 @@ pub struct DataDirCmd {
 
 impl DataDirCmd {
     pub fn run(self) -> smolvm::Result<()> {
+        // Error (exit 1) for a machine that does not exist, rather than
+        // printing a computed path for a name that was never created —
+        // consistent with `status`/`start`/`delete`.
+        let config = smolvm::config::SmolvmConfig::load()?;
+        if config.get_vm(&self.name).is_none() {
+            return Err(smolvm::Error::vm_not_found(&self.name));
+        }
         let dir = smolvm::agent::vm_data_dir(&self.name);
         println!("{}", dir.display());
         Ok(())
