@@ -682,14 +682,31 @@ pub fn fork_vm(golden: &str, clone: &str, clone_forkable: bool) -> smolvm::Resul
     std::fs::create_dir_all(&snapshot_dir)
         .map_err(|e| Error::agent("create clone dir", e.to_string()))?;
 
-    // Register the clone in the DB: same config as the golden, but with no
-    // host port forwards (they would collide with the still-running golden;
-    // per-clone network rejuvenation is future work) and no running-state.
+    // Register the clone in the DB with the golden's config, no running-state,
+    // and its port forwards remapped to fresh host ports. With the default TSI
+    // backend outbound is proxied per-process (each clone gets it for free, no
+    // guest MAC/IP involved); only inbound host ports must be made distinct so
+    // the clone is reachable without colliding with the still-running golden or
+    // sibling clones.
     let mut clone_rec = golden_rec.clone();
     clone_rec.name = clone.to_string();
-    clone_rec.ports.clear();
     clone_rec.pid = None;
     clone_rec.pid_start_time = None;
+    if !clone_rec.ports.is_empty() {
+        let mut remapped = Vec::with_capacity(clone_rec.ports.len());
+        for (golden_host, guest) in &clone_rec.ports {
+            match alloc_free_host_port() {
+                Some(h) => {
+                    eprintln!("  port {golden_host}->{guest} (golden) remapped to {h}->{guest} (clone)");
+                    remapped.push((h, *guest));
+                }
+                None => eprintln!(
+                    "  warning: could not allocate a host port for guest port {guest}; dropping it"
+                ),
+            }
+        }
+        clone_rec.ports = remapped;
+    }
     db.insert_vm(clone, &clone_rec)?;
 
     // Freeze the golden and write its snapshot (checkpoint + memfd manifest).
@@ -788,6 +805,15 @@ fn rejuvenate_clone(clone: &str) {
         ),
         Err(e) => eprintln!("Warning: clone '{clone}' rejuvenation failed: {e}"),
     }
+}
+
+/// Allocate a currently-free host TCP port by binding to port 0 and reading
+/// back the OS-assigned port. Used to give each clone distinct inbound forwards.
+fn alloc_free_host_port() -> Option<u16> {
+    std::net::TcpListener::bind(("127.0.0.1", 0))
+        .ok()
+        .and_then(|l| l.local_addr().ok())
+        .map(|addr| addr.port())
 }
 
 /// Read `hex_len/2` random bytes from the host RNG, hex-encoded. Used to seed
