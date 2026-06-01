@@ -1060,6 +1060,39 @@ mod tests {
     }
 
     #[test]
+    fn create_accepts_trailing_workload_command() {
+        let cli = TestMachineCli::parse_from([
+            "machine", "create", "golden", "--image", "alpine", "--", "echo", "hi",
+        ]);
+        let MachineCmd::Create(cmd) = cli.command else {
+            panic!("expected machine create command");
+        };
+        assert_eq!(cmd.name, Some("golden".to_string()));
+        assert_eq!(cmd.image, Some("alpine".to_string()));
+        // The trailing command is captured (clap may include the "--" separator).
+        let words: Vec<&str> = cmd
+            .command
+            .iter()
+            .map(String::as_str)
+            .filter(|s| *s != "--")
+            .collect();
+        assert_eq!(words, ["echo", "hi"]);
+    }
+
+    #[test]
+    fn create_without_command_leaves_command_empty() {
+        // Regression: adding the trailing COMMAND arg must not break the common
+        // no-command form `machine create <name> --net`.
+        let cli = TestMachineCli::parse_from(["machine", "create", "golden", "--net"]);
+        let MachineCmd::Create(cmd) = cli.command else {
+            panic!("expected machine create command");
+        };
+        assert_eq!(cmd.name, Some("golden".to_string()));
+        assert!(cmd.command.is_empty());
+        assert!(cmd.net);
+    }
+
+    #[test]
     fn is_likely_image_ref_classifies_correctly() {
         // Unambiguous image references
         assert!(is_likely_image_ref("ubuntu:22.04")); // image:tag
@@ -1428,6 +1461,13 @@ pub struct CreateCmd {
     /// Uses pre-extracted layers instead of pulling from a registry.
     #[arg(long, value_name = "PATH", conflicts_with_all = ["image", "smolfile"])]
     pub from: Option<PathBuf>,
+
+    /// Command to run as the machine's persistent workload (image machines).
+    /// Launched as a detached container on every `start`, so it stays running
+    /// (e.g. a pre-warmed browser to be forked). Without this, an image machine
+    /// boots to a bare agent and the image's CMD is not run.
+    #[arg(trailing_var_arg = true, value_name = "COMMAND")]
+    pub command: Vec<String>,
 }
 
 impl CreateCmd {
@@ -1451,8 +1491,8 @@ impl CreateCmd {
         let params = crate::cli::smolfile::build_create_params(
             name,
             self.image,
-            None,   // entrypoint: from Smolfile only
-            vec![], // cmd: from Smolfile only
+            None, // entrypoint: from Smolfile only
+            self.command, // persistent-workload command (detached container on start)
             self.cpus,
             self.mem,
             self.volume,
@@ -1652,7 +1692,7 @@ impl StartCmd {
             // so `machine fork` can later freeze this machine as a CoW base.
             vm_common::enable_forkable_env(&name);
         }
-        match vm_common::start_vm_named(&name, proxy, no_proxy) {
+        match vm_common::start_vm_named(&name, proxy, no_proxy, /* from_snapshot */ false) {
             Ok(()) => Ok(()),
             Err(smolvm::Error::VmNotFound { .. }) if !explicit_name => {
                 // Only fall back to creating a default VM when no --name was given.
@@ -2659,7 +2699,7 @@ impl MonitorCmd {
 
         if !manager.is_process_alive() {
             println!("Machine '{}' is not running, starting...", name);
-            vm_common::start_vm_named(&name, None, None)?;
+            vm_common::start_vm_named(&name, None, None, /* from_snapshot */ false)?;
         }
 
         println!(
@@ -2836,7 +2876,7 @@ impl MonitorCmd {
                         break;
                     }
 
-                    match vm_common::start_vm_named(&name, None, None) {
+                    match vm_common::start_vm_named(&name, None, None, /* from_snapshot */ false) {
                         Ok(()) => {
                             println!("  machine restarted");
                             last_start = std::time::Instant::now();

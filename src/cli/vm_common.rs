@@ -760,7 +760,7 @@ pub fn fork_vm(
         enable_forkable_env(clone);
     }
     eprintln!("Booting clone '{clone}' from snapshot...");
-    let result = start_vm_named(clone, None, None);
+    let result = start_vm_named(clone, None, None, /* from_snapshot */ true);
     std::env::remove_var("SMOLVM_SNAPSHOT_DIR");
     if result.is_ok() {
         rejuvenate_clone(clone);
@@ -842,6 +842,23 @@ fn host_random_hex(hex_len: usize) -> String {
 // Start
 // ============================================================================
 
+/// Resolve a machine's persistent-workload command, docker-style: use the
+/// machine's own `(entrypoint, cmd)` if it set either of them, otherwise fall
+/// back to the image's OCI `(entrypoint, cmd)`. Returns the `(entrypoint, cmd)`
+/// to persist and run. An explicit machine command always wins over the image's.
+pub(crate) fn default_workload_to_image(
+    record_entrypoint: Vec<String>,
+    record_cmd: Vec<String>,
+    image_entrypoint: &[String],
+    image_cmd: &[String],
+) -> (Vec<String>, Vec<String>) {
+    if !record_entrypoint.is_empty() || !record_cmd.is_empty() {
+        (record_entrypoint, record_cmd)
+    } else {
+        (image_entrypoint.to_vec(), image_cmd.to_vec())
+    }
+}
+
 /// Start a named machine that has a config record.
 ///
 /// Uses direct DB operations instead of SmolvmConfig::load() to avoid
@@ -851,12 +868,13 @@ pub fn start_vm_named(
     name: &str,
     proxy: Option<&str>,
     no_proxy: Option<&str>,
+    from_snapshot: bool,
 ) -> smolvm::Result<()> {
     use smolvm::Error;
 
     // Direct DB lookup — 1 read cycle instead of loading everything
     let db = SmolvmDb::open()?;
-    let record = db.get_vm(name)?.ok_or_else(|| Error::vm_not_found(name))?;
+    let mut record = db.get_vm(name)?.ok_or_else(|| Error::vm_not_found(name))?;
 
     // Resolve via the shared probe (PID + vsock ping). The plain
     // `actual_state()` is PID-only and would treat a zombie VMM
@@ -1045,6 +1063,28 @@ pub fn start_vm_named(
             return Err(e);
         }
 
+        // Docker-like default: if the machine has no command of its own, adopt
+        // the image's OCI entrypoint+cmd as its persistent workload so an image
+        // VM runs its image's program on start (and forked clones inherit it).
+        // Persisted here on first boot (where the image config is available) so
+        // later starts reuse it without re-pulling.
+        if let Some(info) = image_info.as_ref() {
+            let (ep, cmd) = default_workload_to_image(
+                record.entrypoint.clone(),
+                record.cmd.clone(),
+                &info.entrypoint,
+                &info.cmd,
+            );
+            if ep != record.entrypoint || cmd != record.cmd {
+                record.entrypoint = ep.clone();
+                record.cmd = cmd.clone();
+                let _ = db.update_vm(name, |r| {
+                    r.entrypoint = ep.clone();
+                    r.cmd = cmd.clone();
+                });
+            }
+        }
+
         // Mark init as completed so subsequent starts skip pull + init.
         // Done before workload start so a CMD failure doesn't re-trigger init.
         if !record.init.is_empty() || record.image.is_some() {
@@ -1061,33 +1101,43 @@ pub fn start_vm_named(
 
     if let Some(ref img) = record.image {
         // Image-based machine: launch the workload container in the background.
-        // The command is the user-configured entrypoint+cmd if set; otherwise
-        // it is left empty and the agent resolves the image's own
-        // ENTRYPOINT+CMD. This lets service-style images (which orchestrate a
-        // supervised stack from their entrypoint) start as their authors
-        // intended, not just images given an explicit command.
+        // An empty command → the agent resolves the image's own ENTRYPOINT+CMD,
+        // so service-style images start as their authors intended. But a clone
+        // booted from a fork snapshot already has the golden's workload running
+        // in its restored memory; relaunching here would double-manage the crun
+        // container and hang every later `machine exec`, so skip the (re)launch
+        // entirely when restoring from a snapshot — the forked container is
+        // inherited as-is.
         let mut cmd = record.entrypoint.clone();
         cmd.extend(record.cmd.clone());
-        let mount_bindings =
-            crate::cli::parsers::record_mounts_to_runconfig_bindings(&record.mounts);
-        let bg_config = smolvm::agent::RunConfig::new(img, cmd)
-            .with_env(exec_env.clone())
-            .with_workdir(record.workdir.clone())
-            .with_user(record.user.clone())
-            .with_mounts(mount_bindings)
-            .with_persistent_overlay(Some(name.to_string()));
-        if let Err(e) = client.run_container_detached(bg_config) {
-            if let Err(stop_err) = manager.stop() {
-                tracing::warn!(error = %stop_err, "failed to stop machine after CMD launch failure");
+        if !from_snapshot {
+            let mount_bindings =
+                crate::cli::parsers::record_mounts_to_runconfig_bindings(&record.mounts);
+            let bg_config = smolvm::agent::RunConfig::new(img, cmd)
+                .with_env(exec_env.clone())
+                .with_workdir(record.workdir.clone())
+                .with_user(record.user.clone())
+                .with_mounts(mount_bindings)
+                .with_persistent_overlay(Some(name.to_string()));
+            if let Err(e) = client.run_container_detached(bg_config) {
+                if let Err(stop_err) = manager.stop() {
+                    tracing::warn!(error = %stop_err, "failed to stop machine after CMD launch failure");
+                }
+                return Err(smolvm::Error::agent("start background CMD", format!("{e}")));
             }
-            return Err(smolvm::Error::agent("start background CMD", format!("{e}")));
+        } else {
+            tracing::info!(
+                "clone booted from snapshot: workload container inherited from fork, skipping relaunch"
+            );
         }
         println!("Machine '{}' running (PID: {})", name, pid.unwrap_or(0));
     } else {
-        // No image — bare VM mode. Run entrypoint+cmd if configured.
+        // No image — bare VM mode. Run entrypoint+cmd if configured. As with the
+        // image branch, a snapshot-restored clone already ran this on the golden
+        // (its effects are in the restored memory/disk), so don't re-run it.
         let mut bare_cmd = record.entrypoint.clone();
         bare_cmd.extend(record.cmd.clone());
-        if !bare_cmd.is_empty() {
+        if !bare_cmd.is_empty() && !from_snapshot {
             // Reuse the secrets already resolved into `exec_env` above — avoids
             // a second store load + decrypt and a duplicate audit-log record.
             // The plaintext stays in this vector and never touches the record/DB.
@@ -1939,6 +1989,39 @@ mod init_runner_tests {
             workdir: workdir.map(str::to_string),
             user: user.map(str::to_string),
         }
+    }
+
+    #[test]
+    fn default_workload_to_image_falls_back_to_image_when_machine_has_none() {
+        let (ep, cmd) = default_workload_to_image(
+            Vec::new(),
+            Vec::new(),
+            &["/entry".to_string()],
+            &["arg".to_string()],
+        );
+        assert_eq!(ep, ["/entry"]);
+        assert_eq!(cmd, ["arg"]);
+    }
+
+    #[test]
+    fn default_workload_to_image_prefers_explicit_machine_command() {
+        // An explicit machine command always wins over the image's defaults,
+        // even if only one of entrypoint/cmd is set.
+        let (ep, cmd) = default_workload_to_image(
+            Vec::new(),
+            vec!["own-cmd".to_string()],
+            &["/image-entry".to_string()],
+            &["image-arg".to_string()],
+        );
+        assert!(ep.is_empty());
+        assert_eq!(cmd, ["own-cmd"]);
+    }
+
+    #[test]
+    fn default_workload_to_image_empty_when_neither_has_a_command() {
+        let (ep, cmd) = default_workload_to_image(Vec::new(), Vec::new(), &[], &[]);
+        assert!(ep.is_empty());
+        assert!(cmd.is_empty());
     }
 
     #[test]
