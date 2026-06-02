@@ -405,6 +405,12 @@ pub struct CreateMachineRequest {
     /// Mutually exclusive with `image` and `from`.
     #[serde(default)]
     pub registry_ref: Option<String>,
+    /// Bearer credential (an OCI Distribution `identity_token`) to present when
+    /// pulling `registry_ref`. The control plane supplies a short-lived,
+    /// tenant-scoped token here so a node can fetch a tenant's private
+    /// `.smolmachine`. Takes precedence over any persisted registry credential.
+    #[serde(default)]
+    pub registry_identity_token: Option<String>,
 }
 
 /// Request to execute a command in a machine.

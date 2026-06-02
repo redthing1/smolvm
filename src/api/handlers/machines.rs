@@ -219,7 +219,8 @@ pub async fn create_machine(
     // If registry_ref is set, pull the artifact from the registry and treat as `from`
     let mut req = req;
     if let Some(ref registry_ref) = req.registry_ref.clone() {
-        let pulled_path = pull_from_registry(registry_ref).await?;
+        let pulled_path =
+            pull_from_registry(registry_ref, req.registry_identity_token.as_deref()).await?;
         req.from = Some(pulled_path);
         req.registry_ref = None;
     }
@@ -965,7 +966,10 @@ pub async fn resize_machine(
     Ok(Json(record_to_info(&name, &record)))
 }
 
-async fn pull_from_registry(registry_ref: &str) -> Result<String, ApiError> {
+async fn pull_from_registry(
+    registry_ref: &str,
+    identity_token: Option<&str>,
+) -> Result<String, ApiError> {
     let parsed = crate::registry::Reference::parse(registry_ref)
         .map_err(|e| ApiError::BadRequest(format!("invalid registry reference: {}", e)))?;
 
@@ -988,7 +992,11 @@ async fn pull_from_registry(registry_ref: &str) -> Result<String, ApiError> {
 
     let mut client = smolvm_registry::RegistryClient::new(base_url);
 
-    if let Some(entry) = settings.machines.registries.get(effective_registry) {
+    // A request-supplied identity token (the control plane's short-lived,
+    // tenant-scoped pull token) takes precedence over any persisted credential.
+    if let Some(token) = identity_token {
+        client = client.with_identity_token(token.to_string());
+    } else if let Some(entry) = settings.machines.registries.get(effective_registry) {
         if let Some(ref token) = entry.identity_token {
             client = client.with_identity_token(token.clone());
         }
