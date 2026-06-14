@@ -266,11 +266,40 @@ impl ServeStartCmd {
     /// acceptor performs the handshake + client-cert verification configured in
     /// `tls_config`; graceful shutdown is driven through its `Handle` (the
     /// `axum::serve` graceful-shutdown future doesn't apply here).
+    ///
+    /// Because mTLS locks the whole network port to CA-signed clients, we ALSO
+    /// bind a plain-HTTP listener on loopback (see `serve_tls::local_plain_addr`)
+    /// so the node's own agent can keep polling `/capacity` locally — it is not
+    /// an mTLS client and is unreachable from the network anyway.
     async fn serve_tcp_tls(
         addr: SocketAddr,
         app: Router,
         tls_config: std::sync::Arc<rustls::ServerConfig>,
     ) -> Result<()> {
+        // Loopback plain-HTTP door for the local node-agent.
+        if let Some(local_addr) = super::serve_tls::local_plain_addr(addr) {
+            if !local_addr.ip().is_loopback() {
+                return Err(smolvm::error::Error::config(
+                    "serve local addr",
+                    format!("SMOLVM_SERVE_LOCAL_ADDR {local_addr} must be loopback"),
+                ));
+            }
+            let local_listener = tokio::net::TcpListener::bind(local_addr)
+                .await
+                .map_err(smolvm::error::Error::Io)?;
+            let local_app = app.clone();
+            tracing::info!(address = %local_addr, "starting loopback HTTP door (local node-agent)");
+            println!(
+                "smolvm local API (loopback, plain) on http://{}",
+                local_addr
+            );
+            tokio::spawn(async move {
+                let _ = axum::serve(local_listener, local_app)
+                    .with_graceful_shutdown(shutdown_signal())
+                    .await;
+            });
+        }
+
         let rustls_config = axum_server::tls_rustls::RustlsConfig::from_config(tls_config);
         let handle = axum_server::Handle::new();
 

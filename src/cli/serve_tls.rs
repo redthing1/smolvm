@@ -39,6 +39,25 @@ pub fn require_mtls() -> bool {
     )
 }
 
+/// Loopback plain-HTTP address for the **local** node-agent when the main port
+/// runs mTLS. mTLS locks the whole network port to CA-signed clients, but the
+/// node's own agent polls `/capacity` locally over plain HTTP — so we open a
+/// second door bound to loopback only (unreachable from the network). Defaults
+/// to `127.0.0.1:<main_port + 1>`; override with `SMOLVM_SERVE_LOCAL_ADDR`.
+/// Returns `None` only if an override is set but unparseable.
+pub fn local_plain_addr(main: std::net::SocketAddr) -> Option<std::net::SocketAddr> {
+    match std::env::var("SMOLVM_SERVE_LOCAL_ADDR")
+        .ok()
+        .filter(|v| !v.is_empty())
+    {
+        Some(v) => v.parse().ok(),
+        None => Some(std::net::SocketAddr::from((
+            std::net::Ipv4Addr::LOCALHOST,
+            main.port().wrapping_add(1),
+        ))),
+    }
+}
+
 fn env_path(name: &str) -> Option<PathBuf> {
     std::env::var_os(name)
         .filter(|v| !v.is_empty())
@@ -166,6 +185,25 @@ mod tests {
         let err = resolve_tls().unwrap_err();
         assert!(err.contains("fail-closed"), "{err}");
         clear();
+    }
+
+    #[test]
+    fn local_plain_addr_defaults_to_loopback_port_plus_one() {
+        let _g = lock();
+        std::env::remove_var("SMOLVM_SERVE_LOCAL_ADDR");
+        let main: std::net::SocketAddr = "0.0.0.0:8080".parse().unwrap();
+        let local = local_plain_addr(main).unwrap();
+        assert!(local.ip().is_loopback());
+        assert_eq!(local.port(), 8081);
+    }
+
+    #[test]
+    fn local_plain_addr_honors_override() {
+        let _g = lock();
+        std::env::set_var("SMOLVM_SERVE_LOCAL_ADDR", "127.0.0.1:9999");
+        let local = local_plain_addr("0.0.0.0:8080".parse().unwrap()).unwrap();
+        assert_eq!(local.port(), 9999);
+        std::env::remove_var("SMOLVM_SERVE_LOCAL_ADDR");
     }
 
     #[test]
