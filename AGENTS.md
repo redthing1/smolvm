@@ -42,6 +42,13 @@ smolvm pack create --image python:3.12-alpine -o ./my-python
 smolvm machine create --name my-vm --from ./my-python.smolmachine
 smolvm machine start --name my-vm
 smolvm machine exec --name my-vm -- pip install requests
+
+# Use local container images (CI, air-gapped, fast iteration)
+docker save myapp:latest -o myapp.tar
+smolvm machine run --image ./myapp.tar -- ./app           # from a docker/podman save archive
+docker save myapp:latest | smolvm machine run --image - -- ./app   # from stdin
+smolvm machine run --image ./rootfs/ -- ./app             # from an unpacked rootfs dir
+smolvm machine create --name myvm --image ./myapp.tar     # persistent, from a local archive
 ```
 
 ## When to Use What
@@ -54,6 +61,7 @@ smolvm machine exec --name my-vm -- pip install requests
 | Persistent dev environment | `machine create` → `machine start` → `machine exec` |
 | Ship software as a binary | `smolvm pack create --image IMAGE -o OUTPUT` |
 | Fast persistent machine from packed artifact | `machine create --name NAME --from FILE.smolmachine` |
+| Use local container images (CI / air-gapped / fast iteration) | `--image ./archive.tar`, `--image -` (stdin), or `--image ./rootfs/` |
 | Use git/ssh with private keys safely | Add `--ssh-agent` to run or create |
 | Inject API keys / tokens without putting them on the command line | `--secret-env`/`--secret-file` flags or Smolfile `[secrets]` |
 | Minimal VM without image | `smolvm machine run -s Smolfile` (bare VM) |
@@ -119,11 +127,32 @@ python-dev@sha256:abcdef0123...                   # digest reference (immutable)
 
 Default registry: `registry.smolmachines.com`. Digest references require `sha256:` followed by exactly 64 hex characters.
 
+### Local container images
+
+`--image` also accepts a local source — useful for CI, air-gapped hosts, and fast
+local iteration. smolvm stays a microVM runtime and delegates all image work
+(flatten, whiteouts, config) to container tooling (`crane`/`docker`/`podman`); the
+archive is flattened with `crane export`.
+
+```
+./image.tar  ./image.tar.gz  ./image.tgz   # a `docker save` / `podman save` archive (gzip ok)
+-                                           # the same archive streamed on stdin
+./rootfs/                                   # an already-unpacked root filesystem directory
+```
+
+A source is treated as local when it starts with `/`, `./`, `../`, is `-`, or ends in
+`.tar`/`.tar.gz`/`.tgz`; everything else is a registry reference (so bare `alpine`
+still pulls). Archives are cached content-addressed by hash and re-resolved on
+`machine start`. `--image -` cannot be combined with `-i`/`-t` (both read stdin).
+
+smolvm boots images, it does not build them: a Dockerfile passed to `--image` is
+rejected with a hint to build first (`docker build … && docker save … | … --image -`).
+
 ## Key Flags
 
 | Flag | Short | Used on | Description |
 |------|-------|---------|-------------|
-| `--image` | `-I` | run, create, pack create | OCI image |
+| `--image` | `-I` | run, create, pack create | OCI image, or a local source: a `docker save` archive (`./img.tar`, or `-` for stdin) or unpacked rootfs dir (`./rootfs/`) |
 | `--name` | `-n` | run, start, stop, status, exec, update | Machine name (default: "default") |
 | `--net` | | run, create | Enable outbound networking (off by default) |
 | `--gpu` | | run, create | Enable GPU acceleration (Vulkan via virtio-gpu) |

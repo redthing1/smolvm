@@ -68,6 +68,20 @@ smolvm pack create --image python:3.12-alpine -o ./python312
 # Python 3.12.x — isolated, no pyenv/venv/conda needed
 ```
 
+**Use local container images** — for CI, air-gapped hosts, and fast iteration. Feed `--image` a `docker save` / `podman save` archive, pipe one on stdin, or point it at an unpacked rootfs directory. Image work is delegated to your container tooling; smolvm just boots the result.
+
+```bash
+# build locally, run in the VM with no push/pull
+docker build -t myapp .
+docker save myapp | smolvm machine run --image - -- ./app
+
+# from an archive file (boots with no network)
+smolvm machine run --image ./myapp.tar -- ./app
+
+# from an already-unpacked rootfs directory
+smolvm machine run --image ./rootfs/ -- ./app
+```
+
 **Persistent machines for development** — create, stop, start. Installed packages survive restarts.
 
 ```bash

@@ -1095,7 +1095,7 @@ pub fn start_vm_named(
     // packed_layers_dir so the launcher mounts them via virtiofs — the guest uses
     // the pre-extracted layers instead of pulling, with no dependency on the
     // original bundle file. Shared with the API and embedded start paths.
-    let features = smolvm::agent::LaunchFeatures {
+    let mut features = smolvm::agent::LaunchFeatures {
         ssh_agent_socket,
         dns_filter_hosts: record.dns_filter_hosts.clone(),
         ..Default::default()
@@ -1104,6 +1104,18 @@ pub fn start_vm_named(
         &smolvm::agent::machine_layers_cache_dir(name),
         record.source_smolmachine.as_deref(),
     )?;
+    // A machine created from a local image archive/dir persists a `local:…`
+    // reference; re-derive its virtiofs mount dir so the guest assembles the
+    // rootfs from it instead of pulling.
+    if features.packed_layers_dir.is_none() {
+        if let Some(dir) = record
+            .image
+            .as_deref()
+            .and_then(smolvm::data::image_source::packed_layers_dir_for_ref)
+        {
+            features.packed_layers_dir = Some(dir);
+        }
+    }
 
     let _ = manager
         .ensure_running_with_full_config(mounts, ports, resources, features)
@@ -1134,7 +1146,12 @@ pub fn start_vm_named(
     // starts, skip both — image manifests/layers persist on the storage disk
     // and the container overlay is remounted (not recreated).
     if !record.init_completed {
-        let image_info = if record.source_smolmachine.is_some() {
+        let uses_packed_layers = record.source_smolmachine.is_some()
+            || record
+                .image
+                .as_deref()
+                .is_some_and(smolvm::data::image_source::is_local_ref);
+        let image_info = if uses_packed_layers {
             // Layers already mounted via virtiofs — no pull needed.
             None
         } else if let Some(ref image) = record.image {

@@ -458,6 +458,11 @@ fn create_packed_image_info(image: &str, packed_dir: &Path) -> Result<ImageInfo>
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     let architecture = "unknown".to_string();
 
+    // For a flattened local archive these come from the recovered image config;
+    // a .smolmachine has no config.json so they stay empty (its config lives in
+    // the PackManifest).
+    let (entrypoint, cmd, env, workdir, user) = read_packed_image_config(packed_dir);
+
     Ok(ImageInfo {
         reference: image.to_string(),
         digest: "packed".to_string(), // No real digest available for packed images
@@ -467,13 +472,255 @@ fn create_packed_image_info(image: &str, packed_dir: &Path) -> Result<ImageInfo>
         os: "linux".to_string(),
         layer_count: layer_dirs.len(),
         layers: layer_dirs,
-        // Packed mode: config is in the PackManifest, not the image
-        entrypoint: Vec::new(),
-        cmd: Vec::new(),
-        env: Vec::new(),
-        workdir: None,
-        user: None,
+        entrypoint,
+        cmd,
+        env,
+        workdir,
+        user,
     })
+}
+
+// =============================================================================
+// Local image archives (`docker save` / `podman save`)
+// =============================================================================
+//
+// smolvm delegates turning a saved-image archive into a rootfs to the bundled
+// `crane` (and `gunzip`/`tar`) rather than parsing OCI layers itself. The host
+// stages `archive.tar` into a content-addressed dir mounted via virtiofs as the
+// packed-layers dir; here we flatten it once into a rootfs on the writable
+// storage disk, recover the image config, and present it as a single packed
+// layer that the existing overlay path consumes.
+
+/// Filename the host stages the saved-image archive under.
+const ARCHIVE_FILE_NAME: &str = "archive.tar";
+/// Subdir the flattened rootfs is written to (a single packed "layer").
+const ARCHIVE_ROOTFS_DIR: &str = "0000_rootfs";
+/// Recovered image config (`crane config` output) beside the rootfs.
+const ARCHIVE_CONFIG_FILE: &str = "config.json";
+/// Marker written once a flatten completes, so restarts reuse it.
+const ARCHIVE_EXTRACTED_MARKER: &str = ".extracted";
+
+/// If `packed_dir` is a staged local image archive (it contains `archive.tar`),
+/// flatten it once into a rootfs on the storage disk and return that directory
+/// (holding `0000_rootfs/` + `config.json`). Returns `None` for an ordinary
+/// packed-layers dir (a `.smolmachine`'s pre-extracted layers).
+///
+/// The output is keyed by the virtiofs mount-point name (constant per VM, since
+/// `/storage` is per-machine), and the completion marker stores the archive's
+/// size+mtime signature. A start reuses the flatten only when that signature
+/// still matches, so a machine re-created from a different image on a reused
+/// disk re-flattens instead of booting the old rootfs. The marker is written
+/// last, so the image-info and overlay paths share one flatten within a start.
+fn ensure_archive_flattened(packed_dir: &Path) -> Result<Option<PathBuf>> {
+    let archive = packed_dir.join(ARCHIVE_FILE_NAME);
+    if !archive.exists() {
+        return Ok(None);
+    }
+    let key = packed_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("archive");
+    let out_base = Path::new(STORAGE_ROOT).join("image-archives").join(key);
+    let marker = out_base.join(ARCHIVE_EXTRACTED_MARKER);
+    let signature = archive_signature(&archive)?;
+    if std::fs::read_to_string(&marker).ok().as_deref() == Some(signature.as_str()) {
+        return Ok(Some(out_base));
+    }
+
+    // First flatten, or the archive changed under a reused disk: rebuild.
+    let _ = std::fs::remove_dir_all(&out_base);
+    let rootfs = out_base.join(ARCHIVE_ROOTFS_DIR);
+    std::fs::create_dir_all(&rootfs)?;
+    info!(archive = %archive.display(), rootfs = %rootfs.display(), "flattening local image archive");
+    flatten_archive(&archive, &rootfs)?;
+    // Recover the image config before writing the marker, so a later reuse can
+    // rely on config.json being present. A docker/podman `save` always carries
+    // one.
+    recover_archive_config(&archive, &out_base.join(ARCHIVE_CONFIG_FILE))?;
+    std::fs::write(&marker, signature)?;
+    Ok(Some(out_base))
+}
+
+/// A cheap content signature for a staged archive (size + mtime), used to
+/// invalidate a stale flatten when a reused disk's archive changed.
+fn archive_signature(archive: &Path) -> Result<String> {
+    let meta = std::fs::metadata(archive)?;
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    Ok(format!("{}:{}", meta.len(), mtime))
+}
+
+/// Feed an archive to `cmd`'s stdin, transparently `gunzip`-ing a gzipped outer
+/// archive. Returns the spawned `gunzip` child (if any) to wait on afterwards.
+fn pipe_archive_into(cmd: &mut Command, archive: &Path) -> Result<Option<std::process::Child>> {
+    let file = std::fs::File::open(archive)?;
+    if !is_gzip(archive)? {
+        cmd.stdin(Stdio::from(file));
+        return Ok(None);
+    }
+    let mut gunzip = Command::new("gunzip")
+        .arg("-c")
+        .stdin(file)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| StorageError::new(format!("failed to spawn gunzip: {e}")))?;
+    let out = gunzip
+        .stdout
+        .take()
+        .ok_or_else(|| StorageError::new("failed to capture gunzip stdout".to_string()))?;
+    cmd.stdin(Stdio::from(out));
+    Ok(Some(gunzip))
+}
+
+/// Flatten a `docker save` archive into `rootfs`, delegating to the bundled
+/// `crane export`. The flattened tar is a single layer with no whiteouts, so
+/// plain `tar -x` is sufficient (no per-layer handling needed).
+fn flatten_archive(archive: &Path, rootfs: &Path) -> Result<()> {
+    // crane export - - : read an image tarball from stdin, write a flat rootfs
+    // tar to stdout.
+    let mut crane = Command::new("crane");
+    crane
+        .args(["export", "-", "-"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let gunzip = pipe_archive_into(&mut crane, archive)?;
+
+    let mut crane_child = crane
+        .spawn()
+        .map_err(|e| StorageError::new(format!("failed to spawn crane export: {e}")))?;
+    let crane_out = crane_child
+        .stdout
+        .take()
+        .ok_or_else(|| StorageError::new("failed to capture crane stdout".to_string()))?;
+
+    let tar_out = Command::new("tar")
+        .arg("-x")
+        .arg("-C")
+        .arg(rootfs)
+        .stdin(Stdio::from(crane_out))
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|e| StorageError::new(format!("failed to run tar: {e}")))?;
+
+    let crane_status = crane_child
+        .wait()
+        .map_err(|e| StorageError::new(format!("failed to wait for crane: {e}")))?;
+    if let Some(mut g) = gunzip {
+        let _ = g.wait();
+    }
+
+    if !crane_status.success() {
+        return Err(StorageError::new(
+            "crane export failed (is this a docker/podman `save` archive?)".to_string(),
+        ));
+    }
+    if !tar_out.status.success() {
+        return Err(StorageError::new(format!(
+            "extracting flattened rootfs failed: {}",
+            String::from_utf8_lossy(&tar_out.stderr)
+        )));
+    }
+    Ok(())
+}
+
+/// Recover the image config (Entrypoint/Cmd/Env/…) from a `docker save` archive
+/// and write it to `dest`. The archive's `manifest.json` names the config blob
+/// under its `Config` key; both are small JSON members extracted with `tar`
+/// (image metadata, not layer/rootfs assembly — that stays delegated to crane).
+fn recover_archive_config(archive: &Path, dest: &Path) -> Result<()> {
+    let manifest_bytes = extract_tar_member(archive, "manifest.json")?;
+    let manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes)
+        .map_err(|e| StorageError::new(format!("parse archive manifest.json: {e}")))?;
+    let config_path = manifest[0]["Config"].as_str().ok_or_else(|| {
+        StorageError::new("archive manifest.json has no Config entry".to_string())
+    })?;
+    let config_bytes = extract_tar_member(archive, config_path)?;
+    std::fs::write(dest, &config_bytes)?;
+    Ok(())
+}
+
+/// Extract a single named member from an archive to memory via `tar -xO`,
+/// transparently `gunzip`-ing a gzipped outer archive.
+fn extract_tar_member(archive: &Path, member: &str) -> Result<Vec<u8>> {
+    let mut tar = Command::new("tar");
+    tar.args(["-x", "-O", "-f", "-"])
+        .arg(member)
+        .stderr(Stdio::null());
+    let gunzip = pipe_archive_into(&mut tar, archive)?;
+    let out = tar
+        .output()
+        .map_err(|e| StorageError::new(format!("failed to run tar: {e}")))?;
+    if let Some(mut g) = gunzip {
+        let _ = g.wait();
+    }
+    if !out.status.success() || out.stdout.is_empty() {
+        return Err(StorageError::new(format!(
+            "could not read '{member}' from archive"
+        )));
+    }
+    Ok(out.stdout)
+}
+
+/// Whether a file begins with the gzip magic bytes (`1f 8b`).
+fn is_gzip(path: &Path) -> Result<bool> {
+    use std::io::Read;
+    let mut magic = [0u8; 2];
+    match std::fs::File::open(path)?.read(&mut magic) {
+        Ok(2) => Ok(magic == [0x1f, 0x8b]),
+        _ => Ok(false),
+    }
+}
+
+/// Read `Entrypoint`/`Cmd`/`Env`/`WorkingDir`/`User` from a recovered image
+/// `config.json` (the `crane config` output) in `packed_dir`, defaulting to
+/// empty when absent — a `.smolmachine` has no such file.
+#[allow(clippy::type_complexity)]
+fn read_packed_image_config(
+    packed_dir: &Path,
+) -> (
+    Vec<String>,
+    Vec<String>,
+    Vec<String>,
+    Option<String>,
+    Option<String>,
+) {
+    let empty = (Vec::new(), Vec::new(), Vec::new(), None, None);
+    let Ok(content) = std::fs::read_to_string(packed_dir.join(ARCHIVE_CONFIG_FILE)) else {
+        return empty;
+    };
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) else {
+        return empty;
+    };
+    let cfg = &json["config"];
+    let string_list = |key: &str| -> Vec<String> {
+        cfg[key]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let non_empty = |key: &str| -> Option<String> {
+        cfg[key]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+    };
+    (
+        string_list("Entrypoint"),
+        string_list("Cmd"),
+        string_list("Env"),
+        non_empty("WorkingDir"),
+        non_empty("User"),
+    )
 }
 
 /// Error type for storage operations.
@@ -1213,6 +1460,11 @@ where
     // If packed layers are available, return synthetic image info
     if let Some(packed_dir) = get_packed_layers_dir() {
         info!(image = %image, "using packed layers, skipping network pull");
+        // A local image archive is flattened into a rootfs first; an ordinary
+        // packed-layers dir is used as-is.
+        if let Some(flattened) = ensure_archive_flattened(packed_dir)? {
+            return create_packed_image_info(image, &flattened);
+        }
         return create_packed_image_info(image, packed_dir);
     }
 
@@ -1506,6 +1758,16 @@ where
 pub fn query_image(image: &str) -> Result<Option<ImageInfo>> {
     let image = normalize_image_ref(image);
     let image = image.as_str();
+
+    // Packed layers (a `.smolmachine` or a staged local image archive/dir):
+    // synthesize image info without a registry manifest, mirroring the pull
+    // path. A local image archive is flattened into a rootfs first.
+    if let Some(packed_dir) = get_packed_layers_dir() {
+        let flattened = ensure_archive_flattened(packed_dir)?;
+        let effective = flattened.as_deref().unwrap_or(packed_dir);
+        return Ok(Some(create_packed_image_info(image, effective)?));
+    }
+
     let root = Path::new(STORAGE_ROOT);
     let manifest_path = root
         .join(MANIFESTS_DIR)
@@ -2023,7 +2285,11 @@ pub fn prepare_overlay(image: &str, workload_id: &str) -> Result<OverlayInfo> {
     // Check if we have packed layers available
     if let Some(packed_dir) = get_packed_layers_dir() {
         info!(image = %image, packed_dir = %packed_dir.display(), "using packed layers");
-        return prepare_overlay_from_packed(image, workload_id, packed_dir);
+        // A local image archive is flattened into a rootfs (a single packed
+        // layer) first; an ordinary packed-layers dir is used as-is.
+        let flattened = ensure_archive_flattened(packed_dir)?;
+        let effective = flattened.as_deref().unwrap_or(packed_dir);
+        return prepare_overlay_from_packed(image, workload_id, effective);
     }
 
     // Ensure image exists
@@ -2054,6 +2320,13 @@ fn prepare_overlay_from_packed(
     workload_id: &str,
     packed_dir: &Path,
 ) -> Result<OverlayInfo> {
+    // An unpacked-image directory IS the rootfs — one lowerdir, not its subdirs
+    // treated as separate layers.
+    if is_rootfs_dir(packed_dir) {
+        return OverlaySetup::new(workload_id)?
+            .execute_or_remount(vec![packed_dir.display().to_string()]);
+    }
+
     // Find layer directories in packed_dir
     // Packed layers are named by short digest (first 12 chars of sha256)
     let mut layer_dirs: Vec<PathBuf> = Vec::new();
@@ -2121,8 +2394,24 @@ fn get_image_lowerdirs(image: &str) -> Result<Vec<String>> {
         .collect())
 }
 
+/// Whether `dir` is itself a root filesystem (an unpacked-image directory,
+/// `--image ./rootfs/`) rather than a set of layer subdirs — detected by the
+/// presence of standard top-level rootfs directories. A `.smolmachine`'s
+/// packed-layers dir holds per-layer subdirs, not these, so it reads as false.
+fn is_rootfs_dir(dir: &Path) -> bool {
+    ["bin", "usr", "etc", "sbin"]
+        .iter()
+        .any(|d| dir.join(d).is_dir())
+}
+
 /// Build lowerdir list from pre-packed layer directories.
 fn get_packed_lowerdirs(packed_dir: &Path) -> Result<Vec<String>> {
+    // An unpacked-image directory IS the rootfs — one lowerdir, not its subdirs
+    // treated as separate layers.
+    if is_rootfs_dir(packed_dir) {
+        return Ok(vec![packed_dir.display().to_string()]);
+    }
+
     let mut layer_dirs: Vec<PathBuf> = Vec::new();
 
     let entries = std::fs::read_dir(packed_dir)
@@ -2451,9 +2740,13 @@ pub fn prepare_for_run_persistent(image: &str, overlay_id: &str) -> Result<Prepa
     validate_storage_id(overlay_id, "persistent overlay id")?;
     let workload_id = format!("persistent-{}", overlay_id);
 
-    // Resolve image layers (same logic as prepare_overlay)
+    // Resolve image layers (same logic as prepare_overlay). A local image
+    // archive is flattened into a rootfs first; a packed-layers dir is used
+    // as-is.
     let lowerdirs = if let Some(packed_dir) = get_packed_layers_dir() {
-        get_packed_lowerdirs(&packed_dir)?
+        let flattened = ensure_archive_flattened(packed_dir)?;
+        let effective = flattened.as_deref().unwrap_or(packed_dir);
+        get_packed_lowerdirs(effective)?
     } else {
         get_image_lowerdirs(image)?
     };

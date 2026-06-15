@@ -37,6 +37,12 @@
 ///            "ghcr.io/owner/repo:v1");
 /// ```
 pub fn normalize_image_ref(image: &str) -> String {
+    // Local image sources (host-resolved `local:<hash>` / `local-dir:<path>`)
+    // are not registry references — pass them through unchanged.
+    if image.starts_with("local:") || image.starts_with("local-dir:") {
+        return image.to_string();
+    }
+
     // 1. Resolve index.docker.io alias.
     let owned;
     let image = if let Some(rest) = image.strip_prefix("index.docker.io/") {

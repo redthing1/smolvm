@@ -585,6 +585,17 @@ impl RunCmd {
             (self.interactive, self.tty)
         };
 
+        // `--image -` consumes stdin to read the archive; `-i`/`-t` also bind
+        // stdin to the guest. They cannot both own stdin.
+        if self.image.as_deref() == Some("-") && (interactive || tty) {
+            return Err(smolvm::Error::config(
+                "machine run",
+                "`--image -` reads the image archive from stdin and cannot be \
+                 combined with -i/-t, which also use stdin.\n\
+                 Pipe the archive from a file instead: --image ./image.tar",
+            ));
+        }
+
         // Detect the common mistake of passing an image reference as a positional
         // argument instead of using --image.  clap's trailing_var_arg captures any
         // positional before "--" into `command`, so `smolvm machine run ubuntu:22.04
@@ -662,10 +673,34 @@ impl RunCmd {
             None
         };
 
+        // Resolve the image source on the host before launch: registry refs
+        // pass through to the guest pull; a local `docker save` archive or an
+        // unpacked rootfs directory is staged/validated and mounted via
+        // virtiofs (the `.smolmachine` packed-layers path), so no pull happens.
+        let raw_image = self.image.clone().or(params.image.clone());
+        let mut packed_layers_dir = None;
+        let image = match raw_image.as_deref() {
+            Some(img) => {
+                use smolvm::data::image_source::{classify, resolve, ResolvedImage};
+                match resolve(classify(img))? {
+                    ResolvedImage::Registry(reference) => Some(reference),
+                    ResolvedImage::Local {
+                        reference,
+                        packed_layers_dir: dir,
+                    } => {
+                        packed_layers_dir = Some(dir);
+                        Some(reference)
+                    }
+                }
+            }
+            None => None,
+        };
+        let uses_packed_layers = packed_layers_dir.is_some();
+
         let features = smolvm::agent::LaunchFeatures {
             ssh_agent_socket,
             dns_filter_hosts: params.dns_filter_hosts.clone(),
-            packed_layers_dir: None,
+            packed_layers_dir,
             extra_disks: Vec::new(),
         };
 
@@ -685,7 +720,7 @@ impl RunCmd {
                 params.cpus,
                 params.mem,
                 params.net,
-                self.image.clone().or(params.image.clone()),
+                image.clone(),
             );
         }
 
@@ -697,10 +732,11 @@ impl RunCmd {
         let sigint_guard = manager.child_pid().map(smolvm::process::SigintGuard::new);
 
         // Resolve image: CLI > Smolfile > None (bare VM)
-        let image = self.image.clone().or(params.image.clone());
-
-        // Pull image if one is specified
-        let image_info = if let Some(ref img) = image {
+        // Pull only registry images; a local source's layers are already
+        // mounted via virtiofs and the guest assembles its rootfs from them.
+        let image_info = if uses_packed_layers {
+            None
+        } else if let Some(ref img) = image {
             match crate::cli::pull_with_progress(
                 &mut client,
                 img,
@@ -1671,9 +1707,24 @@ impl CreateCmd {
             .name
             .unwrap_or_else(smolvm::util::generate_machine_name);
 
+        // Resolve a local image source (archive/dir) on the host now: stage it
+        // into the content-addressed cache and persist the resulting `local:…`
+        // reference, so `start` re-derives the mount dir without a registry
+        // pull. Registry refs pass through unchanged.
+        let image = match self.image.as_deref() {
+            Some(img) => {
+                use smolvm::data::image_source::{classify, resolve, ResolvedImage};
+                Some(match resolve(classify(img))? {
+                    ResolvedImage::Registry(reference) => reference,
+                    ResolvedImage::Local { reference, .. } => reference,
+                })
+            }
+            None => None,
+        };
+
         let params = crate::cli::smolfile::build_create_params(
             name,
-            self.image,
+            image,
             None,         // entrypoint: from Smolfile only
             self.command, // persistent-workload command (detached container on start)
             self.cpus,
