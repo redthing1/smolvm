@@ -1358,6 +1358,12 @@ fn extract_oci_layer<R: std::io::Read>(reader: R, dest: &Path) -> std::io::Resul
     let mut archive = tar::Archive::new(reader);
     archive.set_preserve_permissions(true);
     archive.set_preserve_mtime(true);
+    // Preserve the archive's uid/gid. The agent runs as root (CAP_CHOWN) so this
+    // chowns each entry to the image's intended owner; without it every file is
+    // owned by root, breaking images that ship non-root-owned paths (e.g. a
+    // `node`/`postgres` user's home or data dir). The previous busybox `tar`
+    // preserved ownership by default — the Rust-tar rewrite dropped it.
+    archive.set_preserve_ownerships(true);
     archive.set_overwrite(true);
 
     for entry in archive.entries()? {
