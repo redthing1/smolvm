@@ -60,10 +60,17 @@ pub fn plan_launch_network(
     // machines too. TSI's egress filter lives in libkrun and may not carry the
     // floor, so a default outbound-only tenant VM must not silently fall to TSI
     // on a fleet node. Outside fleet mode, no-ports VMs keep the lighter default.
+    //
+    // An explicit egress policy (--allow-cidr/--allow-host/--outbound-localhost-only)
+    // must also use virtio-net: its egress allow-list is enforced reliably by the
+    // host-side smolvm-network stack, whereas TSI's in-libkrun filter does not
+    // enforce it (verified: a non-allowed IP stays reachable under TSI). Falling
+    // to TSI here would make the egress flags a silent no-op — a security hole —
+    // so a policy forces virtio-net unless the caller explicitly picked a backend.
     let fleet_mode = std::env::var_os("SMOLVM_PUBLISH_ADDR").is_some();
     let backend = resources
         .network_backend
-        .unwrap_or(if has_ports || fleet_mode {
+        .unwrap_or(if has_ports || fleet_mode || has_cidr_policy || has_dns_filter {
             NetworkBackend::VirtioNet
         } else {
             NetworkBackend::Tsi
@@ -88,13 +95,24 @@ pub fn validate_requested_network_backend(
     dns_filter_hosts: Option<&[String]>,
     port_count: usize,
 ) -> crate::Result<()> {
-    // Mirror plan_launch_network's default: unset backend + ports ⇒ virtio-net.
-    // So only an EXPLICIT `--net-backend tsi` alongside ports is a misconfig.
-    let backend = resources.network_backend.unwrap_or(if port_count > 0 {
-        NetworkBackend::VirtioNet
-    } else {
-        NetworkBackend::Tsi
-    });
+    // An egress policy is only enforced under virtio-net; TSI would silently let
+    // it through.
+    let has_egress_policy = resources
+        .allowed_cidrs
+        .as_ref()
+        .is_some_and(|c| !c.is_empty())
+        || dns_filter_hosts.is_some_and(|h| !h.is_empty());
+
+    // Mirror plan_launch_network's default: unset backend + (ports OR egress
+    // policy) ⇒ virtio-net. So only an EXPLICIT `--net-backend tsi` alongside
+    // ports/egress is a misconfig.
+    let backend = resources
+        .network_backend
+        .unwrap_or(if port_count > 0 || has_egress_policy {
+            NetworkBackend::VirtioNet
+        } else {
+            NetworkBackend::Tsi
+        });
 
     // Published ports require the inbound path that only virtio-net has. With the
     // default above this only fires when the caller EXPLICITLY forced TSI + ports.
@@ -103,6 +121,15 @@ pub fn validate_requested_network_backend(
             "ports",
             "published ports require the virtio-net backend (TSI is outbound-only); \
              remove --net-backend tsi or set it to virtio-net",
+        ));
+    }
+
+    // Same for an egress policy — fires only on EXPLICIT TSI + policy.
+    if has_egress_policy && backend != NetworkBackend::VirtioNet {
+        return Err(crate::Error::config(
+            "egress",
+            "egress policy (--allow-cidr/--allow-host/--outbound-localhost-only) requires the \
+             virtio-net backend; TSI does not enforce it. Remove --net-backend tsi or set it to virtio-net",
         ));
     }
 
@@ -189,6 +216,35 @@ mod tests {
         let hosts = ["example.com".to_string()];
         let plan = plan_launch_network(&resources, Some(&hosts), 0);
         assert_eq!(plan.backend, EffectiveNetworkBackend::VirtioNet);
+    }
+
+    #[test]
+    fn test_cidr_policy_default_selects_virtio() {
+        // No explicit backend + a CIDR egress policy must default to virtio-net
+        // (TSI doesn't enforce egress, so defaulting there is a silent no-op).
+        let mut resources = resources();
+        resources.network = true;
+        resources.allowed_cidrs = Some(vec!["1.1.1.1/32".into()]);
+        let plan = plan_launch_network(&resources, None, 0);
+        assert_eq!(plan.backend, EffectiveNetworkBackend::VirtioNet);
+    }
+
+    #[test]
+    fn test_dns_filter_default_selects_virtio() {
+        let mut resources = resources();
+        resources.network = true;
+        let hosts = ["example.com".to_string()];
+        let plan = plan_launch_network(&resources, Some(&hosts), 0);
+        assert_eq!(plan.backend, EffectiveNetworkBackend::VirtioNet);
+    }
+
+    #[test]
+    fn test_validate_egress_explicit_tsi_rejected() {
+        let mut resources = resources();
+        resources.network = true;
+        resources.network_backend = Some(NetworkBackend::Tsi);
+        resources.allowed_cidrs = Some(vec!["1.1.1.1/32".into()]);
+        assert!(validate_requested_network_backend(&resources, None, 0).is_err());
     }
 
     #[test]
