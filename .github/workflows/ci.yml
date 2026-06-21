@@ -32,6 +32,15 @@ jobs:
       - name: Check secrets guardrails
         run: ./scripts/check-secrets-guards.sh
 
+  libkrun-provenance:
+    name: libkrun freshness
+    runs-on: ubuntu-latest
+    steps:
+      # No submodule checkout needed — the check reads the pinned gitlinks.
+      - uses: actions/checkout@v4
+      - name: Bundled libkrun matches the pinned submodule
+        run: ./scripts/check-libkrun-provenance.sh
+
   # ==========================================================================
   # macOS Build & Test (Apple Silicon)
   # ==========================================================================

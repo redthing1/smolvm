@@ -144,6 +144,13 @@ cp -f "$KRUN_SO" "$LIBDIR/$KRUN_FNAME"
 cp -f "$KRUN_SO" "$LIBDIR/libkrun.so"
 ln -sf "libkrun.so" "$LIBDIR/libkrun.so.${KRUN_MAJOR}"
 
+# Record which submodule commits these libs came from, so CI can detect a stale
+# bundle (scripts/check-libkrun-provenance.sh). When libkrunfw was reused rather
+# than rebuilt, keep its recorded commit via --skip-libkrunfw.
+STAMP_ARGS=("$LIBDIR")
+[[ -z "$KRUNFW_SO" ]] && STAMP_ARGS+=(--skip-libkrunfw)
+"$(dirname "$0")/stamp-libkrun-provenance.sh" "${STAMP_ARGS[@]}"
+
 echo ""
 echo "=== done: ${LIBDIR} ==="
 ls -la "$LIBDIR"
