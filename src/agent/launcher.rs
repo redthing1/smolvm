@@ -161,9 +161,9 @@ pub struct LaunchFeatures {
     /// When set, the launcher mounts this directory via virtiofs so the agent
     /// can use pre-extracted layers instead of pulling from a registry.
     pub packed_layers_dir: Option<std::path::PathBuf>,
-    /// Additional disk images to attach to the VM (path, read_only).
+    /// Additional disk images to attach to the VM (path, read_only, format).
     /// Appear as /dev/vdc, /dev/vdd, ... after the storage and overlay disks.
-    pub extra_disks: Vec<(std::path::PathBuf, bool)>,
+    pub extra_disks: Vec<(std::path::PathBuf, bool, DiskFormat)>,
 }
 
 impl LaunchFeatures {
@@ -260,8 +260,8 @@ pub struct LaunchConfig<'a> {
     /// Pre-extracted OCI layers directory for .smolmachine-sourced machines.
     /// Mounted via virtiofs as "smolvm_layers" so the agent uses packed layers.
     pub packed_layers_dir: Option<&'a Path>,
-    /// Additional disk images (path, read_only). Appear as /dev/vdc, /dev/vdd, ...
-    pub extra_disks: &'a [(std::path::PathBuf, bool)],
+    /// Additional disk images (path, read_only, format). Appear as /dev/vdc, /dev/vdd, ...
+    pub extra_disks: &'a [(std::path::PathBuf, bool, DiskFormat)],
     /// Whether DNS filtering was configured for this launch, even if the
     /// host-side proxy socket could not be created.
     pub dns_filter_enabled: bool,
@@ -703,7 +703,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
 
         // Add extra disks (e.g., source VM storage for --from-vm export)
         // These appear as /dev/vdc, /dev/vdd, ... after storage and overlay
-        for (i, (disk_path, read_only)) in extra_disks.iter().enumerate() {
+        for (i, (disk_path, read_only, format)) in extra_disks.iter().enumerate() {
             let block_id_str = format!("extra{}", i);
             let block_id = try_or_free_ctx!(
                 CString::new(block_id_str.as_str()),
@@ -715,7 +715,14 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                 "add extra disk",
                 "path contains null byte"
             );
-            if krun_add_disk2(ctx, block_id.as_ptr(), path.as_ptr(), 0, *read_only) < 0 {
+            if krun_add_disk2(
+                ctx,
+                block_id.as_ptr(),
+                path.as_ptr(),
+                format.to_krun_u32(),
+                *read_only,
+            ) < 0
+            {
                 krun_free_ctx(ctx);
                 return Err(Error::agent(
                     "add extra disk",

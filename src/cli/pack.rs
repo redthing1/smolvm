@@ -8,8 +8,10 @@
 //! - Configuration manifest
 
 use clap::{Args, Subcommand};
-use smolvm::agent::{AgentClient, AgentManager, VmResources};
+use smolvm::agent::{resolve_disk_image, AgentClient, AgentManager, VmResources};
+use smolvm::data::disk::DiskFormat;
 use smolvm::data::resources::DEFAULT_MICROVM_CPU_COUNT;
+use smolvm::storage::{OVERLAY_DISK_FILENAME, STORAGE_DISK_FILENAME};
 
 /// Default memory for packed VMs. Same as machine create — memory is elastic
 /// via virtio balloon, so the host only commits what the guest actually uses.
@@ -23,7 +25,7 @@ use smolvm_pack::format::{PackManifest, PackMode};
 use smolvm_pack::packer::Packer;
 use smolvm_pack::signing::sign_with_hypervisor_entitlements;
 use smolvm_protocol::AgentResponse;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tracing::{debug, info, warn};
 
 /// Package and run self-contained VM executables.
@@ -509,14 +511,20 @@ impl PackCreateCmd {
             ));
         }
 
-        // 2. Locate overlay disk
-        let overlay_path = smolvm::agent::vm_data_dir(&vm_name).join("overlay.raw");
-        if !overlay_path.exists() {
+        // 2. Locate the VM's disks. Default-size machines on Linux get qcow2 CoW
+        // overlays (overlay.qcow2 / storage.qcow2), not `.raw`, so resolve whichever
+        // format exists rather than hardcoding `.raw`. The overlay template is only
+        // consumed by VM-mode (bare) restores — container restores ignore it — so it
+        // is required only for non-image VMs.
+        let vm_dir = smolvm::agent::vm_data_dir(&vm_name);
+        let (overlay_disk, overlay_fmt) = resolve_disk_image(&vm_dir, OVERLAY_DISK_FILENAME);
+        let is_image_based = vm.image.is_some();
+        if !is_image_based && !overlay_disk.exists() {
             return Err(Error::agent(
                 "pack from VM",
                 format!(
                     "overlay disk not found at {}. The VM may not have been started yet.",
-                    overlay_path.display()
+                    overlay_disk.display()
                 ),
             ));
         }
@@ -533,14 +541,15 @@ impl PackCreateCmd {
         let mut collector = AssetCollector::new(staging_dir.clone())
             .map_err(|e| Error::agent("collect assets", e.to_string()))?;
 
-        let is_image_based = vm.image.is_some();
-
         // 4. For image-based VMs, export OCI layers + container overlay via temp VM.
         // The container overlay (installed packages) lives inside the VM's ext4
         // storage disk which can't be read on macOS — a temp VM mounts it for us.
         if is_image_based {
             let image = vm.image.clone().unwrap();
-            let storage_path = smolvm::agent::vm_data_dir(&vm_name).join("storage.raw");
+            // Attach the source storage disk with its real on-disk format so a
+            // qcow2 (default-size) disk is presented correctly and mounts in the
+            // temp VM — hardcoding raw would hand libkrun qcow2 bytes as raw.
+            let (storage_disk, storage_fmt) = resolve_disk_image(&vm_dir, STORAGE_DISK_FILENAME);
 
             self.collect_base_assets(&mut collector)?;
 
@@ -562,7 +571,7 @@ impl PackCreateCmd {
             println!("Starting agent VM to export layers...");
             let manager = AgentManager::for_vm(&pack_vm_name)?;
             let features = smolvm::agent::LaunchFeatures {
-                extra_disks: vec![(storage_path.clone(), false)],
+                extra_disks: vec![(storage_disk.clone(), false, storage_fmt)],
                 ..Default::default()
             };
             manager.start_with_full_config(
@@ -705,11 +714,25 @@ impl PackCreateCmd {
             self.collect_base_assets(&mut collector)?;
         }
 
-        // Add overlay template from VM (bare VM rootfs state)
-        println!("Copying overlay disk ({})...", overlay_path.display());
-        collector
-            .add_overlay_template(&overlay_path)
-            .map_err(|e| Error::agent("collect overlay", e.to_string()))?;
+        // Add the overlay template (the VM's rootfs state). VM-mode restores boot
+        // from it; container restores ignore it entirely (every import path gates
+        // `overlay_template` on `PackMode::Vm`), so skip it for image-based VMs
+        // rather than flatten a qcow2 for nothing. A default-size overlay is a qcow2
+        // CoW image, which must be flattened to a raw before it can be a template.
+        if !is_image_based {
+            let overlay_for_pack = match overlay_fmt {
+                DiskFormat::Raw => overlay_disk.clone(),
+                DiskFormat::Qcow2 => {
+                    let flat = temp_dir.path().join("overlay-flat.raw");
+                    self.flatten_qcow2_to_raw(&overlay_disk, &flat)?;
+                    flat
+                }
+            };
+            println!("Copying overlay disk ({})...", overlay_for_pack.display());
+            collector
+                .add_overlay_template(&overlay_for_pack)
+                .map_err(|e| Error::agent("collect overlay", e.to_string()))?;
+        }
 
         // 5. Resolve Smolfile overrides if provided
         //    Precedence: CLI > [artifact] > Smolfile top-level > VmRecord > default
@@ -791,6 +814,98 @@ impl PackCreateCmd {
         }
 
         self.finalize_pack(manifest, collector, staging_dir)
+    }
+
+    /// Flatten a qcow2 CoW overlay into a standalone raw disk image.
+    ///
+    /// Default-size machines use a qcow2 overlay backed by the install's default
+    /// template, but a pack's overlay template must be a flat raw. There is no
+    /// host-side qcow2 reader (smolvm deliberately takes no qemu-img dependency),
+    /// so the conversion runs inside a throwaway agent VM: the source qcow2 is
+    /// attached read-only (libkrun resolves its backing chain) as `/dev/vdc`
+    /// alongside a fresh raw output as `/dev/vdd`, and the guest `dd`s one into the
+    /// other. `add_overlay_template` then strips trailing zeros so a mostly-empty
+    /// overlay still packs small, and extraction re-sparsifies it on import.
+    fn flatten_qcow2_to_raw(&self, qcow2_path: &Path, dest_raw: &Path) -> smolvm::Result<()> {
+        let virtual_size = read_qcow2_virtual_size(qcow2_path)?;
+        {
+            let f = std::fs::File::create(dest_raw)
+                .map_err(|e| Error::agent("create flatten target", e.to_string()))?;
+            f.set_len(virtual_size)
+                .map_err(|e| Error::agent("size flatten target", e.to_string()))?;
+        }
+
+        let flatten_vm_name = format!(
+            "pack-flatten-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
+        let vm_data = smolvm::agent::vm_data_dir(&flatten_vm_name);
+        println!("Flattening qcow2 overlay to raw...");
+        let manager = AgentManager::for_vm(&flatten_vm_name)?;
+        let features = smolvm::agent::LaunchFeatures {
+            // vdc = source qcow2 (read-only), vdd = fresh raw output.
+            extra_disks: vec![
+                (qcow2_path.to_path_buf(), true, DiskFormat::Qcow2),
+                (dest_raw.to_path_buf(), false, DiskFormat::Raw),
+            ],
+            ..Default::default()
+        };
+        manager.start_with_full_config(
+            Vec::new(),
+            Vec::new(),
+            VmResources {
+                cpus: 2,
+                memory_mib: 2048,
+                network: false,
+                network_backend: None,
+                gpu: false,
+                gpu_vram_mib: None,
+                storage_gib: None,
+                overlay_gib: None,
+                allowed_cidrs: None,
+            },
+            features,
+        )?;
+
+        let result: smolvm::Result<()> = (|| {
+            let mut client = manager.connect()?;
+            let (exit_code, _, stderr) = client.vm_exec(
+                vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    // busybox dd lacks GNU `conv=sparse`, so do a plain full copy
+                    // and `sync`. The output is dense on the temp disk, but
+                    // `add_overlay_template` strips trailing zeros so the pack stays
+                    // small; the imported overlay is re-sparsified on extraction.
+                    "dd if=/dev/vdc of=/dev/vdd bs=1M && sync".to_string(),
+                ],
+                vec![],
+                None,
+                None,
+                None,
+            )?;
+            if exit_code != 0 {
+                return Err(Error::agent(
+                    "flatten qcow2 overlay",
+                    format!(
+                        "dd failed (exit {}): {}",
+                        exit_code,
+                        String::from_utf8_lossy(&stderr)
+                    ),
+                ));
+            }
+            Ok(())
+        })();
+
+        if let Err(e) = manager.stop() {
+            warn!(error = %e, "failed to stop pack flatten VM");
+        }
+        let _ = std::fs::remove_dir_all(&vm_data);
+        result
     }
 
     /// Collect base assets shared by both image and VM packing modes:
@@ -1654,6 +1769,29 @@ fn fmt_bytes(bytes: u64) -> String {
     } else {
         format!("{} MB", bytes / (1024 * 1024))
     }
+}
+
+/// Read a qcow2 image's virtual (guest-visible) size from its header — the
+/// big-endian `u64` at byte offset 24, per the qcow2 spec. Lets the flatten path
+/// size its raw output correctly without a qcow2 library.
+fn read_qcow2_virtual_size(path: &Path) -> smolvm::Result<u64> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path).map_err(|e| Error::agent("open qcow2", e.to_string()))?;
+    let mut magic = [0u8; 4];
+    f.read_exact(&mut magic)
+        .map_err(|e| Error::agent("read qcow2 magic", e.to_string()))?;
+    if &magic != b"QFI\xfb" {
+        return Err(Error::agent(
+            "read qcow2",
+            format!("{} is not a qcow2 image (bad magic)", path.display()),
+        ));
+    }
+    f.seek(SeekFrom::Start(24))
+        .map_err(|e| Error::agent("seek qcow2 size", e.to_string()))?;
+    let mut buf = [0u8; 8];
+    f.read_exact(&mut buf)
+        .map_err(|e| Error::agent("read qcow2 size", e.to_string()))?;
+    Ok(u64::from_be_bytes(buf))
 }
 
 /// A simple terminal spinner that prints a rotating character every 200ms.

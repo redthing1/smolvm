@@ -221,7 +221,7 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
         if let Some(parent) = config.ssh_agent_socket.as_ref().and_then(|s| s.parent()) {
             read_write.push(parent.to_path_buf());
         }
-        for (path, read_only) in &config.extra_disks {
+        for (path, read_only, _format) in &config.extra_disks {
             if *read_only {
                 read_exec.push(path.clone());
             } else {

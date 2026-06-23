@@ -27,6 +27,139 @@ use serde::{Deserialize, Serialize};
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 
+/// Seed a VM-mode machine's overlay+storage disks from extracted pack templates so
+/// it boots the source VM's filesystem rather than a freshly-mkfs'd empty overlay.
+///
+/// VM-mode (`--from-vm`) packs carry the source VM's rootfs DISKS, but the packed
+/// template has its trailing zero extent stripped, so the disk must be grown back to
+/// its logical size before boot. The caller's [`AgentManager`] has already created
+/// default `.qcow2` overlays backed by the EMPTY default template; this removes them
+/// and writes the seeded RAW disks under their place so [`resolve_disk_image`] picks
+/// these at start. A `.formatted` marker stops the host from reformatting the
+/// inherited (already-formatted) filesystem; the guest still grows it with resize2fs.
+///
+/// The template → disk copy uses [`crate::disk_utils::clone_or_copy_file`] (clonefile
+/// CoW on macOS, `SEEK_HOLE` sparse copy on Linux), NOT a dense `fs::copy`: the
+/// templates are sparse (~25 MiB of real data in a multi-GiB logical file), so a dense
+/// copy would balloon every machine to its full logical size (~28 GiB) on disk.
+///
+/// `disk_dir` is the machine's data dir (the parent of `manager.storage_path()`).
+/// Shared by both the serve API create path and the `smolvm machine create --from`
+/// CLI path so a VM-mode pack restores identically through either entry point.
+///
+/// [`AgentManager`]: crate::agent::AgentManager
+/// [`resolve_disk_image`]: crate::agent::manager::resolve_disk_image
+pub fn seed_vm_mode_disks(
+    disk_dir: &Path,
+    cache_dir: &Path,
+    overlay_template: Option<&str>,
+    storage_template: Option<&str>,
+    overlay_logical_size: Option<u64>,
+    overlay_gb: Option<u64>,
+    storage_gb: Option<u64>,
+) -> std::io::Result<()> {
+    // Drop the manager's default qcow2 overlays (backed by the empty default
+    // template) so the seeded raw disks below are what start resolves.
+    for raw_filename in [STORAGE_DISK_FILENAME, OVERLAY_DISK_FILENAME] {
+        let stem = Path::new(raw_filename);
+        let _ = std::fs::remove_file(disk_dir.join(stem.with_extension("qcow2")));
+    }
+
+    // The overlay carries the rootfs and is grown back to its (pre-truncation)
+    // logical size; storage to the requested size. Both VM-mode templates are
+    // normally present, but tolerate a missing one with an empty disk.
+    seed_one_disk(
+        cache_dir,
+        overlay_template,
+        &disk_dir.join(OVERLAY_DISK_FILENAME),
+        overlay_logical_size,
+        overlay_gb,
+    )?;
+    seed_one_disk(
+        cache_dir,
+        storage_template,
+        &disk_dir.join(STORAGE_DISK_FILENAME),
+        None,
+        storage_gb,
+    )?;
+    Ok(())
+}
+
+/// Sparse-copy one packed template into `dest`, grow it to the largest of its copied
+/// size / the source's logical size / any requested size, and mark it formatted
+/// (the copy carries the source's ext4; the guest grows it with resize2fs). With no
+/// template, write an empty sparse disk for the guest to format (no formatted marker).
+fn seed_one_disk(
+    cache_dir: &Path,
+    template: Option<&str>,
+    dest: &Path,
+    logical_size: Option<u64>,
+    size_gb_override: Option<u64>,
+) -> std::io::Result<()> {
+    let _ = std::fs::remove_file(dest);
+    let formatted_marker = dest.with_extension("formatted");
+
+    let Some(rel) = template else {
+        // No template (rare for VM mode): an empty sparse disk the guest formats.
+        let _ = std::fs::remove_file(&formatted_marker);
+        let size = size_gb_override
+            .map(|gb| gb * BYTES_PER_GIB)
+            .unwrap_or(512 * 1024 * 1024);
+        std::fs::File::create(dest)?.set_len(size)?;
+        return Ok(());
+    };
+
+    let src = resolve_template_in_cache(cache_dir, rel)?;
+    if !src.exists() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("VM-mode template not found: {}", src.display()),
+        ));
+    }
+    crate::disk_utils::clone_or_copy_file(&src, dest)
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+
+    // Grow back to the logical/requested size (set_len extends sparsely; the guest
+    // resize2fs expands the ext4 to fill it at boot).
+    let copied = std::fs::metadata(dest)?.len();
+    let target = [
+        Some(copied),
+        logical_size,
+        size_gb_override.map(|gb| gb * BYTES_PER_GIB),
+    ]
+    .into_iter()
+    .flatten()
+    .max()
+    .unwrap_or(copied);
+    if target > copied {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(dest)?
+            .set_len(target)?;
+    }
+
+    std::fs::write(&formatted_marker, b"")?;
+    Ok(())
+}
+
+/// Resolve a pack template's relative path within `cache_dir`, rejecting anything
+/// that isn't a plain in-tree path (no `..`, absolute, or other escaping component)
+/// so a hostile pack manifest can't redirect the copy outside the cache.
+fn resolve_template_in_cache(cache_dir: &Path, rel: &str) -> std::io::Result<PathBuf> {
+    let rel_path = Path::new(rel);
+    let safe = !rel.is_empty()
+        && rel_path
+            .components()
+            .all(|c| matches!(c, std::path::Component::Normal(_)));
+    if !safe {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("invalid VM-mode template path: {rel:?}"),
+        ));
+    }
+    Ok(cache_dir.join(rel_path))
+}
+
 /// Disk format version info (stored at `/.smolvm/version.json` in ext4 disk).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiskVersion {
