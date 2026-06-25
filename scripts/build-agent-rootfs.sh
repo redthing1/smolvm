@@ -370,11 +370,12 @@ mkdir -p "$OUTPUT_DIR/run"
 #   /mnt/overlay  OVERLAY_MOUNT       } setup_persistent_rootfs(), required at
 #   /mnt/storage  STORAGE_TEMP_MOUNT  } boot before the overlay is writable
 #   /mnt/newroot  NEWROOT             }
-#   /mnt/virtiofs paths::VIRTIOFS_MOUNT_ROOT  parent for per-tag virtiofs shares
 #   /mnt/rosetta  vm::rosetta::ROSETTA_GUEST_PATH  macOS Rosetta binfmt share
-for mnt_dir in overlay storage newroot virtiofs rosetta; do
+#   /run/smolvm/virtiofs paths::VIRTIOFS_MOUNT_ROOT  parent for per-tag virtiofs shares
+for mnt_dir in overlay storage newroot rosetta; do
     mkdir -p "$OUTPUT_DIR/mnt/$mnt_dir"
 done
+mkdir -p "$OUTPUT_DIR/run/smolvm/virtiofs"
 
 # Remove existing init (it's a symlink to busybox) and replace with
 # symlink to the agent binary. The agent handles overlayfs setup +

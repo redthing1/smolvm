@@ -27,7 +27,11 @@ pub const CRUN_CGROUP_MANAGER: &str = "disabled";
 // =============================================================================
 
 /// Root directory for virtiofs mounts from the host.
-pub const VIRTIOFS_MOUNT_ROOT: &str = "/mnt/virtiofs";
+///
+/// Keep this outside `/mnt`: users commonly mount host directories at `/mnt`,
+/// and using `/mnt/virtiofs` as an internal staging path makes `/mnt` an
+/// ancestor of the source mount for image-backed containers.
+pub const VIRTIOFS_MOUNT_ROOT: &str = "/run/smolvm/virtiofs";
 
 /// Guest path at which the shared workspace is exposed inside containers.
 /// Used both when mounting /storage/workspace as the fallback workspace and

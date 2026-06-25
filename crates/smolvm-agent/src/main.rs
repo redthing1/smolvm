@@ -259,8 +259,15 @@ fn main() {
         }
     }
 
-    // Initialize packed layers support (if SMOLVM_PACKED_LAYERS env var is set)
+    // Initialize host-mounted image data, if the launcher provided it.
     let t0 = uptime_ms();
+    if let Some(packed_dir) = storage::get_packed_layers_dir() {
+        info!(
+            duration_ms = uptime_ms() - t0,
+            packed_dir = %packed_dir.display(),
+            "packed layer data initialized"
+        );
+    }
     if let Some(image_dir) = storage::get_preloaded_image_dir() {
         info!(
             duration_ms = uptime_ms() - t0,
@@ -2019,13 +2026,13 @@ fn handle_request(
                     unprivileged,
                 )
             } else {
-                handle_run(storage::RunCommandRequest {
-                    image: &image,
-                    command: &command,
-                    env: &env,
-                    workdir: workdir.as_deref(),
-                    user: user.as_deref(),
-                    mounts: &mounts,
+                handle_run(
+                    &image,
+                    &command,
+                    &env,
+                    workdir.as_deref(),
+                    user.as_deref(),
+                    &mounts,
                     timeout_ms,
                     persistent_overlay_id.as_deref(),
                     stdin_data.as_deref(),
