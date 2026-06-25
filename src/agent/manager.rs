@@ -1657,7 +1657,12 @@ impl AgentManager {
         // VMs) don't set it, so they keep today's behavior. We pass the resulting
         // flag down so the boot subprocess only arms its parent-death watchdog in
         // the embedder case. See `cli/internal_boot::run`.
-        let watch_parent = boot_binary.is_some();
+        //
+        // A CLI that sets SMOLVM_BOOT_BINARY (because its own `current_exe` can't
+        // serve `_boot-vm`, e.g. `smol`) but DETACHES the VM must opt out via
+        // `features.watch_parent = Some(false)` — otherwise its persistent
+        // machines die the moment the CLI process exits.
+        let watch_parent = features.watch_parent.unwrap_or(boot_binary.is_some());
         let boot_exe = boot_binary
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| exe.clone());

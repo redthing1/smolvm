@@ -172,6 +172,12 @@ pub struct LaunchFeatures {
     pub snapshot_dir: Option<std::path::PathBuf>,
     /// Control socket path for a forkable machine (pause/resume/checkpoint/FORK).
     pub control_socket: Option<std::path::PathBuf>,
+    /// Override the parent-death watchdog. `None` = default (arm it iff a
+    /// separate boot binary is used, i.e. an in-process SDK embedder whose VM
+    /// must die with it). `Some(false)` forces it off — for a CLI that sets
+    /// `SMOLVM_BOOT_BINARY` (so `current_exe` need not handle `_boot-vm`) yet
+    /// DETACHES the VM to persist after the CLI exits (e.g. `smol start`/`fork`).
+    pub watch_parent: Option<bool>,
 }
 
 impl LaunchFeatures {
