@@ -42,6 +42,7 @@ pub fn build_create_params(
     cli_port: Vec<PortMapping>,
     cli_net: bool,
     cli_network_backend: Option<NetworkBackend>,
+    cli_dns: Option<std::net::Ipv4Addr>,
     cli_init: Vec<String>,
     cli_env: Vec<String>,
     cli_workdir: Option<String>,
@@ -55,8 +56,9 @@ pub fn build_create_params(
     let sf = match smolfile_path {
         Some(path) => load(&path)?,
         None => {
-            let net = cli_net || !cli_allow_cidr.is_empty();
+            let net = cli_net || !cli_allow_cidr.is_empty() || cli_dns.is_some();
             return Ok(CreateVmParams {
+                secret_refs: Default::default(),
                 name,
                 image: cli_image,
                 entrypoint: cli_entrypoint.map(|e| vec![e]).unwrap_or_default(),
@@ -67,6 +69,7 @@ pub fn build_create_params(
                 port: cli_port,
                 net,
                 network_backend: cli_network_backend,
+                dns: cli_dns,
                 init: cli_init,
                 env: cli_env,
                 workdir: cli_workdir,
@@ -198,8 +201,8 @@ pub fn build_create_params(
     // CLI extends
     allowed_cidrs_vec.extend(cli_allow_cidr);
 
-    // --allow-cidr / --allow-host / [network] implies --net
-    let net = if !allowed_cidrs_vec.is_empty() || !sf_allow_hosts.is_empty() {
+    // --allow-cidr / --allow-host / [network] / --dns implies --net
+    let net = if !allowed_cidrs_vec.is_empty() || !sf_allow_hosts.is_empty() || cli_dns.is_some() {
         true
     } else {
         net
@@ -247,6 +250,7 @@ pub fn build_create_params(
         .and_then(|s| parse_duration_secs(s));
 
     Ok(CreateVmParams {
+        secret_refs: sf.secrets,
         name,
         image,
         entrypoint,
@@ -257,6 +261,7 @@ pub fn build_create_params(
         port: ports,
         net,
         network_backend: cli_network_backend,
+        dns: cli_dns,
         init,
         env,
         workdir,
@@ -310,6 +315,10 @@ pub struct PackConfig {
     pub net: Option<bool>,
     /// Whether GPU acceleration is enabled in the packed VM.
     pub gpu: bool,
+    /// Secrets carried into the pack manifest as references. They are resolved
+    /// to plaintext on the run host at exec time and are never packed as
+    /// values.
+    pub secret_refs: std::collections::BTreeMap<String, smolvm::secrets::SecretRef>,
 }
 
 /// Resolve pack configuration by merging CLI flags with an optional Smolfile.
@@ -349,6 +358,7 @@ pub fn resolve_pack_config(
                 workdir: None,
                 net: None,
                 gpu: cli_gpu,
+                secret_refs: Default::default(),
             });
         }
     };
@@ -416,5 +426,6 @@ pub fn resolve_pack_config(
         },
         // CLI --gpu wins; Smolfile gpu = true also enables it.
         gpu: cli_gpu || sf.gpu.unwrap_or(false),
+        secret_refs: sf.secrets,
     })
 }

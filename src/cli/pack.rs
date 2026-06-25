@@ -8,12 +8,15 @@
 //! - Configuration manifest
 
 use clap::{Args, Subcommand};
-use smolvm::agent::{AgentClient, AgentManager, VmResources};
+use smolvm::agent::{resolve_disk_image, AgentClient, AgentManager, VmResources};
+use smolvm::data::disk::DiskFormat;
 use smolvm::data::resources::DEFAULT_MICROVM_CPU_COUNT;
+use smolvm::storage::{OVERLAY_DISK_FILENAME, STORAGE_DISK_FILENAME};
 
 /// Default memory for packed VMs. Same as machine create — memory is elastic
 /// via virtio balloon, so the host only commits what the guest actually uses.
 pub(crate) const PACK_DEFAULT_MEMORY_MIB: u32 = 8192;
+use sha2::{Digest, Sha256};
 use smolvm::config::{RecordState, SmolvmConfig};
 use smolvm::platform::{Arch, Os, Platform};
 use smolvm::util::{libkrun_filename, libkrunfw_filename};
@@ -24,7 +27,7 @@ use smolvm_pack::oci_archive::import_oci_archive;
 use smolvm_pack::packer::Packer;
 use smolvm_pack::signing::sign_with_hypervisor_entitlements;
 use smolvm_protocol::AgentResponse;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tracing::{debug, info, warn};
 
 /// Package and run self-contained VM executables.
@@ -160,9 +163,39 @@ pub struct PackCreateCmd {
     /// the slp/mesa-libkrun-vulkan COPR, or standard Mesa on Linux hosts).
     #[arg(long)]
     pub gpu: bool,
+
+    /// Directory under which to stage pack assets (pulled layers, the merged
+    /// layer, agent rootfs, and the ext4 template). Defaults to the smolvm cache
+    /// dir; point this at a roomy disk-backed path when the default filesystem is
+    /// small. Overrides the `SMOLVM_PACK_STAGING` env var.
+    #[arg(long = "staging-dir", value_name = "DIR")]
+    pub staging_dir: Option<PathBuf>,
+
+    #[command(flatten, next_help_heading = "Network")]
+    pub proxy_opts: crate::cli::proxy_opts::ProxyOpts,
 }
 
 impl PackCreateCmd {
+    /// Resolve the directory under which the staging temp dir is created.
+    ///
+    /// Precedence: `--staging-dir` → `SMOLVM_PACK_STAGING` → the disk-backed
+    /// cache dir (`<cache>/smolvm`) → `$TMPDIR`. The default must NOT be
+    /// `$TMPDIR`: staging holds the whole image (the pulled layers, a merged
+    /// copy, the agent rootfs, and the ext4 template), and on most Linux distros
+    /// `$TMPDIR` is tmpfs (RAM-backed, small), so large images fail there with
+    /// ENOSPC/EDQUOT.
+    fn staging_root(&self) -> smolvm::Result<PathBuf> {
+        let root = self
+            .staging_dir
+            .clone()
+            .or_else(|| std::env::var_os("SMOLVM_PACK_STAGING").map(PathBuf::from))
+            .or_else(|| dirs::cache_dir().map(|c| c.join("smolvm")))
+            .unwrap_or_else(std::env::temp_dir);
+        std::fs::create_dir_all(&root)
+            .map_err(|e| Error::agent("create staging root", e.to_string()))?;
+        Ok(root)
+    }
+
     pub fn run(self) -> smolvm::Result<()> {
         if let Some(vm_name) = self.from_vm.clone() {
             if self.oci_platform.is_some() {
@@ -196,7 +229,9 @@ impl PackCreateCmd {
         info!(image = %image, output = %self.output.display(), "packing image");
 
         // Create temporary staging directory
-        let temp_dir = tempfile::tempdir()
+        let temp_dir = tempfile::Builder::new()
+            .prefix("pack-staging-")
+            .tempdir_in(self.staging_root()?)
             .map_err(|e| Error::agent("create temp directory", e.to_string()))?;
         let staging_dir = temp_dir.path().join("staging");
 
@@ -277,6 +312,7 @@ impl PackCreateCmd {
                 memory_mib: 8192,
                 network: true,
                 network_backend: None,
+                dns: None,
                 gpu: false,
                 storage_gib: None,
                 overlay_gib: None,
@@ -296,6 +332,8 @@ impl PackCreateCmd {
             &mut client,
             &image,
             pack_config.oci_platform.as_deref(),
+            self.proxy_opts.proxy(),
+            self.proxy_opts.no_proxy(),
         )?;
         debug!(image_info = ?image_info, "image pulled");
 
@@ -374,6 +412,7 @@ impl PackCreateCmd {
                 vec![],
                 None,
                 None,
+                None,
             )?;
 
             // stdout/stderr from vm_exec are now Vec<u8>; convert lossily
@@ -399,7 +438,10 @@ impl PackCreateCmd {
             // never holds the full tar in memory).
             print!("  Exporting merged layer...");
             let _ = std::io::Write::flush(&mut std::io::stdout());
-            let merged_digest = format!("sha256:merged-{}", &image_info.digest[..16]);
+            let merged_hash = hex::encode(Sha256::digest(
+                format!("merged-{}", image_info.digest).as_bytes(),
+            ));
+            let merged_digest = format!("sha256:{}", merged_hash);
             let merged_file = collector.layer_staging_path(&merged_digest);
 
             let total_bytes = client
@@ -521,14 +563,20 @@ impl PackCreateCmd {
             ));
         }
 
-        // 2. Locate overlay disk
-        let overlay_path = smolvm::agent::vm_data_dir(&vm_name).join("overlay.raw");
-        if !overlay_path.exists() {
+        // 2. Locate the VM's disks. Default-size machines on Linux get qcow2 CoW
+        // overlays (overlay.qcow2 / storage.qcow2), not `.raw`, so resolve whichever
+        // format exists rather than hardcoding `.raw`. The overlay template is only
+        // consumed by VM-mode (bare) restores — container restores ignore it — so it
+        // is required only for non-image VMs.
+        let vm_dir = smolvm::agent::vm_data_dir(&vm_name);
+        let (overlay_disk, overlay_fmt) = resolve_disk_image(&vm_dir, OVERLAY_DISK_FILENAME);
+        let is_image_based = vm.image.is_some();
+        if !is_image_based && !overlay_disk.exists() {
             return Err(Error::agent(
                 "pack from VM",
                 format!(
                     "overlay disk not found at {}. The VM may not have been started yet.",
-                    overlay_path.display()
+                    overlay_disk.display()
                 ),
             ));
         }
@@ -536,21 +584,41 @@ impl PackCreateCmd {
         println!("Packing VM '{}' snapshot...", vm_name);
 
         // 3. Create temporary staging directory
-        let temp_dir = tempfile::tempdir()
+        let temp_dir = tempfile::Builder::new()
+            .prefix("pack-staging-")
+            .tempdir_in(self.staging_root()?)
             .map_err(|e| Error::agent("create temp directory", e.to_string()))?;
         let staging_dir = temp_dir.path().join("staging");
 
         let mut collector = AssetCollector::new(staging_dir.clone())
             .map_err(|e| Error::agent("collect assets", e.to_string()))?;
 
-        let is_image_based = vm.image.is_some();
-
         // 4. For image-based VMs, export OCI layers + container overlay via temp VM.
         // The container overlay (installed packages) lives inside the VM's ext4
         // storage disk which can't be read on macOS — a temp VM mounts it for us.
         if is_image_based {
             let image = vm.image.clone().unwrap();
-            let storage_path = smolvm::agent::vm_data_dir(&vm_name).join("storage.raw");
+            // A locally-sourced image (`--image -` / `--image file.tar` / a rootfs
+            // dir) is flattened on boot and has no registry manifest, so the
+            // layer-export path below — which pulls that manifest to enumerate base
+            // layers — cannot source it. Fail with a clear, actionable message
+            // instead of a confusing registry "UNAUTHORIZED" on `local:<hash>`.
+            if smolvm::data::image_source::is_local_ref(&image) {
+                return Err(Error::agent(
+                    "pack from VM",
+                    format!(
+                        "VM '{vm_name}' was created from a local image ({image}). \
+                         `pack create --from-vm` can only snapshot VMs created from a \
+                         REGISTRY image — local archives and rootfs directories are \
+                         flattened on boot and have no registry manifest to re-pull. \
+                         Recreate the machine from a registry reference to pack it."
+                    ),
+                ));
+            }
+            // Attach the source storage disk with its real on-disk format so a
+            // qcow2 (default-size) disk is presented correctly and mounts in the
+            // temp VM — hardcoding raw would hand libkrun qcow2 bytes as raw.
+            let (storage_disk, storage_fmt) = resolve_disk_image(&vm_dir, STORAGE_DISK_FILENAME);
 
             self.collect_base_assets(&mut collector)?;
 
@@ -572,7 +640,7 @@ impl PackCreateCmd {
             println!("Starting agent VM to export layers...");
             let manager = AgentManager::for_vm(&pack_vm_name)?;
             let features = smolvm::agent::LaunchFeatures {
-                extra_disks: vec![(storage_path.clone(), false)],
+                extra_disks: vec![(storage_disk.clone(), false, storage_fmt)],
                 ..Default::default()
             };
             manager.start_with_full_config(
@@ -583,6 +651,7 @@ impl PackCreateCmd {
                     memory_mib: 8192,
                     network: true,
                     network_backend: None,
+                    dns: None,
                     gpu: false,
                     gpu_vram_mib: None,
                     storage_gib: None,
@@ -610,6 +679,7 @@ impl PackCreateCmd {
                     vec![],
                     None,
                     None,
+                    None,
                 )?;
                 if exit_code != 0 {
                     return Err(Error::agent(
@@ -624,7 +694,13 @@ impl PackCreateCmd {
 
                 // Pull the same image (layers are cached on the source storage,
                 // but the agent needs the manifest to know the layer list).
-                let image_info = crate::cli::pull_with_progress(&mut client, &image, None)?;
+                let image_info = crate::cli::pull_with_progress(
+                    &mut client,
+                    &image,
+                    None,
+                    self.proxy_opts.proxy(),
+                    self.proxy_opts.no_proxy(),
+                )?;
 
                 // Export base image layers
                 println!("Exporting {} layers...", image_info.layer_count);
@@ -655,7 +731,9 @@ impl PackCreateCmd {
                 let overlay_dir =
                     format!("/mnt/source-storage/overlays/persistent-{}/upper", vm_name);
                 println!("Exporting container overlay...");
-                let overlay_digest = format!("sha256:overlay-{}", vm_name);
+                let overlay_hash =
+                    hex::encode(Sha256::digest(format!("overlay-{}", vm_name).as_bytes()));
+                let overlay_digest = format!("sha256:{}", overlay_hash);
                 let overlay_layer_file = collector.layer_staging_path(&overlay_digest);
 
                 // Use the agent to tar the overlay dir
@@ -672,6 +750,7 @@ impl PackCreateCmd {
                         ),
                     ],
                     vec![],
+                    None,
                     None,
                     None,
                 )?;
@@ -705,11 +784,25 @@ impl PackCreateCmd {
             self.collect_base_assets(&mut collector)?;
         }
 
-        // Add overlay template from VM (bare VM rootfs state)
-        println!("Copying overlay disk ({})...", overlay_path.display());
-        collector
-            .add_overlay_template(&overlay_path)
-            .map_err(|e| Error::agent("collect overlay", e.to_string()))?;
+        // Add the overlay template (the VM's rootfs state). VM-mode restores boot
+        // from it; container restores ignore it entirely (every import path gates
+        // `overlay_template` on `PackMode::Vm`), so skip it for image-based VMs
+        // rather than flatten a qcow2 for nothing. A default-size overlay is a qcow2
+        // CoW image, which must be flattened to a raw before it can be a template.
+        if !is_image_based {
+            let overlay_for_pack = match overlay_fmt {
+                DiskFormat::Raw => overlay_disk.clone(),
+                DiskFormat::Qcow2 => {
+                    let flat = temp_dir.path().join("overlay-flat.raw");
+                    self.flatten_qcow2_to_raw(&overlay_disk, &flat)?;
+                    flat
+                }
+            };
+            println!("Copying overlay disk ({})...", overlay_for_pack.display());
+            collector
+                .add_overlay_template(&overlay_for_pack)
+                .map_err(|e| Error::agent("collect overlay", e.to_string()))?;
+        }
 
         // 5. Resolve Smolfile overrides if provided
         //    Precedence: CLI > [artifact] > Smolfile top-level > VmRecord > default
@@ -758,9 +851,133 @@ impl PackCreateCmd {
         manifest.workdir = vm.workdir.clone();
         manifest.user = vm.image_user.clone();
 
-        apply_pack_config_overrides(&mut manifest, pack_config);
+        // Layer Smolfile env on top of VmRecord env
+        if !pack_config.env.is_empty() {
+            for e in &pack_config.env {
+                if let Some((key, _)) = e.split_once('=') {
+                    manifest
+                        .env
+                        .retain(|existing| !existing.starts_with(&format!("{}=", key)));
+                }
+                manifest.env.push(e.clone());
+            }
+        }
+
+        // Baseline secret refs from the source VM record, then layer the
+        // Smolfile [secrets] on top (Smolfile wins on key collisions). Refs
+        // only — plaintext is resolved on the run host, never packed.
+        manifest.secret_refs = vm.secret_refs.clone();
+        manifest.secret_refs.extend(pack_config.secret_refs.clone());
+
+        // Smolfile workdir overrides VmRecord workdir
+        if pack_config.workdir.is_some() {
+            manifest.workdir = pack_config.workdir;
+        }
+
+        // Override entrypoint from Smolfile/[artifact] or CLI
+        if !pack_config.entrypoint.is_empty() {
+            manifest.entrypoint = pack_config.entrypoint;
+        }
+
+        // Override cmd from Smolfile/[artifact]
+        if !pack_config.cmd.is_empty() {
+            manifest.cmd = pack_config.cmd;
+        }
 
         self.finalize_pack(manifest, collector, staging_dir)
+    }
+
+    /// Flatten a qcow2 CoW overlay into a standalone raw disk image.
+    ///
+    /// Default-size machines use a qcow2 overlay backed by the install's default
+    /// template, but a pack's overlay template must be a flat raw. There is no
+    /// host-side qcow2 reader (smolvm deliberately takes no qemu-img dependency),
+    /// so the conversion runs inside a throwaway agent VM: the source qcow2 is
+    /// attached read-only (libkrun resolves its backing chain) as `/dev/vdc`
+    /// alongside a fresh raw output as `/dev/vdd`, and the guest `dd`s one into the
+    /// other. `add_overlay_template` then strips trailing zeros so a mostly-empty
+    /// overlay still packs small, and extraction re-sparsifies it on import.
+    fn flatten_qcow2_to_raw(&self, qcow2_path: &Path, dest_raw: &Path) -> smolvm::Result<()> {
+        let virtual_size = read_qcow2_virtual_size(qcow2_path)?;
+        {
+            let f = std::fs::File::create(dest_raw)
+                .map_err(|e| Error::agent("create flatten target", e.to_string()))?;
+            f.set_len(virtual_size)
+                .map_err(|e| Error::agent("size flatten target", e.to_string()))?;
+        }
+
+        let flatten_vm_name = format!(
+            "pack-flatten-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
+        let vm_data = smolvm::agent::vm_data_dir(&flatten_vm_name);
+        println!("Flattening qcow2 overlay to raw...");
+        let manager = AgentManager::for_vm(&flatten_vm_name)?;
+        let features = smolvm::agent::LaunchFeatures {
+            // vdc = source qcow2 (read-only), vdd = fresh raw output.
+            extra_disks: vec![
+                (qcow2_path.to_path_buf(), true, DiskFormat::Qcow2),
+                (dest_raw.to_path_buf(), false, DiskFormat::Raw),
+            ],
+            ..Default::default()
+        };
+        manager.start_with_full_config(
+            Vec::new(),
+            Vec::new(),
+            VmResources {
+                cpus: 2,
+                memory_mib: 2048,
+                network: false,
+                network_backend: None,
+                dns: None,
+                gpu: false,
+                gpu_vram_mib: None,
+                storage_gib: None,
+                overlay_gib: None,
+                allowed_cidrs: None,
+            },
+            features,
+        )?;
+
+        let result: smolvm::Result<()> = (|| {
+            let mut client = manager.connect()?;
+            let (exit_code, _, stderr) = client.vm_exec(
+                vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    // busybox dd lacks GNU `conv=sparse`, so do a plain full copy
+                    // and `sync`. The output is dense on the temp disk, but
+                    // `add_overlay_template` strips trailing zeros so the pack stays
+                    // small; the imported overlay is re-sparsified on extraction.
+                    "dd if=/dev/vdc of=/dev/vdd bs=1M && sync".to_string(),
+                ],
+                vec![],
+                None,
+                None,
+                None,
+            )?;
+            if exit_code != 0 {
+                return Err(Error::agent(
+                    "flatten qcow2 overlay",
+                    format!(
+                        "dd failed (exit {}): {}",
+                        exit_code,
+                        String::from_utf8_lossy(&stderr)
+                    ),
+                ));
+            }
+            Ok(())
+        })();
+
+        if let Err(e) = manager.stop() {
+            warn!(error = %e, "failed to stop pack flatten VM");
+        }
+        let _ = std::fs::remove_dir_all(&vm_data);
+        result
     }
 
     /// Collect base assets shared by both image and VM packing modes:
@@ -870,19 +1087,30 @@ impl PackCreateCmd {
             return Ok(dir.clone());
         }
 
-        // Best option: use the exact libkrun that this process has loaded.
-        // This guarantees the packed binary gets a library with all required symbols,
-        // avoiding mismatches when multiple libkrun versions are installed.
+        // Use the same canonical resolver as the launcher and embedded runtime so
+        // `pack create` finds libkrun anywhere the rest of smolvm does: it honors
+        // the explicit `$SMOLVM_LIB_DIR` override (e.g. a distro libkrun, or a
+        // non-standard install dir) and the installed/exe-relative `lib/` layout.
+        // Without this, packing a build whose libs live outside the hardcoded
+        // candidates below required `--lib-dir`, even though the env var was set.
+        if let Some(dir) = smolvm::agent::find_lib_dir() {
+            debug!(lib_dir = %dir.display(), "found library directory via canonical resolver");
+            return Ok(dir);
+        }
+
+        // Next best: use the exact libkrun that this process has loaded, which
+        // guarantees the packed binary gets a library with all required symbols.
+        // (Rarely fires for `pack create`: the builder VM boots in a subprocess,
+        // so the packer process itself never dlopens libkrun.)
         if let Some(dir) = Self::find_loaded_libkrun_dir() {
             debug!(lib_dir = %dir.display(), "using libkrun from running process");
             return Ok(dir);
         }
 
-        let source_tree_lib = if cfg!(target_os = "linux") {
-            PathBuf::from(format!("lib/linux-{}", std::env::consts::ARCH))
-        } else {
-            PathBuf::from("lib")
-        };
+        // Fallback: a few well-known locations the canonical resolver does not
+        // check (Homebrew, /usr/local/lib, and the current working directory).
+        let platform_lib = format!("lib/linux-{}", std::env::consts::ARCH);
+        let source_tree_lib = PathBuf::from(&platform_lib);
         let candidates = [
             // Relative to executable
             std::env::current_exe()
@@ -913,7 +1141,7 @@ impl PackCreateCmd {
 
         Err(Error::agent(
             "find libkrun",
-            "could not find libkrun library. Use --lib-dir to specify the location.",
+            "could not find libkrun library. Set SMOLVM_LIB_DIR or pass --lib-dir to specify the location.",
         ))
     }
 
@@ -1338,8 +1566,8 @@ impl PackPushCmd {
 
         let parsed = smolvm::registry::Reference::parse(&self.reference)
             .map_err(|e| Error::agent("parse reference", e.to_string()))?;
-        let config = smolvm::registry::RegistryConfig::load()?;
-        let client = build_registry_client(&parsed.registry, &config)?;
+        let settings = smolvm::SmolSettings::load()?;
+        let client = build_registry_client(&parsed.registry, &settings.machines)?;
 
         let repo = parsed.repository();
         let tag = parsed.tag.as_deref().unwrap_or("latest");
@@ -1388,8 +1616,8 @@ impl PackPullCmd {
     pub fn run(self) -> smolvm::Result<()> {
         let parsed = smolvm::registry::Reference::parse(&self.reference)
             .map_err(|e| Error::agent("parse reference", e.to_string()))?;
-        let config = smolvm::registry::RegistryConfig::load()?;
-        let client = build_registry_client(&parsed.registry, &config)?;
+        let settings = smolvm::SmolSettings::load()?;
+        let client = build_registry_client(&parsed.registry, &settings.machines)?;
 
         let repo = parsed.repository();
         let tag_or_digest = parsed
@@ -1426,6 +1654,22 @@ impl PackPullCmd {
             dest.display(),
             result.size,
         );
+
+        // Warn if the artifact targets a different host platform.
+        // This is not an error — the user may be inspecting or transferring
+        // the artifact — but it will not run on this host as-is.
+        if let Ok(manifest) = smolvm_pack::read_manifest_from_sidecar(&dest) {
+            let current = Platform::current().host_oci_platform();
+            if manifest.host_platform != current {
+                eprintln!(
+                    "Warning: this artifact was built for {} and will not run on {} (current platform).\
+                     \nTo run on {}, create a new pack:\
+                     \n\n  smolvm pack create --image {} -o <output>",
+                    manifest.host_platform, current, current, manifest.image,
+                );
+            }
+        }
+
         Ok(())
     }
 }
@@ -1453,8 +1697,8 @@ impl PackInspectCmd {
     pub fn run(self) -> smolvm::Result<()> {
         let parsed = smolvm::registry::Reference::parse(&self.reference)
             .map_err(|e| Error::agent("parse reference", e.to_string()))?;
-        let config = smolvm::registry::RegistryConfig::load()?;
-        let client = build_registry_client(&parsed.registry, &config)?;
+        let settings = smolvm::SmolSettings::load()?;
+        let client = build_registry_client(&parsed.registry, &settings.machines)?;
 
         let repo = parsed.repository();
         let tag_or_digest = parsed
@@ -1483,9 +1727,11 @@ async fn run_inspect(
     tag_or_digest: &str,
     json_output: bool,
 ) -> smolvm::Result<()> {
-    // Fetch OCI manifest (~200 bytes).
+    // Fetch the OCI manifest (~200 bytes), resolving a multi-platform index to
+    // this machine's host-platform entry — same as `pull`, so inspect agrees with
+    // what pull would actually download instead of rejecting multi-arch tags.
     let manifest_bytes = client
-        .get_manifest(repo, tag_or_digest)
+        .get_manifest_resolved(repo, tag_or_digest)
         .await
         .map_err(|e| Error::agent("fetch manifest", e.to_string()))?;
 
@@ -1531,7 +1777,17 @@ async fn run_inspect(
         println!("Reference:  {}", full_ref);
         println!("Image:      {}", pack_manifest.image);
         println!("Platform:   {}", pack_manifest.platform);
-        println!("Host:       {}", pack_manifest.host_platform);
+        {
+            let current = Platform::current().host_oci_platform();
+            if pack_manifest.host_platform == current {
+                println!("Host:       {}", pack_manifest.host_platform);
+            } else {
+                println!(
+                    "Host:       {}  [incompatible — current platform: {}]",
+                    pack_manifest.host_platform, current
+                );
+            }
+        }
         println!("CPUs:       {}", pack_manifest.cpus);
         println!("Memory:     {} MiB", pack_manifest.mem);
         if !pack_manifest.entrypoint.is_empty() {
@@ -1557,16 +1813,41 @@ fn build_registry_client(
     registry: &str,
     config: &smolvm::registry::RegistryConfig,
 ) -> smolvm::Result<smolvm_registry::RegistryClient> {
-    let base_url = if registry.starts_with("localhost") || registry.contains("127.0.0.1") {
-        format!("http://{}", registry)
+    let effective = config.get_mirror(registry).unwrap_or(registry);
+
+    // Docker Hub: the user-facing name is "docker.io" but the Distribution API
+    // endpoint is "registry-1.docker.io". The config key stays "docker.io" so
+    // credential lookup is consistent; only the HTTP endpoint changes.
+    let api_host = match effective {
+        "docker.io" => "registry-1.docker.io",
+        h => h,
+    };
+
+    let base_url = if smolvm_registry::is_local_registry(api_host) {
+        format!("http://{}", api_host)
     } else {
-        format!("https://{}", registry)
+        format!("https://{}", api_host)
     };
 
     let mut client = smolvm_registry::RegistryClient::new(base_url);
 
-    if let Some(auth) = config.get_credentials(registry) {
-        client = client.with_token(auth.password);
+    if let Some(entry) = config.registries.get(registry) {
+        if let Some(identity_token) = &entry.identity_token {
+            // Upstream credential (e.g. Auth0 JWT): exchanged with the token service
+            // per-operation to obtain a short-lived OCI bearer token.
+            client = client.with_identity_token(identity_token.clone());
+        } else if let Some(auth) = config.get_credentials(registry) {
+            if auth.username == "token" {
+                // Legacy direct-bearer convention: username="token" means the
+                // password value IS the bearer token, sent on every request.
+                client = client.with_token(auth.password);
+            } else {
+                // Standard Docker/OCI path: username+password are sent as Basic auth
+                // to the registry's token endpoint after a 401 Bearer challenge.
+                // Used for Docker Hub, GHCR, ECR, GCR, ACR, Harbor, and Quay.
+                client = client.with_basic_credentials(auth.username, auth.password);
+            }
+        }
     }
 
     Ok(client)
@@ -1579,6 +1860,29 @@ fn fmt_bytes(bytes: u64) -> String {
     } else {
         format!("{} MB", bytes / (1024 * 1024))
     }
+}
+
+/// Read a qcow2 image's virtual (guest-visible) size from its header — the
+/// big-endian `u64` at byte offset 24, per the qcow2 spec. Lets the flatten path
+/// size its raw output correctly without a qcow2 library.
+fn read_qcow2_virtual_size(path: &Path) -> smolvm::Result<u64> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path).map_err(|e| Error::agent("open qcow2", e.to_string()))?;
+    let mut magic = [0u8; 4];
+    f.read_exact(&mut magic)
+        .map_err(|e| Error::agent("read qcow2 magic", e.to_string()))?;
+    if &magic != b"QFI\xfb" {
+        return Err(Error::agent(
+            "read qcow2",
+            format!("{} is not a qcow2 image (bad magic)", path.display()),
+        ));
+    }
+    f.seek(SeekFrom::Start(24))
+        .map_err(|e| Error::agent("seek qcow2 size", e.to_string()))?;
+    let mut buf = [0u8; 8];
+    f.read_exact(&mut buf)
+        .map_err(|e| Error::agent("read qcow2 size", e.to_string()))?;
+    Ok(u64::from_be_bytes(buf))
 }
 
 /// A simple terminal spinner that prints a rotating character every 200ms.
@@ -1682,5 +1986,101 @@ mod tests {
         }
         // If None, libkrun wasn't loaded (e.g., weak link + library not found).
         // This is expected in some CI environments and is not a failure.
+    }
+
+    // ── build_registry_client auth path selection ────────────────────────────
+
+    #[test]
+    fn build_registry_client_uses_identity_token_when_set() {
+        let mut config = smolvm::registry::RegistryConfig::default();
+        config.registries.insert(
+            "registry.smolmachines.com".to_string(),
+            smolvm::registry::RegistryEntry {
+                identity_token: Some("eyJ_upstream_jwt".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let client = build_registry_client("registry.smolmachines.com", &config).unwrap();
+        assert_eq!(
+            client.identity_token(),
+            Some("eyJ_upstream_jwt"),
+            "identity_token must be passed to with_identity_token()"
+        );
+    }
+
+    #[test]
+    fn build_registry_client_standard_credentials_use_basic_auth() {
+        // A real username (not "token") triggers the Docker/OCI Basic challenge path.
+        let mut config = smolvm::registry::RegistryConfig::default();
+        config.registries.insert(
+            "ghcr.io".to_string(),
+            smolvm::registry::RegistryEntry {
+                username: Some("github_user".to_string()),
+                password: Some("ghp_secret".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let client = build_registry_client("ghcr.io", &config).unwrap();
+        assert_eq!(client.identity_token(), None);
+        assert_eq!(
+            client.basic_credentials(),
+            Some(("github_user", "ghp_secret")),
+            "standard username must route to with_basic_credentials()"
+        );
+    }
+
+    #[test]
+    fn build_registry_client_token_username_sends_direct_bearer() {
+        // username="token" is the legacy direct-bearer convention.
+        let mut config = smolvm::registry::RegistryConfig::default();
+        config.registries.insert(
+            "custom.registry.io".to_string(),
+            smolvm::registry::RegistryEntry {
+                username: Some("token".to_string()),
+                password: Some("bearer_value".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let client = build_registry_client("custom.registry.io", &config).unwrap();
+        assert_eq!(client.identity_token(), None);
+        assert_eq!(client.basic_credentials(), None);
+    }
+
+    #[test]
+    fn build_registry_client_docker_hub_uses_api_endpoint() {
+        // docker.io must map to registry-1.docker.io for Distribution API calls.
+        let config = smolvm::registry::RegistryConfig::default();
+        let client = build_registry_client("docker.io", &config).unwrap();
+        assert_eq!(
+            client.base_url(),
+            "https://registry-1.docker.io",
+            "docker.io must map to registry-1.docker.io"
+        );
+    }
+
+    #[test]
+    fn build_registry_client_identity_token_wins_over_password() {
+        // When both are set (shouldn't happen in practice after set_credentials clears
+        // identity_token, but we verify the precedence rule is enforced).
+        let mut config = smolvm::registry::RegistryConfig::default();
+        config.registries.insert(
+            "registry.smolmachines.com".to_string(),
+            smolvm::registry::RegistryEntry {
+                username: Some("user".to_string()),
+                password: Some("stale_password".to_string()),
+                identity_token: Some("eyJ_identity".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let client = build_registry_client("registry.smolmachines.com", &config).unwrap();
+        assert_eq!(
+            client.identity_token(),
+            Some("eyJ_identity"),
+            "identity_token must take precedence over password"
+        );
     }
 }

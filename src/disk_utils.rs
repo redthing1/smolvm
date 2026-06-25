@@ -1,3 +1,6 @@
+//! Disk image helpers: sparse creation, template/copy-on-write cloning, and
+//! resizing of the raw VM disk images.
+
 use crate::data::consts::BYTES_PER_GIB;
 use crate::data::disk::DiskType;
 use crate::error::{Error, Result};
@@ -92,6 +95,11 @@ pub(crate) fn copy_disk_from_template<D: DiskType>(
 
     clone_or_copy_file(template_path, disk_path)?;
 
+    // Extend the sparse file to the target size. The ext4 filesystem inside
+    // is still at the template's original size — the guest agent expands it
+    // at boot via resize2fs in a parallel thread (~10ms, non-blocking).
+    // We do NOT run resize2fs on the host: it takes ~880ms to expand the
+    // filesystem metadata synchronously, blocking the entire boot path.
     let current_size = std::fs::metadata(disk_path)
         .map_err(|e| Error::storage("read copied disk metadata", e.to_string()))?
         .len();
@@ -260,9 +268,14 @@ pub(crate) fn write_last_byte(
 
 /// Clone a file using the platform-optimal copy method.
 ///
-/// - macOS: `clonefile()` for instant APFS copy-on-write (falls back to `fs::copy`)
-/// - Linux: `fs::copy` (uses `copy_file_range` for sparse-aware copy)
-pub(crate) fn clone_or_copy_file(src: &Path, dst: &Path) -> Result<()> {
+/// - macOS: `clonefile()` for instant APFS copy-on-write
+/// - Linux: sparse copy via `SEEK_HOLE`/`SEEK_DATA` (copies only data regions)
+/// - Fallback: `fs::copy`
+///
+/// Disk templates are sparse files (~500KB actual data in a 512MB logical file).
+/// `std::fs::copy()` copies all bytes including zero regions. The sparse copy
+/// path skips holes, reducing copy time from ~400ms to ~5ms.
+pub fn clone_or_copy_file(src: &Path, dst: &Path) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
         use std::ffi::CString;
@@ -289,6 +302,88 @@ pub(crate) fn clone_or_copy_file(src: &Path, dst: &Path) -> Result<()> {
         );
     }
 
+    #[cfg(target_os = "linux")]
+    {
+        // TODO(reflink): try a FICLONE ioctl before sparse_copy for true
+        // copy-on-write on btrfs/XFS hosts. (Fork clones already get
+        // filesystem-independent block CoW via qcow2 overlays; this would only
+        // speed up the remaining full-copy callers on reflink-capable hosts.)
+        match sparse_copy(src, dst) {
+            Ok(bytes) => {
+                tracing::debug!(
+                    src = %src.display(), dst = %dst.display(),
+                    bytes_copied = bytes, "sparse copy succeeded"
+                );
+                return Ok(());
+            }
+            Err(e) => {
+                tracing::debug!(src = %src.display(), error = %e, "sparse copy failed, falling back");
+            }
+        }
+    }
+
     std::fs::copy(src, dst).map_err(|e| Error::storage("copy file", e.to_string()))?;
     Ok(())
+}
+
+/// Copy only data regions of a sparse file via SEEK_HOLE/SEEK_DATA.
+#[cfg(target_os = "linux")]
+fn sparse_copy(src: &Path, dst: &Path) -> std::io::Result<u64> {
+    use std::os::unix::io::AsRawFd;
+
+    let src_file = std::fs::File::open(src)?;
+    let src_len = src_file.metadata()?.len();
+    if src_len == 0 {
+        std::fs::File::create(dst)?;
+        return Ok(0);
+    }
+
+    let dst_file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(dst)?;
+    dst_file.set_len(src_len)?;
+
+    let src_fd = src_file.as_raw_fd();
+    let dst_fd = dst_file.as_raw_fd();
+    let mut total: u64 = 0;
+    let mut offset: i64 = 0;
+    let mut buf = vec![0u8; 256 * 1024];
+
+    loop {
+        let data_start = unsafe { libc::lseek(src_fd, offset, libc::SEEK_DATA) };
+        if data_start < 0 {
+            if std::io::Error::last_os_error().raw_os_error() == Some(libc::ENXIO) {
+                break;
+            }
+            return Err(std::io::Error::last_os_error());
+        }
+        let hole_start = unsafe { libc::lseek(src_fd, data_start, libc::SEEK_HOLE) };
+        let data_end = if hole_start < 0 {
+            src_len as i64
+        } else {
+            hole_start
+        };
+
+        let mut pos = data_start;
+        while pos < data_end {
+            let to_read = std::cmp::min((data_end - pos) as usize, buf.len());
+            let n =
+                unsafe { libc::pread(src_fd, buf.as_mut_ptr() as *mut libc::c_void, to_read, pos) };
+            if n <= 0 {
+                break;
+            }
+            let written = unsafe {
+                libc::pwrite(dst_fd, buf.as_ptr() as *const libc::c_void, n as usize, pos)
+            };
+            if written <= 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            pos += n as i64;
+            total += n as u64;
+        }
+        offset = data_end;
+    }
+    Ok(total)
 }

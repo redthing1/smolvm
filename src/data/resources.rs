@@ -46,6 +46,14 @@ pub struct VmResources {
     /// Allowed egress CIDR ranges. None = unrestricted, Some([]) = deny all.
     #[serde(default)]
     pub allowed_cidrs: Option<Vec<String>>,
+    /// Custom DNS resolver for the guest. None = backend default.
+    ///
+    /// Under TSI this becomes the guest's `/etc/resolv.conf` nameserver (the
+    /// guest's datagrams are proxied to it directly). Under virtio-net it
+    /// becomes the gateway's upstream resolver. Lets a VM on a network that
+    /// blocks the default resolver (e.g. 8.8.8.8) still resolve names.
+    #[serde(default)]
+    pub dns: Option<std::net::Ipv4Addr>,
 }
 
 /// Minimum memory required for the VM to boot (kernel + agent).
@@ -81,6 +89,21 @@ impl VmResources {
                 ),
             ));
         }
+        // `None` means "use the default size"; only an explicit 0 is invalid.
+        // Caught here so `machine create` rejects it up front instead of
+        // persisting a machine that can never start.
+        if self.storage_gib == Some(0) {
+            return Err(crate::Error::config(
+                "validate resources",
+                "storage disk size must be greater than 0 GiB",
+            ));
+        }
+        if self.overlay_gib == Some(0) {
+            return Err(crate::Error::config(
+                "validate resources",
+                "overlay disk size must be greater than 0 GiB",
+            ));
+        }
         Ok(())
     }
 }
@@ -97,6 +120,7 @@ impl Default for VmResources {
             storage_gib: None,
             overlay_gib: None,
             allowed_cidrs: None,
+            dns: None,
         }
     }
 }

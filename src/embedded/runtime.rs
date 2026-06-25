@@ -58,6 +58,39 @@ impl EmbeddedRuntime {
         })
     }
 
+    /// Start (or reconnect to) a persisted machine as a FORKABLE fork base and
+    /// cache its handle. Like [`start_machine`](Self::start_machine) but boots
+    /// with memfd-backed guest RAM + a control socket so it can later be forked
+    /// with [`fork_machine`](Self::fork_machine) — the basis for local RL rollout
+    /// branching.
+    pub fn start_forkable_machine(&self, name: &str) -> Result<()> {
+        self.with_name_lock(name, || {
+            if let Some(handle) = self.cached_handle(name)? {
+                if lock_handle(&handle)?.is_process_alive() {
+                    return Ok(());
+                }
+                self.remove_cached_handle(name)?;
+            }
+
+            let handle = control::start_forkable_vm(&self.db, name)?;
+            self.insert_handle(name, handle)?;
+            Ok(())
+        })
+    }
+
+    /// Fork a running, forkable `golden` into a new `clone` (copy-on-write guest
+    /// RAM + disks, same host) and cache the clone's handle so it can be exec'd
+    /// by name. `ports` are `(host, guest)` inbound forwards for the clone; empty
+    /// remaps the golden's forwards to fresh host ports. The golden freezes as the
+    /// shared base and must not be started again while clones exist.
+    pub fn fork_machine(&self, golden: &str, clone: &str, ports: &[(u16, u16)]) -> Result<()> {
+        self.with_name_lock(clone, || {
+            let handle = control::fork_vm(&self.db, golden, clone, ports)?;
+            self.insert_handle(clone, handle)?;
+            Ok(())
+        })
+    }
+
     /// Connect to an already-running machine and cache its handle.
     pub fn connect_machine(&self, name: &str) -> Result<()> {
         self.with_name_lock(name, || {
@@ -96,7 +129,13 @@ impl EmbeddedRuntime {
                 let _ = control::stop_vm(&self.db, name);
             }
 
-            control::delete_vm(&self.db, name)?;
+            // Idempotent: deleting an already-deleted machine is a no-op success
+            // (the desired end state — gone — already holds). Lets SDK callers
+            // call delete() more than once without an error.
+            match control::delete_vm(&self.db, name) {
+                Ok(()) | Err(crate::Error::VmNotFound { .. }) => {}
+                Err(e) => return Err(e),
+            }
             self.remove_name_lock(name)?;
             Ok(())
         })
@@ -177,6 +216,23 @@ impl EmbeddedRuntime {
         let handle = self.started_handle(name)?;
         let mut handle = lock_handle(&handle)?;
         handle.exec_streaming(command, env, workdir, timeout)
+    }
+
+    /// Execute a command, delivering streaming output events LIVE via the
+    /// callback as they arrive (no buffering). The live counterpart of
+    /// `exec_streaming`; SDKs bridge the callback to a native iterator.
+    pub fn exec_streaming_with<F: FnMut(ExecEvent)>(
+        &self,
+        name: &str,
+        command: Vec<String>,
+        env: Vec<(String, String)>,
+        workdir: Option<String>,
+        timeout: Option<Duration>,
+        on_event: F,
+    ) -> Result<()> {
+        let handle = self.started_handle(name)?;
+        let mut handle = lock_handle(&handle)?;
+        handle.exec_streaming_with(command, env, workdir, timeout, on_event)
     }
 
     /// Get the child PID if the machine is running.

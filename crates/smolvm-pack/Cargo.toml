@@ -1,9 +1,10 @@
 [package]
 name = "smolvm-pack"
-version = "0.7.0"
+version = "1.2.4"
 edition = "2021"
 description = "Single-binary packaging for smolvm"
 license = "Apache-2.0"
+repository = "https://github.com/smol-machines/smolvm"
 
 [features]
 default = ["packaging"]
@@ -14,6 +15,7 @@ zstd = ["dep:zstd"]
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+smolvm-protocol = { path = "../smolvm-protocol", version = "1.2.4" }
 tar = "0.4"
 zstd = { version = "0.13", optional = true }
 crc32fast = "1.4"

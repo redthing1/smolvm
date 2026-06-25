@@ -355,6 +355,27 @@ mkdir -p "$OUTPUT_DIR/storage"
 mkdir -p "$OUTPUT_DIR/etc/init.d"
 mkdir -p "$OUTPUT_DIR/run"
 
+# Bake in the agent's /mnt mount points so the rootfs is self-sufficient.
+#
+# At boot, setup_persistent_rootfs() (crates/smolvm-agent/src/main.rs) mounts
+# the overlay/storage disks and stages pivot_root under these paths BEFORE any
+# writable overlay exists — its create_dir_all() calls run against the agent
+# rootfs itself. On a read-only rootfs, or one built from scratch without the
+# Alpine base's empty /mnt, those mkdirs fail, the mounts fail, and the VM
+# boots without its persistent overlay. Pre-creating the dirs here makes those
+# runtime create_dir_all() calls a no-op (the agent keeps them as a backstop
+# and WARNs if a mount point is ever missing on a RO rootfs).
+#
+# Keep this list in sync with the agent's mount-point constants:
+#   /mnt/overlay  OVERLAY_MOUNT       } setup_persistent_rootfs(), required at
+#   /mnt/storage  STORAGE_TEMP_MOUNT  } boot before the overlay is writable
+#   /mnt/newroot  NEWROOT             }
+#   /mnt/virtiofs paths::VIRTIOFS_MOUNT_ROOT  parent for per-tag virtiofs shares
+#   /mnt/rosetta  vm::rosetta::ROSETTA_GUEST_PATH  macOS Rosetta binfmt share
+for mnt_dir in overlay storage newroot virtiofs rosetta; do
+    mkdir -p "$OUTPUT_DIR/mnt/$mnt_dir"
+done
+
 # Remove existing init (it's a symlink to busybox) and replace with
 # symlink to the agent binary. The agent handles overlayfs setup +
 # pivot_root internally before starting the vsock listener.

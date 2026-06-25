@@ -67,7 +67,9 @@ pub mod config;
 /// Canonical shared data models and constants used across adapters.
 pub mod data;
 pub mod db;
-mod disk_utils;
+pub mod disk_utils;
+pub mod dns_filter;
+pub mod dns_filter_listener;
 /// Language-neutral embedded runtime support shared by SDK adapters.
 pub mod embedded;
 pub mod image_store;
@@ -76,8 +78,11 @@ pub mod network;
 pub mod platform;
 pub mod process;
 pub mod registry;
+pub mod secrets;
+pub mod settings;
 pub mod smolfile;
 pub mod storage;
+pub mod systemd_scope;
 pub mod util;
 pub mod vm;
 
@@ -110,6 +115,7 @@ pub use db::SmolvmDb;
 pub use error::{Error, Result};
 pub use process::ChildProcess;
 pub use registry::{RegistryAuth, RegistryConfig};
+pub use settings::SmolSettings;
 pub use vm::config::{NetworkPolicy, RootfsSource, Timeouts, VmConfig, VmId};
 pub use vm::state::{ExitReason, VmState};
 pub use vm::{default_backend, VmBackend, VmHandle};

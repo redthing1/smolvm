@@ -7,6 +7,8 @@ pub mod disk;
 /// Canonical error types used by the shared data layer.
 #[path = "errors.rs"]
 pub mod error;
+/// Classifying `--image` into a registry ref, local archive, or rootfs dir.
+pub mod image_source;
 /// Canonical network-related data models.
 pub mod network;
 /// Canonical resource configuration data models.

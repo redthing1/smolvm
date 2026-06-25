@@ -41,12 +41,28 @@ pub struct KrunFunctions {
     pub disable_implicit_vsock: unsafe extern "C" fn(u32) -> i32,
     pub add_vsock: unsafe extern "C" fn(u32, u32) -> i32,
     pub set_console_output: unsafe extern "C" fn(u32, *const libc::c_char) -> i32,
-    pub set_egress_policy: Option<unsafe extern "C" fn(u32, *const *const libc::c_char) -> i32>,
+    pub set_egress_policy: Option<
+        unsafe extern "C" fn(
+            u32,
+            *const *const libc::c_char,
+            *const *const libc::c_char,
+            *const *const libc::c_char,
+        ) -> i32,
+    >,
     pub add_net_unixstream: Option<
         unsafe extern "C" fn(u32, *const libc::c_char, libc::c_int, *mut u8, u32, u32) -> i32,
     >,
     pub get_egress_handle: Option<unsafe extern "C" fn(u32) -> *mut libc::c_void>,
     pub set_gpu_options2: Option<unsafe extern "C" fn(u32, u32, u64) -> i32>,
+    /// Register a Unix control socket for the VM (pause/resume/checkpoint/restore).
+    pub set_control_socket: Option<unsafe extern "C" fn(u32, *const libc::c_char) -> i32>,
+    /// Boot the VM as a fork clone from a snapshot directory (CoW-map a golden
+    /// VM's RAM + restore state instead of cold-booting).
+    pub set_snapshot: Option<unsafe extern "C" fn(u32, *const libc::c_char) -> i32>,
+    /// Create a qcow2 copy-on-write overlay backed by an existing disk image
+    /// (used for fork-clone block disks). Pure filesystem op; takes no ctx.
+    pub create_disk_overlay:
+        Option<unsafe extern "C" fn(*const libc::c_char, *const libc::c_char, u32) -> i32>,
 }
 
 impl KrunFunctions {
@@ -80,7 +96,13 @@ impl KrunFunctions {
         let lib_path_c = CString::new(lib_path.to_string_lossy().as_bytes())
             .map_err(|_| "invalid library path")?;
 
-        let handle = libc::dlopen(lib_path_c.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL);
+        // RTLD_LAZY (not RTLD_NOW): a single libkrun built with the GPU feature
+        // references virglrenderer, but on Linux that NEEDED entry is stripped at
+        // package time so a host without virglrenderer can still load it. Lazy
+        // binding defers the virgl symbols until the GPU path actually calls them;
+        // preload_linux_gpu_dependencies() loads virglrenderer first when a GPU
+        // host has it. Non-GPU hosts never bind those symbols.
+        let handle = libc::dlopen(lib_path_c.as_ptr(), libc::RTLD_LAZY | libc::RTLD_LOCAL);
         if handle.is_null() {
             let err = dlerror_message();
             libc::dlclose(fw_handle);
@@ -137,6 +159,9 @@ impl KrunFunctions {
             add_net_unixstream: load_optional_sym!("krun_add_net_unixstream"),
             get_egress_handle: load_optional_sym!("krun_get_egress_handle"),
             set_gpu_options2: load_optional_sym!("krun_set_gpu_options2"),
+            set_control_socket: load_optional_sym!("krun_set_control_socket"),
+            set_snapshot: load_optional_sym!("krun_set_snapshot"),
+            create_disk_overlay: load_optional_sym!("krun_create_disk_overlay"),
         })
     }
 
@@ -260,6 +285,14 @@ fn preload_linux_gpu_dependencies(lib_dir: &Path) {
         let path = lib_dir.join(lib_name);
         if path.exists() {
             dlopen_global(&path);
+        } else {
+            // Not bundled: try the host's copy by soname. A GPU host has
+            // virglrenderer (and its X11/DRM/Mesa chain) installed system-wide;
+            // loading it RTLD_GLOBAL here lets libkrun's lazily-bound virgl
+            // symbols resolve when the GPU path runs. Best-effort — on a non-GPU
+            // host it simply isn't found, which is fine: those symbols are never
+            // called, and the libkrun NEEDED entry was stripped at package time.
+            dlopen_global_soname(lib_name);
         }
     }
 
@@ -293,31 +326,14 @@ fn dlopen_global(path: &Path) -> bool {
     true
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn virtiofs_mode_uses_add3_when_available() {
-        assert_eq!(
-            select_virtiofs_add_mode(false, true),
-            VirtiofsAddMode::Add3 { read_only: false }
-        );
-        assert_eq!(
-            select_virtiofs_add_mode(true, true),
-            VirtiofsAddMode::Add3 { read_only: true }
-        );
-    }
-
-    #[test]
-    fn virtiofs_mode_allows_legacy_rw_only() {
-        assert_eq!(
-            select_virtiofs_add_mode(false, false),
-            VirtiofsAddMode::LegacyReadWrite
-        );
-        assert_eq!(
-            select_virtiofs_add_mode(true, false),
-            VirtiofsAddMode::UnsupportedReadOnly
-        );
-    }
+/// Load a library by soname (no path), letting the dynamic loader search the
+/// host's standard library directories. Used to pick up a GPU host's
+/// system-installed virglrenderer when it isn't bundled. Best-effort: on a
+/// non-GPU host the library is absent, which is expected and not an error.
+#[cfg(target_os = "linux")]
+fn dlopen_global_soname(soname: &str) -> bool {
+    let Ok(soname_c) = CString::new(soname) else {
+        return false;
+    };
+    unsafe { !libc::dlopen(soname_c.as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL).is_null() }
 }

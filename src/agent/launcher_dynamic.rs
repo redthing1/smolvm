@@ -9,10 +9,10 @@
 use crate::network::backend::{COMPAT_NET_FEATURES, TSI_FEATURE_HIJACK_INET};
 use crate::network::{plan_launch_network, EffectiveNetworkBackend};
 use smolvm_network::{
-    guest_env, start_virtio_network, GuestNetworkConfig, PortMapping as VirtioPortMapping,
+    start_virtio_network, GuestNetworkConfig, PortMapping as VirtioPortMapping,
     VirtioNetworkRuntime,
 };
-use smolvm_protocol::ports;
+use smolvm_protocol::{guest_env, ports};
 use std::ffi::CString;
 use std::os::fd::RawFd;
 use std::path::{Path, PathBuf};
@@ -179,9 +179,6 @@ pub fn launch_agent_vm_dynamic(
     }
 
     let network_plan = plan_launch_network(&config.resources, None, config.port_mappings.len());
-    if let Some(reason) = network_plan.fallback_reason {
-        tracing::warn!(reason = %reason.user_message(), "network backend fell back to TSI");
-    }
 
     let mut virtio_network_runtime: Option<VirtioNetworkRuntime> = None;
     let guest_network = match network_plan.backend {
@@ -238,7 +235,13 @@ pub fn launch_agent_vm_dynamic(
                         cidr_cstrings.iter().map(|s| s.as_ptr()).collect();
                     cidr_ptrs.push(std::ptr::null());
 
-                    if unsafe { (set_egress)(ctx, cidr_ptrs.as_ptr()) } < 0 {
+                    // The dynamic path enforces CIDR-only egress; DNS allow-host
+                    // filtering (hosts + resolver args) is wired in the main
+                    // launcher path.
+                    if unsafe {
+                        (set_egress)(ctx, cidr_ptrs.as_ptr(), std::ptr::null(), std::ptr::null())
+                    } < 0
+                    {
                         free_ctx_on_err!("krun_set_egress_policy failed");
                     }
                 }
@@ -261,8 +264,12 @@ pub fn launch_agent_vm_dynamic(
                 .iter()
                 .map(|(host, guest)| VirtioPortMapping::new(*host, *guest))
                 .collect();
+            let egress = smolvm_network::EgressPolicy::from_allowed_cidrs(
+                config.resources.allowed_cidrs.as_deref(),
+            );
 
-            let runtime = match start_virtio_network(host_fd, guest_network, &port_mappings) {
+            let runtime = match start_virtio_network(host_fd, guest_network, &port_mappings, egress)
+            {
                 Ok(runtime) => runtime,
                 Err(err) => {
                     // SAFETY: guest_fd was created by socketpair above and not moved elsewhere.
@@ -375,6 +382,15 @@ pub fn launch_agent_vm_dynamic(
         }
     }
 
+    // Tell the agent GPU was requested so it creates /dev/dri nodes and starts
+    // seatd after pivot_root. Keep this in sync with the normal launcher.
+    if config.resources.gpu {
+        let gpu_env = format!("{}={}", guest_env::GPU, guest_env::VALUE_ON);
+        if let Ok(cstr) = CString::new(gpu_env) {
+            env_strings.push(cstr);
+        }
+    }
+
     if let Some(network) = guest_network {
         env_strings.push(cstr(&format!(
             "{}={}",
@@ -400,6 +416,21 @@ pub fn launch_agent_vm_dynamic(
             "{}={}",
             guest_env::GUEST_MAC,
             format_mac(network.guest_mac)
+        )));
+        env_strings.push(cstr(&format!(
+            "{}={}",
+            guest_env::GUEST_IP6,
+            network.guest_ip6
+        )));
+        env_strings.push(cstr(&format!(
+            "{}={}",
+            guest_env::GATEWAY6,
+            network.gateway_ip6
+        )));
+        env_strings.push(cstr(&format!(
+            "{}={}",
+            guest_env::PREFIX_LEN6,
+            network.prefix_len6
         )));
         env_strings.push(cstr(&format!("{}={}", guest_env::DNS, network.dns_server)));
     }

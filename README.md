@@ -24,8 +24,7 @@ Install
 smolvm machine run --net --image alpine -- echo hello
 ```
 
-The installer builds the current checkout and installs the resulting runtime
-under `~/.smolvm`, with a `smolvm` symlink in `~/.local/bin`.
+Or download from [GitHub Releases](https://github.com/smol-machines/smolvm/releases), and place it into `~/.local/share/`.
 
 Quick Start
 -----------
@@ -65,10 +64,24 @@ smolvm pack create --image python:3.12-alpine -o ./python312
 # Python 3.12.x — isolated, no pyenv/venv/conda needed
 ```
 
+**Use local container images** — for CI, air-gapped hosts, and fast iteration. Feed `--image` a `docker save` / `podman save` archive, pipe one on stdin, or point it at an unpacked rootfs directory. Image work is delegated to your container tooling; smolvm just boots the result.
+
+```bash
+# build locally, run in the VM with no push/pull
+docker build -t myapp .
+docker save myapp | smolvm machine run --image - -- ./app
+
+# from an archive file (boots with no network)
+smolvm machine run --image ./myapp.tar -- ./app
+
+# from an already-unpacked rootfs directory
+smolvm machine run --image ./rootfs/ -- ./app
+```
+
 **Persistent machines for development** — create, stop, start. Installed packages survive restarts.
 
 ```bash
-smolvm machine create --net myvm
+smolvm machine create --net --name myvm
 smolvm machine start --name myvm
 smolvm machine exec --name myvm -- apk add sl
 smolvm machine exec --name myvm -it -- /bin/sh
@@ -103,7 +116,7 @@ ssh_agent = true
 ```
 
 ```bash
-smolvm machine create myvm -s Smolfile
+smolvm machine create --name myvm -s Smolfile
 smolvm machine start --name myvm
 ```
 
@@ -145,7 +158,7 @@ Known Limitations
 -----------------
 
 * Network is opt-in (`--net` on `machine create`). TCP/UDP only, no ICMP.
-* Volume mounts: directories only (no single files).
+* Volume mounts: directories only (no single files). Mounting at `/workspace` (`-v /host/dir:/workspace`) takes priority over the default storage-disk workspace — your host directory is used instead.
 * macOS: binary must be signed with Hypervisor.framework entitlements.
 * `--ssh-agent` requires an SSH agent running on the host (`SSH_AUTH_SOCK` must be set).
 * GPU acceleration requires libkrun built with `GPU=1` and virglrenderer + a Vulkan driver on the host (see [GPU Acceleration](#gpu-acceleration) below).

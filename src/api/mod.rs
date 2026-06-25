@@ -57,6 +57,7 @@ use state::ApiState;
     ),
     tags(
         (name = "Health", description = "Health check endpoints"),
+        (name = "Node", description = "Node capacity introspection"),
         (name = "Machines", description = "Machine lifecycle management"),
         (name = "Execution", description = "Command execution in machines"),
         (name = "Logs", description = "Log streaming"),
@@ -66,6 +67,8 @@ use state::ApiState;
     paths(
         // Health
         handlers::health::health,
+        // Node
+        handlers::node::capacity,
         // Execution
         handlers::exec::exec_command,
         handlers::exec::exec_stream,
@@ -82,6 +85,7 @@ use state::ApiState;
         handlers::machines::list_machines,
         handlers::machines::get_machine,
         handlers::machines::start_machine,
+        handlers::machines::fork_machine,
         handlers::machines::stop_machine,
         handlers::machines::delete_machine,
         handlers::machines::exec_machine,
@@ -102,8 +106,11 @@ use state::ApiState;
         types::LogsQuery,
         types::MachineExecRequest,
         types::ResizeMachineRequest,
+        types::ForkRequest,
+        types::StartMachineQuery,
         // Response types
         types::HealthResponse,
+        types::CapacityResponse,
         types::MachineInfo,
         types::MountInfo,
         types::ListMachinesResponse,
@@ -141,8 +148,22 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
     // Health check route
     let health_route = Router::new().route("/health", get(handlers::health::health));
 
-    // SSE logs route (no timeout - streams indefinitely)
-    let logs_route = Router::new().route("/{id}/logs", get(handlers::exec::stream_logs));
+    // Node capacity introspection (polled by a fleet node-agent over HTTP).
+    let capacity_route = Router::new().route("/capacity", get(handlers::node::capacity));
+
+    // Explicit, control-initiated node drain (decommission). Stops all VMs
+    // cleanly. Control-only by construction (the listener is mTLS-gated; the
+    // loopback door is localhost). See docs/lossless-serve-restart.md.
+    let drain_route = Router::new().route("/drain", post(handlers::machines::drain_node));
+
+    // Long-lived streaming routes (no request timeout): SSE logs and the
+    // interactive PTY WebSocket both outlive the 5-minute API timeout.
+    let logs_route = Router::new()
+        .route("/{id}/logs", get(handlers::exec::stream_logs))
+        .route(
+            "/{id}/exec/interactive",
+            get(handlers::exec::exec_interactive),
+        );
 
     // Machine routes with timeout
     let machine_routes_with_timeout = Router::new()
@@ -150,6 +171,7 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
         .route("/", get(handlers::machines::list_machines))
         .route("/{id}", get(handlers::machines::get_machine))
         .route("/{id}/start", post(handlers::machines::start_machine))
+        .route("/{id}/fork", post(handlers::machines::fork_machine))
         .route("/{id}/stop", post(handlers::machines::stop_machine))
         .route("/{id}", delete(handlers::machines::delete_machine))
         // Exec routes
@@ -173,8 +195,17 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
         .merge(logs_route)
         .merge(machine_routes_with_timeout);
 
+    // Volume provisioning (node-side storage for the control plane): create the
+    // backing storage on THIS worker and return its host path. See
+    // handlers::volumes.
+    let volume_routes = Router::new()
+        .route("/", post(handlers::volumes::provision_volume))
+        .route("/{id}", delete(handlers::volumes::deprovision_volume));
+
     // API v1 routes
-    let api_v1 = Router::new().nest("/machines", machine_routes);
+    let api_v1 = Router::new()
+        .nest("/machines", machine_routes)
+        .nest("/volumes", volume_routes);
 
     // CORS: Use configured origins, or default to localhost for security.
     let default_origins = || {
@@ -228,6 +259,8 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
     // Combine all routes
     Router::new()
         .merge(health_route)
+        .merge(capacity_route)
+        .merge(drain_route)
         .merge(metrics_route)
         .nest("/api/v1", api_v1)
         .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()))

@@ -9,7 +9,8 @@
 
 use crate::client::RegistryClient;
 use crate::{
-    OciDescriptor, OciManifest, Result, CONFIG_MEDIA_TYPE, LAYER_MEDIA_TYPE, MANIFEST_MEDIA_TYPE,
+    OciDescriptor, OciIndex, OciIndexManifest, OciManifest, OciPlatform, Result, CONFIG_MEDIA_TYPE,
+    INDEX_MEDIA_TYPE, LAYER_MEDIA_TYPE, MANIFEST_MEDIA_TYPE,
 };
 use sha2::{Digest, Sha256};
 use std::path::Path;
@@ -24,6 +25,11 @@ pub struct PushResult {
     pub layer_size: u64,
     /// Digest of the OCI manifest.
     pub manifest_digest: String,
+    /// Host platform this artifact targets (e.g. `linux/amd64`).
+    pub platform: String,
+    /// The per-platform tag the manifest was also tagged under (e.g.
+    /// `latest-linux-amd64`).
+    pub platform_tag: String,
 }
 
 /// Push a `.smolmachine` sidecar to the registry.
@@ -65,14 +71,31 @@ pub async fn push(
     let manifest = smolvm_pack::read_manifest_from_sidecar(smolmachine_path)?;
     let config_json = serde_json::to_vec_pretty(&manifest)?;
 
-    // 3. Stream-upload sidecar as the layer blob (pass 2: re-read file as stream).
-    tracing::info!("uploading sidecar blob...");
-    let file = tokio::fs::File::open(smolmachine_path).await?;
-    let stream = tokio_util::io::ReaderStream::with_capacity(file, 256 * 1024);
-    let body = reqwest::Body::wrap_stream(stream);
-    client
-        .push_blob_stream(repo, &layer_digest, layer_size, body)
-        .await?;
+    // 3. Upload the sidecar as the layer blob. Large blobs go chunked (POST +
+    // per-chunk PATCH + PUT) so a body-size-capping proxy in front of the
+    // registry (e.g. Cloudflare, which 413s a multi-hundred-MB monolithic PUT)
+    // never sees an oversized request; smaller blobs keep the single-PUT stream.
+    let chunk_size = crate::client::upload_chunk_size();
+    if layer_size as usize > chunk_size {
+        tracing::info!(chunk_size, "uploading sidecar blob (chunked)...");
+        client
+            .push_blob_chunked(repo, &layer_digest, smolmachine_path, chunk_size)
+            .await?;
+    } else {
+        // The factory reopens the file on each call so that a 401 mid-upload can
+        // be retried with a fresh stream. The OS page cache makes reopens cheap.
+        tracing::info!("uploading sidecar blob...");
+        let path = smolmachine_path.to_path_buf();
+        client
+            .push_blob_stream(repo, &layer_digest, layer_size, move || {
+                // std::fs::File::open is synchronous but fast (just a syscall).
+                let file = std::fs::File::open(&path).map_err(crate::RegistryError::from)?;
+                let async_file = tokio::fs::File::from_std(file);
+                let stream = tokio_util::io::ReaderStream::with_capacity(async_file, 256 * 1024);
+                Ok(reqwest::Body::wrap_stream(stream))
+            })
+            .await?;
+    }
 
     // 4. Upload config blob (small, buffered is fine).
     tracing::info!("uploading config blob...");
@@ -96,21 +119,64 @@ pub async fn push(
     };
 
     let manifest_json = serde_json::to_vec_pretty(&oci_manifest)?;
+    let manifest_size = manifest_json.len() as u64;
     let manifest_digest = format!("sha256:{}", hex::encode(Sha256::digest(&manifest_json)));
 
-    // 6. PUT manifest.
-    tracing::info!(reference = %reference, "uploading manifest...");
-    client.put_manifest(repo, reference, &manifest_json).await?;
+    // 6. Store the single-platform manifest content-addressably (by digest), and
+    //    also tag it per platform (e.g. `latest-linux-amd64`) so a specific
+    //    platform is directly pullable.
+    //
+    //    Key the index entry on the GUEST platform (`linux/<arch>`), not the
+    //    builder's `host_platform`. The `.smolmachine` sidecar is selected on
+    //    pull by guest arch (client.rs matches `os == linux && arch == host
+    //    arch`); keying on `host_platform` made artifacts built on macOS index
+    //    as `darwin/arm64`, which pull could never select. On Linux builders
+    //    `platform == host_platform`, so this is a no-op there.
+    let platform = OciPlatform::parse(&manifest.platform);
+    let platform_tag = format!("{reference}-{}-{}", platform.os, platform.architecture);
+    tracing::info!(digest = %manifest_digest, platform = %platform.label(), "uploading manifest...");
+    client
+        .put_manifest(repo, &manifest_digest, &manifest_json)
+        .await?;
+    client
+        .put_manifest(repo, &platform_tag, &manifest_json)
+        .await?;
 
-    tracing::info!(
-        digest = %manifest_digest,
-        layer_size,
-        "push complete"
-    );
+    // 7. Maintain an image index at `reference` so the tag fans out by platform.
+    //    Merge with any existing index (replacing this platform's entry); a
+    //    legacy single-manifest tag is replaced by a fresh index.
+    let entry = OciIndexManifest {
+        media_type: MANIFEST_MEDIA_TYPE.to_string(),
+        digest: manifest_digest.clone(),
+        size: manifest_size,
+        platform: Some(platform.clone()),
+    };
+    let mut manifests = match client.get_manifest_raw(repo, reference).await {
+        Ok((bytes, ct)) if ct.contains(INDEX_MEDIA_TYPE) => {
+            serde_json::from_slice::<OciIndex>(&bytes)
+                .map(|i| i.manifests)
+                .unwrap_or_default()
+        }
+        _ => Vec::new(),
+    };
+    manifests.retain(|m| m.platform.as_ref() != Some(&platform));
+    manifests.push(entry);
+    let index = OciIndex {
+        schema_version: 2,
+        media_type: INDEX_MEDIA_TYPE.to_string(),
+        manifests,
+    };
+    let index_json = serde_json::to_vec_pretty(&index)?;
+    tracing::info!(reference = %reference, platforms = index.manifests.len(), "updating image index...");
+    client.put_manifest(repo, reference, &index_json).await?;
+
+    tracing::info!(digest = %manifest_digest, layer_size, "push complete");
 
     Ok(PushResult {
         layer_digest,
         layer_size,
         manifest_digest,
+        platform: platform.label(),
+        platform_tag,
     })
 }

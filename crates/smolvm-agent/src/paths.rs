@@ -27,11 +27,22 @@ pub const CRUN_CGROUP_MANAGER: &str = "disabled";
 // =============================================================================
 
 /// Root directory for virtiofs mounts from the host.
-///
-/// Keep this outside `/mnt`: users commonly mount host directories at `/mnt`,
-/// and using `/mnt/virtiofs` as an internal staging path makes `/mnt` an
-/// ancestor of the source mount for image-backed containers.
-pub const VIRTIOFS_MOUNT_ROOT: &str = "/run/smolvm/virtiofs";
+pub const VIRTIOFS_MOUNT_ROOT: &str = "/mnt/virtiofs";
+
+/// Guest path at which the shared workspace is exposed inside containers.
+/// Used both when mounting /storage/workspace as the fallback workspace and
+/// when checking whether a user-provided volume already claims this path.
+pub const WORKSPACE_GUEST_PATH: &str = "/workspace";
+
+// =============================================================================
+// Storage Paths
+// =============================================================================
+
+/// Root directory for all persistent storage.
+pub const STORAGE_ROOT: &str = "/storage";
+
+/// Directory for overlay filesystems.
+pub const OVERLAYS_DIR: &str = "/storage/overlays";
 
 // =============================================================================
 // Container Runtime Paths
@@ -45,33 +56,6 @@ pub const CONTAINERS_LOGS_DIR: &str = "/storage/containers/logs";
 
 /// Directory for container exit code files.
 pub const CONTAINERS_EXIT_DIR: &str = "/storage/containers/exit";
-
-// =============================================================================
-// Storage Paths
-// =============================================================================
-
-/// Root directory for all persistent storage.
-#[allow(dead_code)]
-pub const STORAGE_ROOT: &str = "/storage";
-
-/// Directory for overlay filesystems.
-pub const OVERLAYS_DIR: &str = "/storage/overlays";
-
-/// Path to the persistent container registry file.
-#[allow(dead_code)]
-pub const REGISTRY_PATH: &str = "/storage/containers/registry.json";
-
-/// Path to the registry lock file.
-#[allow(dead_code)]
-pub const REGISTRY_LOCK_PATH: &str = "/storage/containers/registry.lock";
-
-// =============================================================================
-// Timeouts (milliseconds)
-// =============================================================================
-
-/// Timeout for acquiring registry lock.
-#[allow(dead_code)]
-pub const REGISTRY_LOCK_TIMEOUT_MS: u64 = 5000;
 
 // =============================================================================
 // Path Helper Functions

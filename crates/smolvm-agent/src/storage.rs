@@ -12,10 +12,10 @@ use crate::crun::CrunCommand;
 use crate::oci::{generate_container_id, OciSpec};
 use crate::paths;
 use crate::process::{WaitResult, TIMEOUT_EXIT_CODE};
-use smolvm_network::guest_env;
-use smolvm_protocol::{ImageInfo, OverlayInfo, RegistryAuth, StorageStatus};
-use std::ffi::CString;
-use std::os::unix::fs::PermissionsExt;
+use smolvm_protocol::guest_env;
+use smolvm_protocol::{
+    image_repo, normalize_image_ref, ImageInfo, OverlayInfo, RegistryAuth, StorageStatus,
+};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
@@ -179,9 +179,11 @@ fn ensure_mount_target_under_root(rootfs: &Path, container_path: &str) -> Result
     })?;
 
     let relative = validate_container_destination_path(container_path)?;
+    let components: Vec<_> = relative.components().collect();
+    let last_idx = components.len().saturating_sub(1);
     let mut current = root_canon.clone();
 
-    for component in relative.components() {
+    for (idx, component) in components.into_iter().enumerate() {
         let std::path::Component::Normal(seg) = component else {
             return Err(StorageError::ValidationFailed {
                 context: "mount destination".to_string(),
@@ -203,9 +205,31 @@ fn ensure_mount_target_under_root(rootfs: &Path, container_path: &str) -> Result
                             reason: "resolved path escapes rootfs".to_string(),
                         });
                     }
-                }
-
-                if !meta.is_dir() {
+                    if idx == last_idx {
+                        // The mount target itself is a symlink within the rootfs.
+                        // Previous VM runs can leave such symlinks (e.g. /workspace →
+                        // /storage/workspace) in the writable agent rootfs. Replace it
+                        // with a real directory so the bind mount claims the path
+                        // directly rather than following through to the symlink target.
+                        std::fs::remove_file(&current).map_err(|e| StorageError::ReadFile {
+                            path: current.display().to_string(),
+                            cause: format!("failed to remove symlink at mount target: {}", e),
+                        })?;
+                        std::fs::create_dir(&current).map_err(|err| StorageError::CreateDir {
+                            path: current.display().to_string(),
+                            cause: err.to_string(),
+                        })?;
+                    } else if !current.is_dir() {
+                        // Intermediate symlink must resolve to a directory.
+                        return Err(StorageError::ValidationFailed {
+                            context: "mount destination".to_string(),
+                            reason: format!(
+                                "destination component is not a directory: {}",
+                                current.display()
+                            ),
+                        });
+                    }
+                } else if !meta.is_dir() {
                     return Err(StorageError::ValidationFailed {
                         context: "mount destination".to_string(),
                         reason: format!(
@@ -401,79 +425,95 @@ pub fn init_volume_mounts() -> Result<&'static [(String, String, bool)]> {
         .expect("boot volume mounts were just initialized"))
 }
 
-fn parse_boot_volume_mounts_from_env() -> Result<Vec<(String, String, bool)>> {
-    let count: usize = match std::env::var("SMOLVM_MOUNT_COUNT") {
-        Ok(v) => v.parse().map_err(|_| StorageError::ValidationFailed {
-            context: "SMOLVM_MOUNT_COUNT".to_string(),
-            reason: format!("invalid count: {}", v),
-        })?,
-        Err(_) => return Ok(Vec::new()),
-    };
-
-    let mut mounts = Vec::with_capacity(count);
-    for i in 0..count {
-        let env_key = format!("SMOLVM_MOUNT_{}", i);
-        let env_val = std::env::var(&env_key).map_err(|_| StorageError::ValidationFailed {
-            context: env_key.clone(),
-            reason: "missing mount environment variable".to_string(),
-        })?;
-
-        // Parse "tag:guest_path:ro|rw".
-        let parts: Vec<&str> = env_val.splitn(3, ':').collect();
-        if parts.len() != 3 {
-            return Err(StorageError::ValidationFailed {
-                context: env_key,
-                reason: format!("invalid mount format, expected tag:path:ro|rw: {}", env_val),
-            });
-        }
-
-        let read_only = match parts[2] {
-            "ro" => true,
-            "rw" => false,
-            mode => {
-                return Err(StorageError::ValidationFailed {
-                    context: env_key,
-                    reason: format!("invalid mount mode: {}", mode),
-                });
-            }
-        };
-
-        let tag = parts[0].to_string();
-        let guest_path = parts[1].to_string();
-        info!(tag = %tag, guest_path = %guest_path, read_only = read_only, "boot volume mount");
-        mounts.push((tag, guest_path, read_only));
+/// Add the /storage/workspace → /workspace fallback bind mount to an OCI spec,
+/// unless a user-provided volume already claims /workspace.
+///
+/// The fallback exposes the storage disk's workspace directory inside containers
+/// so that persistent files written to /workspace survive across VM restarts.
+/// It must be skipped when the user provides `-v host:/workspace` to avoid
+/// silently overwriting their virtiofs mount (which comes earlier in the spec).
+///
+/// Mount target comparison is slash-normalized to handle trailing slashes.
+pub fn add_workspace_fallback(spec: &mut OciSpec, mounts: &[(String, String, bool)]) {
+    let workspace_src = Path::new(STORAGE_ROOT).join(WORKSPACE_DIR);
+    if !workspace_src.exists() {
+        return;
     }
-
-    Ok(mounts)
+    let user_owns_workspace = mounts
+        .iter()
+        .any(|(_, path, _)| path.trim_end_matches('/') == paths::WORKSPACE_GUEST_PATH);
+    if !user_owns_workspace {
+        spec.add_bind_mount(
+            &workspace_src.to_string_lossy(),
+            paths::WORKSPACE_GUEST_PATH,
+            false,
+        );
+    }
 }
 
-/// Create ImageInfo from preloaded image data.
-fn create_preloaded_image_info(image: &str, image_dir: &Path) -> Result<ImageInfo> {
-    if let Some(mut info) = read_preloaded_image_metadata(image_dir)? {
-        info.reference = image.to_string();
-        return Ok(info);
-    }
+/// Name of the optional index file (written into the packed-layers dir at
+/// extraction time) recording the layers in OCI order, bottom-most first, one
+/// short layer id per line.
+///
+/// Packed layer subdirs are content-addressed (named by digest), so sorting
+/// their names does NOT reproduce the manifest's stacking order. That is fine
+/// for the common single-flattened-layer image, but a multi-layer pack (e.g. an
+/// init-cache base + init-overlay layer from `pack create --from-vm`) gets
+/// mis-stacked: the base can sort above the overlay, so overlayfs shadows the
+/// overlay's in-place edits to base files (`/etc/ld.so.cache`,
+/// `/var/lib/dpkg/status`) while keeping its new files — installed packages then
+/// appear on disk but unregistered, and libs in multiarch dirs fail to load.
+/// Honoring this index restores the true order; absent (older packs) we fall
+/// back to a name sort.
+const LAYER_ORDER_FILE: &str = "layer-order";
 
-    let mut layer_dirs: Vec<String> = Vec::new();
-
-    let entries = std::fs::read_dir(image_dir)
-        .map_err(|e| StorageError::read_error(image_dir.display().to_string(), e))?;
-
+/// Packed layer directory names in OCI order, **bottom-most layer first**.
+///
+/// Honors [`LAYER_ORDER_FILE`] when present and self-consistent; otherwise falls
+/// back to a lexical name sort (correct for the single-flattened-layer case).
+/// Only names backed by an existing subdirectory are returned, which also drops
+/// stray non-layer dirs (e.g. macOS `.fseventsd`) when the index is present.
+fn ordered_packed_layer_names(packed_dir: &Path) -> Result<Vec<String>> {
+    // The layer subdirs actually present (excluding source `.tar` files and the
+    // order index itself, which is a plain file).
+    let mut present: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let entries = std::fs::read_dir(packed_dir)
+        .map_err(|e| StorageError::read_error(packed_dir.display().to_string(), e))?;
     for entry in entries {
-        let entry: std::fs::DirEntry = entry?;
-        let path = entry.path();
-        if path.is_dir() {
+        let entry = entry?;
+        if entry.path().is_dir() {
             let name = entry.file_name().to_string_lossy().to_string();
-            // Skip .tar files, only use directories
             if !name.ends_with(".tar") {
-                // Store as sha256:{short_digest} for consistency
-                layer_dirs.push(format!("sha256:{}", name));
+                present.insert(name);
             }
         }
     }
 
-    // Sort for consistent ordering
-    layer_dirs.sort();
+    // Prefer the explicit order index when it resolves to layers we actually have.
+    if let Ok(contents) = std::fs::read_to_string(packed_dir.join(LAYER_ORDER_FILE)) {
+        let ordered: Vec<String> = contents
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| present.contains(l))
+            .collect();
+        if !ordered.is_empty() {
+            return Ok(ordered);
+        }
+    }
+
+    // Fallback: name sort (BTreeSet is already ascending = bottom→top by the
+    // legacy "stub creates layers in order" convention).
+    Ok(present.into_iter().collect())
+}
+
+/// Create a synthetic ImageInfo from packed layers.
+/// This is used when running from a packed binary where layers are pre-extracted.
+fn create_packed_image_info(image: &str, packed_dir: &Path) -> Result<ImageInfo> {
+    // Layer dirs in OCI order (bottom→top), as sha256:{short_digest} ids.
+    let layer_dirs: Vec<String> = ordered_packed_layer_names(packed_dir)?
+        .into_iter()
+        .map(|name| format!("sha256:{}", name))
+        .collect();
 
     // Calculate approximate size
     let mut total_size = 0u64;
@@ -493,6 +533,11 @@ fn create_preloaded_image_info(image: &str, image_dir: &Path) -> Result<ImageInf
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     let architecture = "unknown".to_string();
 
+    // For a flattened local archive these come from the recovered image config;
+    // a .smolmachine has no config.json so they stay empty (its config lives in
+    // the PackManifest).
+    let (entrypoint, cmd, env, workdir, user) = read_packed_image_config(packed_dir);
+
     Ok(ImageInfo {
         reference: image.to_string(),
         digest: "preloaded".to_string(),
@@ -502,24 +547,272 @@ fn create_preloaded_image_info(image: &str, image_dir: &Path) -> Result<ImageInf
         os: "linux".to_string(),
         layer_count: layer_dirs.len(),
         layers: layer_dirs,
-        entrypoint: Vec::new(),
-        cmd: Vec::new(),
-        env: Vec::new(),
-        workdir: None,
-        user: None,
+        entrypoint,
+        cmd,
+        env,
+        workdir,
+        user,
     })
 }
 
-fn read_preloaded_image_metadata(image_dir: &Path) -> Result<Option<ImageInfo>> {
-    let metadata_path = image_dir.join(IMAGE_METADATA_FILENAME);
-    if !metadata_path.is_file() {
+// =============================================================================
+// Local image archives (`docker save` / `podman save`)
+// =============================================================================
+//
+// smolvm delegates turning a saved-image archive into a rootfs to the bundled
+// `crane` (and `gunzip`/`tar`) rather than parsing OCI layers itself. The host
+// stages `archive.tar` into a content-addressed dir mounted via virtiofs as the
+// packed-layers dir; here we flatten it once into a rootfs on the writable
+// storage disk, recover the image config, and present it as a single packed
+// layer that the existing overlay path consumes.
+
+/// Filename the host stages the saved-image archive under.
+const ARCHIVE_FILE_NAME: &str = "archive.tar";
+/// Subdir the flattened rootfs is written to (a single packed "layer").
+const ARCHIVE_ROOTFS_DIR: &str = "0000_rootfs";
+/// Recovered image config (`crane config` output) beside the rootfs.
+const ARCHIVE_CONFIG_FILE: &str = "config.json";
+/// Marker written once a flatten completes, so restarts reuse it.
+const ARCHIVE_EXTRACTED_MARKER: &str = ".extracted";
+
+/// If `packed_dir` is a staged local image archive (it contains `archive.tar`),
+/// flatten it once into a rootfs on the storage disk and return that directory
+/// (holding `0000_rootfs/` + `config.json`). Returns `None` for an ordinary
+/// packed-layers dir (a `.smolmachine`'s pre-extracted layers).
+///
+/// The output is keyed by the virtiofs mount-point name (constant per VM, since
+/// `/storage` is per-machine), and the completion marker stores the archive's
+/// size+mtime signature. A start reuses the flatten only when that signature
+/// still matches, so a machine re-created from a different image on a reused
+/// disk re-flattens instead of booting the old rootfs. The marker is written
+/// last, so the image-info and overlay paths share one flatten within a start.
+fn ensure_archive_flattened(packed_dir: &Path) -> Result<Option<PathBuf>> {
+    let archive = packed_dir.join(ARCHIVE_FILE_NAME);
+    if !archive.exists() {
         return Ok(None);
     }
-    let text = std::fs::read_to_string(&metadata_path)
-        .map_err(|e| StorageError::read_error(metadata_path.display().to_string(), e))?;
-    let info = serde_json::from_str(&text)
-        .map_err(|e| StorageError::parse_error(IMAGE_METADATA_FILENAME, e))?;
-    Ok(Some(info))
+    let key = packed_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("archive");
+    let out_base = Path::new(STORAGE_ROOT).join("image-archives").join(key);
+    let marker = out_base.join(ARCHIVE_EXTRACTED_MARKER);
+    let signature = archive_signature(&archive)?;
+    if std::fs::read_to_string(&marker).ok().as_deref() == Some(signature.as_str()) {
+        return Ok(Some(out_base));
+    }
+
+    // First flatten, or the archive changed under a reused disk: rebuild.
+    let _ = std::fs::remove_dir_all(&out_base);
+    let rootfs = out_base.join(ARCHIVE_ROOTFS_DIR);
+    std::fs::create_dir_all(&rootfs)?;
+    info!(archive = %archive.display(), rootfs = %rootfs.display(), "flattening local image archive");
+    flatten_archive(&archive, &rootfs)?;
+    // Recover the image config before writing the marker, so a later reuse can
+    // rely on config.json being present. A docker/podman `save` always carries
+    // one.
+    recover_archive_config(&archive, &out_base.join(ARCHIVE_CONFIG_FILE))?;
+    std::fs::write(&marker, signature)?;
+    Ok(Some(out_base))
+}
+
+/// A cheap content signature for a staged archive (size + mtime), used to
+/// invalidate a stale flatten when a reused disk's archive changed.
+fn archive_signature(archive: &Path) -> Result<String> {
+    let meta = std::fs::metadata(archive)?;
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    Ok(format!("{}:{}", meta.len(), mtime))
+}
+
+/// Feed an archive to `cmd`'s stdin, transparently `gunzip`-ing a gzipped outer
+/// archive. Returns the spawned `gunzip` child (if any) to wait on afterwards.
+fn pipe_archive_into(cmd: &mut Command, archive: &Path) -> Result<Option<std::process::Child>> {
+    let file = std::fs::File::open(archive)?;
+    if !is_gzip(archive)? {
+        cmd.stdin(Stdio::from(file));
+        return Ok(None);
+    }
+    let mut gunzip = Command::new("gunzip")
+        .arg("-c")
+        .stdin(file)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| StorageError::new(format!("failed to spawn gunzip: {e}")))?;
+    let out = gunzip
+        .stdout
+        .take()
+        .ok_or_else(|| StorageError::new("failed to capture gunzip stdout".to_string()))?;
+    cmd.stdin(Stdio::from(out));
+    Ok(Some(gunzip))
+}
+
+/// Flatten a `docker save` archive into `rootfs`, delegating to the bundled
+/// `crane export`. The flattened tar is a single layer with no whiteouts, so
+/// plain `tar -x` is sufficient (no per-layer handling needed).
+fn flatten_archive(archive: &Path, rootfs: &Path) -> Result<()> {
+    // crane export - - : read an image tarball from stdin, write a flat rootfs
+    // tar to stdout.
+    let mut crane = Command::new("crane");
+    crane
+        .args(["export", "-", "-"])
+        .stdout(Stdio::piped())
+        // Capture (don't discard) crane's stderr so a failure reports the REAL
+        // reason — e.g. "file manifest.json not found in tar" for an empty or
+        // truncated archive — instead of a misleading guess.
+        .stderr(Stdio::piped());
+    let gunzip = pipe_archive_into(&mut crane, archive)?;
+
+    let mut crane_child = crane
+        .spawn()
+        .map_err(|e| StorageError::new(format!("failed to spawn crane export: {e}")))?;
+    let crane_out = crane_child
+        .stdout
+        .take()
+        .ok_or_else(|| StorageError::new("failed to capture crane stdout".to_string()))?;
+    let mut crane_err = crane_child
+        .stderr
+        .take()
+        .ok_or_else(|| StorageError::new("failed to capture crane stderr".to_string()))?;
+
+    let tar_out = Command::new("tar")
+        .arg("-x")
+        .arg("-C")
+        .arg(rootfs)
+        .stdin(Stdio::from(crane_out))
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|e| StorageError::new(format!("failed to run tar: {e}")))?;
+
+    let crane_status = crane_child
+        .wait()
+        .map_err(|e| StorageError::new(format!("failed to wait for crane: {e}")))?;
+    if let Some(mut g) = gunzip {
+        let _ = g.wait();
+    }
+
+    if !crane_status.success() {
+        // crane's stderr is a single short line; reading it after the process
+        // exits (its stdout was drained by `tar`) cannot deadlock.
+        let mut stderr = String::new();
+        let _ = std::io::Read::read_to_string(&mut crane_err, &mut stderr);
+        let stderr = stderr.trim();
+        return Err(StorageError::new(format!(
+            "crane export failed{} (is the image a valid `docker save` / OCI archive?)",
+            if stderr.is_empty() {
+                String::new()
+            } else {
+                format!(": {stderr}")
+            }
+        )));
+    }
+    if !tar_out.status.success() {
+        return Err(StorageError::new(format!(
+            "extracting flattened rootfs failed: {}",
+            String::from_utf8_lossy(&tar_out.stderr)
+        )));
+    }
+    Ok(())
+}
+
+/// Recover the image config (Entrypoint/Cmd/Env/…) from a `docker save` archive
+/// and write it to `dest`. The archive's `manifest.json` names the config blob
+/// under its `Config` key; both are small JSON members extracted with `tar`
+/// (image metadata, not layer/rootfs assembly — that stays delegated to crane).
+fn recover_archive_config(archive: &Path, dest: &Path) -> Result<()> {
+    let manifest_bytes = extract_tar_member(archive, "manifest.json")?;
+    let manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes)
+        .map_err(|e| StorageError::new(format!("parse archive manifest.json: {e}")))?;
+    let config_path = manifest[0]["Config"].as_str().ok_or_else(|| {
+        StorageError::new("archive manifest.json has no Config entry".to_string())
+    })?;
+    let config_bytes = extract_tar_member(archive, config_path)?;
+    std::fs::write(dest, &config_bytes)?;
+    Ok(())
+}
+
+/// Extract a single named member from an archive to memory via `tar -xO`,
+/// transparently `gunzip`-ing a gzipped outer archive.
+fn extract_tar_member(archive: &Path, member: &str) -> Result<Vec<u8>> {
+    let mut tar = Command::new("tar");
+    tar.args(["-x", "-O", "-f", "-"])
+        .arg(member)
+        .stderr(Stdio::null());
+    let gunzip = pipe_archive_into(&mut tar, archive)?;
+    let out = tar
+        .output()
+        .map_err(|e| StorageError::new(format!("failed to run tar: {e}")))?;
+    if let Some(mut g) = gunzip {
+        let _ = g.wait();
+    }
+    if !out.status.success() || out.stdout.is_empty() {
+        return Err(StorageError::new(format!(
+            "could not read '{member}' from archive"
+        )));
+    }
+    Ok(out.stdout)
+}
+
+/// Whether a file begins with the gzip magic bytes (`1f 8b`).
+fn is_gzip(path: &Path) -> Result<bool> {
+    use std::io::Read;
+    let mut magic = [0u8; 2];
+    match std::fs::File::open(path)?.read(&mut magic) {
+        Ok(2) => Ok(magic == [0x1f, 0x8b]),
+        _ => Ok(false),
+    }
+}
+
+/// Read `Entrypoint`/`Cmd`/`Env`/`WorkingDir`/`User` from a recovered image
+/// `config.json` (the `crane config` output) in `packed_dir`, defaulting to
+/// empty when absent — a `.smolmachine` has no such file.
+#[allow(clippy::type_complexity)]
+fn read_packed_image_config(
+    packed_dir: &Path,
+) -> (
+    Vec<String>,
+    Vec<String>,
+    Vec<String>,
+    Option<String>,
+    Option<String>,
+) {
+    let empty = (Vec::new(), Vec::new(), Vec::new(), None, None);
+    let Ok(content) = std::fs::read_to_string(packed_dir.join(ARCHIVE_CONFIG_FILE)) else {
+        return empty;
+    };
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) else {
+        return empty;
+    };
+    let cfg = &json["config"];
+    let string_list = |key: &str| -> Vec<String> {
+        cfg[key]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let non_empty = |key: &str| -> Option<String> {
+        cfg[key]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+    };
+    (
+        string_list("Entrypoint"),
+        string_list("Cmd"),
+        string_list("Env"),
+        non_empty("WorkingDir"),
+        non_empty("User"),
+    )
 }
 
 /// Error type for storage operations.
@@ -1065,6 +1358,229 @@ fn json_string_array(value: &serde_json::Value, key: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// OCI/AUFS whiteout marker that deletes a single name from lower layers
+/// (`.wh.<name>`).
+const WHITEOUT_PREFIX: &str = ".wh.";
+/// OCI/AUFS opaque-directory marker: the directory replaces, rather than merges
+/// with, the same directory in lower layers (`.wh..wh..opq`).
+const OPAQUE_WHITEOUT: &str = ".wh..wh..opq";
+
+/// What an OCI layer tar entry means once its name is interpreted.
+#[derive(Debug, PartialEq, Eq)]
+enum LayerEntry<'a> {
+    /// `.wh..wh..opq`: mark the parent directory opaque.
+    OpaqueDir,
+    /// `.wh.<name>`: delete `<name>` from lower layers (carries `<name>`).
+    Whiteout(&'a str),
+    /// An ordinary entry to extract as-is.
+    Normal,
+}
+
+/// Classify an entry by its file name. The opaque marker must be checked before
+/// the generic `.wh.` prefix, since `.wh..wh..opq` also starts with `.wh.`.
+fn classify_layer_entry(file_name: &str) -> LayerEntry<'_> {
+    if file_name == OPAQUE_WHITEOUT {
+        return LayerEntry::OpaqueDir;
+    }
+    match file_name.strip_prefix(WHITEOUT_PREFIX) {
+        Some(name) if !name.is_empty() => LayerEntry::Whiteout(name),
+        _ => LayerEntry::Normal,
+    }
+}
+
+/// Join `rel` under `base`, returning `None` if any component would escape the
+/// base (`..`, an absolute path, or a Windows-style prefix). Mirrors the
+/// containment guard tar extractors use to prevent path-traversal.
+fn jailed_join(base: &Path, rel: &Path) -> Option<PathBuf> {
+    use std::path::Component;
+    let mut out = base.to_path_buf();
+    for component in rel.components() {
+        match component {
+            Component::Normal(part) => out.push(part),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+    Some(out)
+}
+
+/// Create an overlayfs whiteout (a `mknod` character device with device number
+/// 0/0) at `path`, replacing any existing entry. This is how the kernel's
+/// overlayfs records "this name is deleted from lower layers" — the on-disk
+/// representation that OCI's `.wh.<name>` marker must be translated into.
+///
+/// Linux-only: overlayfs whiteouts are a Linux concept and the agent only runs
+/// in the Linux guest. The non-Linux stub keeps the crate compiling on the
+/// macOS host (where `mknod`/`makedev`/xattr signatures differ).
+#[cfg(target_os = "linux")]
+fn create_overlay_whiteout(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    // Clear any entry the layer may already have written at this name so mknod
+    // doesn't fail with EEXIST.
+    let _ = std::fs::remove_file(path);
+    let _ = std::fs::remove_dir_all(path);
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    // SAFETY: `c_path` is a valid NUL-terminated path; mode and dev are scalars.
+    let rc = unsafe {
+        libc::mknod(
+            c_path.as_ptr(),
+            libc::S_IFCHR as libc::mode_t,
+            libc::makedev(0, 0),
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn create_overlay_whiteout(_path: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "overlayfs whiteouts are only created in the Linux guest",
+    ))
+}
+
+/// Mark `dir` opaque for overlayfs via the `trusted.overlay.opaque` xattr — the
+/// representation of OCI's `.wh..wh..opq` marker. Linux-only (see
+/// [`create_overlay_whiteout`]).
+#[cfg(target_os = "linux")]
+fn set_overlay_opaque(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let c_path = std::ffi::CString::new(dir.as_os_str().as_bytes())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let name = std::ffi::CString::new("trusted.overlay.opaque").expect("static xattr name");
+    let value = b"y";
+    // SAFETY: path/name are NUL-terminated; value/len describe a valid buffer.
+    let rc = unsafe {
+        libc::setxattr(
+            c_path.as_ptr(),
+            name.as_ptr(),
+            value.as_ptr() as *const libc::c_void,
+            value.len(),
+            0,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn set_overlay_opaque(_dir: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "overlayfs opaque dirs are only set in the Linux guest",
+    ))
+}
+
+/// Extract one decompressed OCI layer tar into `dest`, applying OCI whiteout
+/// semantics so the overlayfs composition is correct.
+///
+/// Each layer is extracted in isolation into its own directory (later stacked as
+/// an overlayfs lowerdir). A plain `tar -x` does not give the kernel's overlayfs
+/// what it needs, so this translates at unpack time — the same conversion
+/// containerd / docker-overlay2 / containers-storage perform:
+/// - `.wh.<name>` (delete marker) → an overlayfs whiteout (`mknod c 0 0`), so
+///   the stacked overlay hides `<name>` from lower layers. (busybox `tar` left
+///   it as a plain file overlayfs ignores, so deletions never applied; worse,
+///   some images ship the marker as a hardlink to a lower-layer file, which
+///   aborted the whole extraction — issue #397. Whiteouts are handled by name
+///   here, before the hardlink path, so that case is just a normal whiteout.)
+/// - `.wh..wh..opq` (opaque-dir marker) → the `trusted.overlay.opaque` xattr on
+///   its parent directory.
+/// - a hardlink whose target isn't in this layer (it lives in a lower layer) is
+///   skipped rather than failing; overlayfs resolves the real file at runtime.
+///
+/// Requires `CAP_MKNOD` + `CAP_SYS_ADMIN`, which the agent has as guest PID 1.
+fn extract_oci_layer<R: std::io::Read>(reader: R, dest: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut archive = tar::Archive::new(reader);
+    archive.set_preserve_permissions(true);
+    archive.set_preserve_mtime(true);
+    // Preserve the archive's uid/gid. The agent runs as root (CAP_CHOWN) so this
+    // chowns each entry to the image's intended owner; without it every file is
+    // owned by root, breaking images that ship non-root-owned paths (e.g. a
+    // `node`/`postgres` user's home or data dir). The previous busybox `tar`
+    // preserved ownership by default — the Rust-tar rewrite dropped it.
+    archive.set_preserve_ownerships(true);
+    archive.set_overwrite(true);
+
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let path = entry.path()?.into_owned();
+
+        // Jail the on-disk path under the layer dir (defends against `..` and
+        // absolute paths embedded in the archive).
+        let Some(full_path) = jailed_join(dest, &path) else {
+            warn!(path = %path.display(), "skipping layer entry that escapes the layer dir");
+            continue;
+        };
+
+        // Whiteout markers are interpreted by name, before normal extraction.
+        if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
+            match classify_layer_entry(file_name) {
+                LayerEntry::OpaqueDir => {
+                    if let Some(parent) = full_path.parent() {
+                        std::fs::create_dir_all(parent)?;
+                        set_overlay_opaque(parent)?;
+                    }
+                    continue;
+                }
+                LayerEntry::Whiteout(removed) => {
+                    if let Some(parent) = full_path.parent() {
+                        std::fs::create_dir_all(parent)?;
+                        create_overlay_whiteout(&parent.join(removed))?;
+                    }
+                    continue;
+                }
+                LayerEntry::Normal => {}
+            }
+        }
+
+        // A hardlink whose target wasn't extracted into this layer can't be
+        // created here; skip it (overlayfs resolves the lower-layer file).
+        if entry.header().entry_type() == tar::EntryType::Link {
+            let target = entry.link_name()?.and_then(|link| jailed_join(dest, &link));
+            if target.is_none_or(|t| !t.exists()) {
+                continue;
+            }
+        }
+
+        // Ensure the parent is writable before extracting children — OCI layers
+        // can set restrictive directory modes before their contents.
+        if let Some(parent) = full_path.parent() {
+            if parent.is_dir() {
+                let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o755));
+            }
+        }
+
+        if let Err(e) = entry.unpack_in(dest) {
+            // Regular files and directories failing is a real error; non-regular
+            // entries (symlinks, device nodes, fifos) can fail benignly — skip.
+            match entry.header().entry_type() {
+                tar::EntryType::Regular
+                | tar::EntryType::GNUSparse
+                | tar::EntryType::Continuous
+                | tar::EntryType::Directory => {
+                    return Err(std::io::Error::new(
+                        e.kind(),
+                        format!("failed to unpack '{}': {}", path.display(), e),
+                    ));
+                }
+                _ => {
+                    warn!(path = %path.display(), error = %e, "skipping non-regular layer entry");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Pull an OCI image with progress callback and optional authentication.
 ///
 /// The callback is called for each layer being pulled with (current, total, layer_id).
@@ -1072,6 +1588,8 @@ pub fn pull_image_with_progress_and_auth<F>(
     image: &str,
     oci_platform: Option<&str>,
     auth: Option<&RegistryAuth>,
+    proxy: Option<&str>,
+    no_proxy: Option<&str>,
     mut progress: F,
 ) -> Result<ImageInfo>
 where
@@ -1085,9 +1603,19 @@ where
         }
     })?;
 
-    if let Some(image_dir) = get_preloaded_image_dir() {
-        info!(image = %image, "using preloaded image data, skipping network pull");
-        return create_preloaded_image_info(image, image_dir);
+    // Canonicalize so all equivalent refs share the same on-disk cache key.
+    let image = normalize_image_ref(image);
+    let image = image.as_str();
+
+    // If packed layers are available, return synthetic image info
+    if let Some(packed_dir) = get_packed_layers_dir() {
+        info!(image = %image, "using packed layers, skipping network pull");
+        // A local image archive is flattened into a rootfs first; an ordinary
+        // packed-layers dir is used as-is.
+        if let Some(flattened) = ensure_archive_flattened(packed_dir)? {
+            return create_packed_image_info(image, &flattened);
+        }
+        return create_packed_image_info(image, packed_dir);
     }
 
     // Determine OCI platform - default to current architecture
@@ -1144,7 +1672,7 @@ where
     // Get manifest with OCI platform specified
     progress(0, 0, "fetching manifest");
     info!(image = %image, oci_platform = ?oci_platform, "fetching manifest");
-    let manifest = crane_manifest(image, oci_platform, auth)?;
+    let manifest = crane_manifest(image, oci_platform, auth, proxy, no_proxy)?;
 
     // Parse manifest to get config and layers
     let manifest_json: serde_json::Value =
@@ -1192,7 +1720,7 @@ where
     std::fs::write(&manifest_path, &manifest)?;
 
     // Fetch and save config
-    let config = crane_config(image, oci_platform, auth)?;
+    let config = crane_config(image, oci_platform, auth, proxy, no_proxy)?;
     let config_id = config_digest
         .strip_prefix("sha256:")
         .unwrap_or(config_digest);
@@ -1241,7 +1769,7 @@ where
         // Build crane command
         let mut crane_cmd = Command::new("crane");
         crane_cmd.arg("blob");
-        crane_cmd.arg(format!("{}@{}", blob_image_reference(image), layer_digest));
+        crane_cmd.arg(format!("{}@{}", image_repo(image), layer_digest));
         if let Some(p) = oci_platform {
             crane_cmd.arg("--platform").arg(p);
         }
@@ -1253,53 +1781,64 @@ where
             crane_cmd.env("DOCKER_CONFIG", td.path());
         }
 
+        apply_proxy_env(&mut crane_cmd, proxy, no_proxy);
+
         // Spawn crane process
         let mut crane = crane_cmd
             .spawn()
             .map_err(|e| StorageError::new(format!("failed to spawn crane: {}", e)))?;
 
-        // Build tar command with crane's stdout as input
+        // Decompress with busybox `gunzip` and extract with our OCI-aware
+        // extractor. Keeping gzip external avoids linking a decompressor crate
+        // into the size-sensitive agent; reading the stream to EOF also drives
+        // the crane -> gunzip pipeline.
         let crane_stdout = crane
             .stdout
             .take()
             .ok_or_else(|| StorageError::new("failed to capture crane stdout".to_string()))?;
 
-        let mut tar_cmd = Command::new("tar");
-        tar_cmd.args(["-xzf", "-", "-C"]);
-        tar_cmd.arg(&layer_dir);
-        tar_cmd.stdin(crane_stdout);
-        tar_cmd.stdout(Stdio::null());
-        tar_cmd.stderr(Stdio::piped());
+        let mut gunzip = Command::new("gunzip")
+            .arg("-c")
+            .stdin(crane_stdout)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| StorageError::new(format!("failed to spawn gunzip: {}", e)))?;
 
-        // Run tar and wait for it
-        let tar_output = tar_cmd
-            .output()
-            .map_err(|e| StorageError::new(format!("failed to run tar: {}", e)))?;
+        let gunzip_stdout = gunzip
+            .stdout
+            .take()
+            .ok_or_else(|| StorageError::new("failed to capture gunzip stdout".to_string()))?;
 
-        // Wait for crane to finish and check its status
+        let extract_result = extract_oci_layer(gunzip_stdout, &layer_dir);
+
+        let gunzip_status = gunzip
+            .wait()
+            .map_err(|e| StorageError::new(format!("failed to wait for gunzip: {}", e)))?;
         let crane_status = crane
             .wait()
             .map_err(|e| StorageError::new(format!("failed to wait for crane: {}", e)))?;
 
-        if !crane_status.success() {
-            if let Err(e) = std::fs::remove_dir_all(&layer_dir) {
-                warn!(layer = %layer_id, error = %e, "failed to clean up layer directory after crane failure");
-            }
-            return Err(StorageError::new(format!(
-                "crane blob failed for layer {}",
-                layer_digest
-            )));
-        }
+        // crane failure (network/auth) is the most useful error to surface, and
+        // it manifests downstream as a truncated stream, so check it first.
+        let layer_failure = if !crane_status.success() {
+            Some(format!("crane blob failed for layer {}", layer_digest))
+        } else if let Err(e) = extract_result {
+            Some(format!(
+                "layer extraction failed for layer {}: {}",
+                layer_digest, e
+            ))
+        } else if !gunzip_status.success() {
+            Some(format!("gunzip failed for layer {}", layer_digest))
+        } else {
+            None
+        };
 
-        if !tar_output.status.success() {
+        if let Some(message) = layer_failure {
             if let Err(e) = std::fs::remove_dir_all(&layer_dir) {
-                warn!(layer = %layer_id, error = %e, "failed to clean up layer directory after tar failure");
+                warn!(layer = %layer_id, error = %e, "failed to clean up layer directory after extraction failure");
             }
-            let stderr = String::from_utf8_lossy(&tar_output.stderr);
-            return Err(StorageError::new(format!(
-                "tar extraction failed for layer {}: {}",
-                layer_digest, stderr
-            )));
+            return Err(StorageError::new(message));
         }
 
         if let Ok(size) = dir_size(&layer_dir) {
@@ -1367,9 +1906,16 @@ where
 
 /// Query if an image exists locally.
 pub fn query_image(image: &str) -> Result<Option<ImageInfo>> {
-    if let Some(image_dir) = get_preloaded_image_dir() {
-        info!(image = %image, "using preloaded image data for image query");
-        return create_preloaded_image_info(image, image_dir).map(Some);
+    let image = normalize_image_ref(image);
+    let image = image.as_str();
+
+    // Packed layers (a `.smolmachine` or a staged local image archive/dir):
+    // synthesize image info without a registry manifest, mirroring the pull
+    // path. A local image archive is flattened into a rootfs first.
+    if let Some(packed_dir) = get_packed_layers_dir() {
+        let flattened = ensure_archive_flattened(packed_dir)?;
+        let effective = flattened.as_deref().unwrap_or(packed_dir);
+        return Ok(Some(create_packed_image_info(image, effective)?));
     }
 
     let root = Path::new(STORAGE_ROOT);
@@ -1562,84 +2108,6 @@ pub fn find_layer_path(image_digest: &str, layer_index: usize) -> Result<PathBuf
     }
 
     Ok(layer_dir)
-}
-
-/// Export a layer as a tar file on the storage disk.
-///
-/// DEPRECATED: Prefer streaming export via `find_layer_path()` + piped tar.
-/// This function creates a temp tar file that can fill the storage disk for
-/// large layers. Kept for backward compatibility.
-#[allow(dead_code)]
-pub fn export_layer(image_digest: &str, layer_index: usize) -> Result<PathBuf> {
-    let layer_dir = find_layer_path(image_digest, layer_index)?;
-    let layer_id = layer_dir
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("unknown");
-
-    let root = Path::new(STORAGE_ROOT);
-    let tmp_dir = root.join("tmp");
-    std::fs::create_dir_all(&tmp_dir)?;
-    let tar_path = tmp_dir.join(format!("layer-{}.tar", &layer_id[..12.min(layer_id.len())]));
-
-    info!(
-        layer_id = %layer_id,
-        output = %tar_path.display(),
-        "exporting layer as tar (temp file)"
-    );
-
-    let status = Command::new("tar")
-        .args(["-cf"])
-        .arg(&tar_path)
-        .arg("-C")
-        .arg(&layer_dir)
-        .arg(".")
-        .status()?;
-
-    if !status.success() {
-        return Err(StorageError::new(format!(
-            "failed to create tar archive for layer {}",
-            layer_id
-        )));
-    }
-
-    Ok(tar_path)
-}
-
-/// Get the layer digest for an image at a specific index.
-#[allow(dead_code)]
-pub fn get_layer_digest(image_digest: &str, layer_index: usize) -> Result<String> {
-    let root = Path::new(STORAGE_ROOT);
-    let manifests_dir = root.join(MANIFESTS_DIR);
-
-    if !manifests_dir.exists() {
-        return Err(StorageError::NoImagesFound);
-    }
-
-    for entry in std::fs::read_dir(&manifests_dir)? {
-        let entry = entry?;
-        let content = std::fs::read_to_string(entry.path())?;
-        if let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&content) {
-            if let Some(config) = manifest.get("config") {
-                if let Some(digest) = config.get("digest").and_then(|d| d.as_str()) {
-                    if digest == image_digest {
-                        if let Some(layers) = manifest["layers"].as_array() {
-                            if layer_index < layers.len() {
-                                if let Some(layer_digest) = layers[layer_index]["digest"].as_str() {
-                                    return Ok(layer_digest.to_string());
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    Err(StorageError::new(format!(
-        "layer {} not found for image {}",
-        layer_index, image_digest
-    )))
 }
 
 /// Remove all image manifests and configs, making all layers unreferenced.
@@ -1942,11 +2410,17 @@ impl OverlaySetup {
 }
 
 fn overlay_resolv_conf_contents() -> String {
-    if std::env::var(guest_env::BACKEND).as_deref() == Ok(guest_env::BACKEND_VIRTIO_NET) {
-        if let Ok(dns_server) = std::env::var(guest_env::DNS) {
-            if !dns_server.is_empty() {
-                return format!("nameserver {}\n", dns_server);
-            }
+    if std::env::var(guest_env::DNS_FILTER).as_deref() == Ok("1") {
+        return "nameserver 127.0.0.1\n".to_string();
+    }
+
+    // A nameserver supplied by the host (SMOLVM_NETWORK_DNS) wins for either
+    // backend: under virtio-net it's the gateway address, and under TSI it's a
+    // custom resolver (--dns) the guest queries directly. Only fall back to
+    // public resolvers when the host didn't specify one.
+    if let Ok(dns_server) = std::env::var(guest_env::DNS) {
+        if !dns_server.is_empty() {
+            return format!("nameserver {}\n", dns_server);
         }
     }
 
@@ -1960,9 +2434,14 @@ fn overlay_resolv_conf_contents() -> String {
 /// a fresh overlay. This idempotent behavior is critical for `machine cp`
 /// which may call this before or after `machine exec`.
 pub fn prepare_overlay(image: &str, workload_id: &str) -> Result<OverlayInfo> {
-    if let Some(image_dir) = get_preloaded_image_dir() {
-        info!(image = %image, image_dir = %image_dir.display(), "using preloaded image data");
-        return prepare_overlay_from_preloaded_image(image, workload_id, image_dir);
+    // Check if we have packed layers available
+    if let Some(packed_dir) = get_packed_layers_dir() {
+        info!(image = %image, packed_dir = %packed_dir.display(), "using packed layers");
+        // A local image archive is flattened into a rootfs (a single packed
+        // layer) first; an ordinary packed-layers dir is used as-is.
+        let flattened = ensure_archive_flattened(packed_dir)?;
+        let effective = flattened.as_deref().unwrap_or(packed_dir);
+        return prepare_overlay_from_packed(image, workload_id, effective);
     }
 
     // Ensure image exists
@@ -1990,14 +2469,19 @@ fn prepare_overlay_from_preloaded_image(
     workload_id: &str,
     image_dir: &Path,
 ) -> Result<OverlayInfo> {
-    if image_dir.join(IMAGE_OCI_ARCHIVE_FILENAME).is_file() {
-        let rootfs = materialize_preloaded_oci_archive(image_dir)?;
-        return OverlaySetup::new(workload_id)?.execute(vec![rootfs.display().to_string()]);
+    // An unpacked-image directory IS the rootfs — one lowerdir, not its subdirs
+    // treated as separate layers.
+    if is_rootfs_dir(packed_dir) {
+        return OverlaySetup::new(workload_id)?
+            .execute_or_remount(vec![packed_dir.display().to_string()]);
     }
 
-    let layer_dirs = preloaded_layer_dirs(image_dir)?;
+    // Packed layers are named by short digest (first 12 chars of sha256).
+    // Order is taken from the layer-order index (manifest order, bottom→top),
+    // falling back to a name sort — see `ordered_packed_layer_names`.
+    let layer_names = ordered_packed_layer_names(packed_dir)?;
 
-    if layer_dirs.is_empty() {
+    if layer_names.is_empty() {
         return Err(StorageError::new(format!(
             "no layer directories found in {}",
             image_dir.display()
@@ -2006,16 +2490,17 @@ fn prepare_overlay_from_preloaded_image(
 
     info!(
         image = %image,
-        layer_count = layer_dirs.len(),
-        layers = ?layer_dirs.iter().map(|p| p.file_name().unwrap_or_default().to_string_lossy().to_string()).collect::<Vec<_>>(),
-        "found preloaded layer directories"
+        layer_count = layer_names.len(),
+        layers = ?layer_names,
+        "found packed layers"
     );
 
-    // Build lowerdir from layers (reversed for overlay order - top layer first)
-    let lowerdirs: Vec<String> = layer_dirs
+    // Build lowerdir from layers (reversed so the top-most layer is leftmost,
+    // as overlayfs gives leftmost lowerdir the highest priority).
+    let lowerdirs: Vec<String> = layer_names
         .iter()
         .rev()
-        .map(|path| path.display().to_string())
+        .map(|name| packed_dir.join(name).display().to_string())
         .collect();
 
     // Use shared overlay setup logic — execute_or_remount preserves the
@@ -2041,123 +2526,41 @@ fn get_image_lowerdirs(image: &str) -> Result<Vec<String>> {
         .collect())
 }
 
-/// Build lowerdir list from preloaded image data.
-fn get_preloaded_lowerdirs(image_dir: &Path) -> Result<Vec<String>> {
-    if image_dir.join(IMAGE_OCI_ARCHIVE_FILENAME).is_file() {
-        let rootfs = materialize_preloaded_oci_archive(image_dir)?;
-        return Ok(vec![rootfs.display().to_string()]);
+/// Whether `dir` is itself a root filesystem (an unpacked-image directory,
+/// `--image ./rootfs/`) rather than a set of layer subdirs — detected by the
+/// presence of standard top-level rootfs directories. A `.smolmachine`'s
+/// packed-layers dir holds per-layer subdirs, not these, so it reads as false.
+fn is_rootfs_dir(dir: &Path) -> bool {
+    ["bin", "usr", "etc", "sbin"]
+        .iter()
+        .any(|d| dir.join(d).is_dir())
+}
+
+/// Build lowerdir list from pre-packed layer directories.
+fn get_packed_lowerdirs(packed_dir: &Path) -> Result<Vec<String>> {
+    // An unpacked-image directory IS the rootfs — one lowerdir, not its subdirs
+    // treated as separate layers.
+    if is_rootfs_dir(packed_dir) {
+        return Ok(vec![packed_dir.display().to_string()]);
     }
 
-    let layer_dirs = preloaded_layer_dirs(image_dir)?;
-    if layer_dirs.is_empty() {
+    // Order from the layer-order index (manifest order, bottom→top), falling
+    // back to a name sort — see `ordered_packed_layer_names`.
+    let layer_names = ordered_packed_layer_names(packed_dir)?;
+
+    if layer_names.is_empty() {
         return Err(StorageError::new(format!(
             "no layer directories found in {}",
-            image_dir.display()
+            packed_dir.display()
         )));
     }
 
-    Ok(layer_dirs
+    // Reversed so the top-most layer is leftmost (overlayfs priority order).
+    Ok(layer_names
         .iter()
         .rev()
-        .map(|path| path.display().to_string())
+        .map(|name| packed_dir.join(name).display().to_string())
         .collect())
-}
-
-fn materialize_preloaded_oci_archive(image_dir: &Path) -> Result<PathBuf> {
-    let archive_path = image_dir.join(IMAGE_OCI_ARCHIVE_FILENAME);
-    if !archive_path.is_file() {
-        return Err(StorageError::new(format!(
-            "preloaded OCI archive not found: {}",
-            archive_path.display()
-        )));
-    }
-
-    let info = read_preloaded_image_metadata(image_dir)?
-        .ok_or_else(|| StorageError::new("preloaded OCI metadata not found".to_string()))?;
-    let image_id = info
-        .digest
-        .strip_prefix("sha256:")
-        .unwrap_or(&info.digest)
-        .to_string();
-    validate_storage_id(&image_id, "preloaded OCI image digest")?;
-
-    let image_root = Path::new(STORAGE_ROOT)
-        .join(MATERIALIZED_IMAGE_ROOTFS_DIR)
-        .join(&image_id);
-    let rootfs_path = image_root.join("rootfs");
-    let marker_path = image_root.join(".complete");
-    if marker_path.is_file() && rootfs_path.is_dir() {
-        return Ok(rootfs_path);
-    }
-
-    info!(
-        image = %info.reference,
-        digest = %info.digest,
-        "materializing preloaded OCI archive"
-    );
-
-    if image_root.exists() {
-        std::fs::remove_dir_all(&image_root)?;
-    }
-    std::fs::create_dir_all(&image_root)?;
-
-    let work_dir = image_root.join("work");
-    let staging_rootfs = image_root.join("rootfs.tmp");
-    let platform = format!("{}/{}", info.os, info.architecture);
-    smolvm_pack::oci_archive::import_oci_archive_rootfs(
-        &archive_path,
-        &staging_rootfs,
-        &work_dir,
-        Some(&platform),
-    )
-    .map_err(|e| StorageError::new(format!("failed to materialize OCI archive: {}", e)))?;
-
-    if rootfs_path.exists() {
-        std::fs::remove_dir_all(&rootfs_path)?;
-    }
-    std::fs::rename(&staging_rootfs, &rootfs_path)?;
-    if work_dir.exists() {
-        std::fs::remove_dir_all(&work_dir)?;
-    }
-    std::fs::write(&marker_path, info.digest.as_bytes())?;
-
-    Ok(rootfs_path)
-}
-
-fn preloaded_layer_dirs(image_dir: &Path) -> Result<Vec<PathBuf>> {
-    if let Some(info) = read_preloaded_image_metadata(image_dir)? {
-        let dirs = info
-            .layers
-            .iter()
-            .map(|digest| {
-                let id = digest.strip_prefix("sha256:").unwrap_or(digest);
-                image_dir.join(id)
-            })
-            .filter(|path| path.is_dir())
-            .collect::<Vec<_>>();
-        if !dirs.is_empty() {
-            return Ok(dirs);
-        }
-    }
-
-    let mut layer_dirs: Vec<PathBuf> = Vec::new();
-
-    let entries = std::fs::read_dir(image_dir)
-        .map_err(|e| StorageError::read_error(image_dir.display().to_string(), e))?;
-
-    for entry in entries {
-        let entry: std::fs::DirEntry = entry?;
-        let path = entry.path();
-        if path.is_dir() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if !name.ends_with(".tar") {
-                layer_dirs.push(path);
-            }
-        }
-    }
-
-    layer_dirs.sort();
-    Ok(layer_dirs)
 }
 
 /// Clean up an overlay filesystem.
@@ -2282,7 +2685,19 @@ fn prepare_rootfs_for_ephemeral_run(image: &str) -> Result<PreparedOverlayRootfs
 /// When `persistent_overlay_id` is `Some`, the overlay persists across runs
 /// (filesystem changes accumulate). When `None`, an ephemeral overlay is
 /// created and destroyed after the run.
-pub fn run_command(request: RunCommandRequest<'_>) -> Result<RunResult> {
+pub fn run_command(
+    image: &str,
+    command: &[String],
+    env: &[(String, String)],
+    workdir: Option<&str>,
+    user: Option<&str>,
+    mounts: &[(String, String, bool)],
+    timeout_ms: Option<u64>,
+    persistent_overlay_id: Option<&str>,
+    stdin_data: Option<&str>,
+    client_fd: Option<std::os::unix::io::RawFd>,
+    unprivileged: bool,
+) -> Result<RunResult> {
     // Validate inputs
     crate::oci::validate_image_reference(request.image).map_err(StorageError::new)?;
     crate::oci::validate_env_vars(request.env).map_err(StorageError::new)?;
@@ -2305,11 +2720,10 @@ pub fn run_command(request: RunCommandRequest<'_>) -> Result<RunResult> {
         let bundle_path = overlay_root.join("bundle");
 
         // Create OCI spec
-        let workdir_str = request.workdir.unwrap_or("/");
-        let identity =
-            crate::oci::resolve_process_identity(Path::new(&prepared.rootfs_path), request.user)
-                .map_err(StorageError::new)?;
-        let mut spec = OciSpec::new(request.command, request.env, workdir_str, false, &identity);
+        let workdir_str = workdir.unwrap_or("/");
+        let identity = crate::oci::resolve_process_identity(Path::new(&prepared.rootfs_path), user)
+            .map_err(StorageError::new)?;
+        let mut spec = OciSpec::new(command, env, workdir_str, false, &identity, unprivileged);
         spec.add_gpu_devices_if_available();
 
         // Add virtiofs bind mounts to OCI spec
@@ -2322,11 +2736,7 @@ pub fn run_command(request: RunCommandRequest<'_>) -> Result<RunResult> {
             );
         }
 
-        // Shared workspace: /storage/workspace → /workspace inside container
-        let workspace_src = Path::new(STORAGE_ROOT).join(WORKSPACE_DIR);
-        if workspace_src.exists() {
-            spec.add_bind_mount(&workspace_src.to_string_lossy(), "/workspace", false);
-        }
+        add_workspace_fallback(&mut spec, mounts);
 
         // Forward SSH agent into the container if enabled at boot.
         crate::ssh_agent::inject_into_container(&mut spec);
@@ -2357,8 +2767,9 @@ pub fn run_command(request: RunCommandRequest<'_>) -> Result<RunResult> {
         let result = run_with_crun(
             &bundle_path,
             &container_id,
-            request.timeout_ms,
-            request.client_fd,
+            timeout_ms,
+            stdin_data,
+            client_fd,
         );
 
         // Note: virtiofs mounts are left in place for reuse
@@ -2393,6 +2804,7 @@ pub fn spawn_in_overlay(
     user: Option<&str>,
     mounts: &[(String, String, bool)],
     persistent_overlay_id: &str,
+    unprivileged: bool,
 ) -> Result<u32> {
     crate::oci::validate_image_reference(image).map_err(StorageError::new)?;
     crate::oci::validate_env_vars(env).map_err(StorageError::new)?;
@@ -2410,7 +2822,7 @@ pub fn spawn_in_overlay(
     let workdir_str = workdir.unwrap_or("/");
     let identity = crate::oci::resolve_process_identity(Path::new(&prepared.rootfs_path), user)
         .map_err(StorageError::new)?;
-    let mut spec = OciSpec::new(command, env, workdir_str, false, &identity);
+    let mut spec = OciSpec::new(command, env, workdir_str, false, &identity, unprivileged);
 
     for (tag, container_path, read_only) in mounts {
         let virtiofs_mount = Path::new(paths::VIRTIOFS_MOUNT_ROOT).join(tag);
@@ -2421,10 +2833,7 @@ pub fn spawn_in_overlay(
         );
     }
 
-    let workspace_src = Path::new(STORAGE_ROOT).join(WORKSPACE_DIR);
-    if workspace_src.exists() {
-        spec.add_bind_mount(&workspace_src.to_string_lossy(), "/workspace", false);
-    }
+    add_workspace_fallback(&mut spec, mounts);
 
     crate::ssh_agent::inject_into_container(&mut spec);
     spec.add_gpu_devices_if_available();
@@ -2473,9 +2882,13 @@ pub fn prepare_for_run_persistent(image: &str, overlay_id: &str) -> Result<Prepa
     validate_storage_id(overlay_id, "persistent overlay id")?;
     let workload_id = format!("persistent-{}", overlay_id);
 
-    // Resolve image layers (same logic as prepare_overlay)
-    let lowerdirs = if let Some(image_dir) = get_preloaded_image_dir() {
-        get_preloaded_lowerdirs(image_dir)?
+    // Resolve image layers (same logic as prepare_overlay). A local image
+    // archive is flattened into a rootfs first; a packed-layers dir is used
+    // as-is.
+    let lowerdirs = if let Some(packed_dir) = get_packed_layers_dir() {
+        let flattened = ensure_archive_flattened(packed_dir)?;
+        let effective = flattened.as_deref().unwrap_or(packed_dir);
+        get_packed_lowerdirs(effective)?
     } else {
         get_image_lowerdirs(image)?
     };
@@ -2740,6 +3153,7 @@ fn run_with_crun(
     bundle_dir: &Path,
     container_id: &str,
     timeout_ms: Option<u64>,
+    stdin_data: Option<&str>,
     client_fd: Option<std::os::unix::io::RawFd>,
 ) -> Result<RunResult> {
     info!(
@@ -2750,19 +3164,38 @@ fn run_with_crun(
     );
 
     // Spawn the container using CrunCommand.
-    // stdin_null() is critical: without it, crun inherits the agent's vsock
-    // stdin, and /bin/sh reads protocol bytes instead of user input, hanging.
-    let mut child = CrunCommand::run(bundle_dir, container_id)
-        .stdin_null()
-        .capture_output()
-        .spawn()
-        .map_err(|e| {
-            StorageError::new(format!(
-                "failed to spawn crun: {}. Is crun installed at {}?",
-                e,
-                paths::CRUN_PATH
-            ))
-        })?;
+    // stdin_null() is critical when no input is supplied: without it, crun
+    // inherits the agent's vsock stdin, and /bin/sh reads protocol bytes
+    // instead of user input, hanging. With input, pipe it in and close the
+    // pipe so the command sees EOF (same contract as the bare-VM exec path).
+    let builder = CrunCommand::run(bundle_dir, container_id);
+    let builder = if stdin_data.is_some() {
+        builder.stdin_piped()
+    } else {
+        builder.stdin_null()
+    };
+    let mut child = builder.capture_output().spawn().map_err(|e| {
+        StorageError::new(format!(
+            "failed to spawn crun: {}. Is crun installed at {}?",
+            e,
+            paths::CRUN_PATH
+        ))
+    })?;
+
+    // Write stdin on a separate thread so the wait/timeout loop stays live
+    // even if the child never reads and the pipe buffer fills. Dropping the
+    // handle closes the pipe → EOF.
+    let _stdin_writer = stdin_data.and_then(|data| {
+        child.stdin.take().map(|mut child_stdin| {
+            let data = data.to_owned();
+            std::thread::Builder::new()
+                .name("run-stdin".into())
+                .spawn(move || {
+                    use std::io::Write;
+                    let _ = child_stdin.write_all(data.as_bytes());
+                })
+        })
+    });
 
     // Capture container_id for the cleanup closure
     let cid = container_id.to_string();
@@ -3086,9 +3519,14 @@ fn setup_docker_auth(
 
     let registry = extract_registry_from_image(image);
 
-    let temp_dir = tempfile::TempDir::new().map_err(|e| {
-        StorageError::new(format!("failed to create temp directory for auth: {}", e))
-    })?;
+    // The guest root filesystem (and thus the default temp dir, /tmp) is
+    // read-only, so create the auth config under the writable storage disk.
+    let temp_dir = tempfile::Builder::new()
+        .prefix("smolauth")
+        .tempdir_in(STORAGE_ROOT)
+        .map_err(|e| {
+            StorageError::new(format!("failed to create temp directory for auth: {}", e))
+        })?;
 
     let auth_b64 = base64_encode(&format!("{}:{}", a.username, a.password));
     let config_json = format!(
@@ -3109,6 +3547,18 @@ fn setup_docker_auth(
     Ok(Some(temp_dir))
 }
 
+/// Set HTTP_PROXY / HTTPS_PROXY / NO_PROXY on a crane subprocess so the
+/// in-VM registry client can reach the registry through a corporate proxy.
+fn apply_proxy_env(cmd: &mut Command, proxy: Option<&str>, no_proxy: Option<&str>) {
+    if let Some(p) = proxy {
+        cmd.env("HTTP_PROXY", p);
+        cmd.env("HTTPS_PROXY", p);
+    }
+    if let Some(np) = no_proxy {
+        cmd.env("NO_PROXY", np);
+    }
+}
+
 /// Run a crane command with the given operation.
 ///
 /// If auth is provided, creates a temporary Docker config for crane to use.
@@ -3118,6 +3568,8 @@ fn run_crane(
     image: &str,
     oci_platform: Option<&str>,
     auth: Option<&RegistryAuth>,
+    proxy: Option<&str>,
+    no_proxy: Option<&str>,
 ) -> Result<String> {
     use crate::retry::{
         is_permanent_error, is_transient_network_error, retry_with_backoff, RetryConfig,
@@ -3128,7 +3580,7 @@ fn run_crane(
     retry_with_backoff(
         RetryConfig::for_network(),
         &op_name,
-        || run_crane_once(operation, image, oci_platform, auth),
+        || run_crane_once(operation, image, oci_platform, auth, proxy, no_proxy),
         |e| {
             let error_msg = e.to_string();
             // Don't retry permanent errors
@@ -3147,6 +3599,8 @@ fn run_crane_once(
     image: &str,
     oci_platform: Option<&str>,
     auth: Option<&RegistryAuth>,
+    proxy: Option<&str>,
+    no_proxy: Option<&str>,
 ) -> Result<String> {
     let mut cmd = Command::new("crane");
     cmd.arg(operation).arg(image);
@@ -3160,6 +3614,8 @@ fn run_crane_once(
     if let Some(ref td) = _temp_dir {
         cmd.env("DOCKER_CONFIG", td.path());
     }
+
+    apply_proxy_env(&mut cmd, proxy, no_proxy);
 
     let output = cmd.output()?;
 
@@ -3179,8 +3635,10 @@ fn crane_manifest(
     image: &str,
     oci_platform: Option<&str>,
     auth: Option<&RegistryAuth>,
+    proxy: Option<&str>,
+    no_proxy: Option<&str>,
 ) -> Result<String> {
-    run_crane("manifest", image, oci_platform, auth)
+    run_crane("manifest", image, oci_platform, auth, proxy, no_proxy)
 }
 
 /// Run crane config command.
@@ -3188,8 +3646,10 @@ fn crane_config(
     image: &str,
     oci_platform: Option<&str>,
     auth: Option<&RegistryAuth>,
+    proxy: Option<&str>,
+    no_proxy: Option<&str>,
 ) -> Result<String> {
-    run_crane("config", image, oci_platform, auth)
+    run_crane("config", image, oci_platform, auth, proxy, no_proxy)
 }
 
 /// Sanitize image name for use as filename.
@@ -3197,10 +3657,37 @@ fn sanitize_image_name(image: &str) -> String {
     image.replace(['/', ':', '@'], "_")
 }
 
-/// Reverse sanitization.
+/// Reverse sanitization of a canonical image filename back to an image reference.
+///
+/// Because we now always store under the canonical form the mapping is
+/// deterministic:
+/// - The last `_`-delimited segment is the tag (or digest hex), except when
+///   the penultimate segment is `sha256`, in which case `sha256_<hex>` is the
+///   digest.
+/// - Everything else is the `registry/path` portion, with `_` reversed to `/`.
+///
+/// The result is passed to `query_image`, which normalizes it before
+/// computing the cache key.
 fn unsanitize_image_name(name: &str) -> String {
-    // This is approximate - we lose some info
-    name.replacen('_', "/", 1).replacen('_', ":", 1)
+    let parts: Vec<&str> = name.split('_').collect();
+    if parts.len() < 2 {
+        return name.to_string();
+    }
+
+    // Detect sha256 digest: penultimate segment is "sha256", last is 64 hex chars.
+    let n = parts.len();
+    if n >= 2
+        && parts[n - 2] == "sha256"
+        && parts[n - 1].len() == 64
+        && parts[n - 1].chars().all(|c| c.is_ascii_hexdigit())
+    {
+        let name_part = parts[..n - 2].join("/");
+        return format!("{name_part}@sha256:{}", parts[n - 1]);
+    }
+
+    // Normal case: last segment is the tag.
+    let name_part = parts[..n - 1].join("/");
+    format!("{name_part}:{}", parts[n - 1])
 }
 
 /// Get disk usage for a path.
@@ -3311,6 +3798,136 @@ mod tests {
     }
 
     #[test]
+    fn classifies_oci_whiteout_markers() {
+        // Opaque marker must win over the generic `.wh.` prefix.
+        assert_eq!(classify_layer_entry(".wh..wh..opq"), LayerEntry::OpaqueDir);
+        // `.wh.<name>` carries the name to delete.
+        assert_eq!(
+            classify_layer_entry(".wh.RPM-GPG-KEY-kojiv2"),
+            LayerEntry::Whiteout("RPM-GPG-KEY-kojiv2")
+        );
+        // A bare `.wh.` (no name) and ordinary files are normal entries.
+        assert_eq!(classify_layer_entry(".wh."), LayerEntry::Normal);
+        assert_eq!(classify_layer_entry("CERN.repo"), LayerEntry::Normal);
+        assert_eq!(classify_layer_entry(".wherever"), LayerEntry::Normal);
+    }
+
+    #[test]
+    fn jailed_join_blocks_escapes() {
+        let base = Path::new("/layer");
+        assert_eq!(
+            jailed_join(base, Path::new("tmp/CERN.repo")),
+            Some(PathBuf::from("/layer/tmp/CERN.repo"))
+        );
+        assert_eq!(
+            jailed_join(base, Path::new("./tmp/./x")),
+            Some(PathBuf::from("/layer/tmp/x"))
+        );
+        // `..` and absolute paths escape the layer dir — rejected.
+        assert!(jailed_join(base, Path::new("../etc/passwd")).is_none());
+        assert!(jailed_join(base, Path::new("tmp/../../etc")).is_none());
+        assert!(jailed_join(base, Path::new("/etc/passwd")).is_none());
+    }
+
+    /// End-to-end extraction with whiteout conversion. mknod/setxattr(trusted.*)
+    /// need root, so skip when not privileged (the live guest is PID 1 root).
+    /// Linux-only: the syscalls and overlayfs semantics don't exist on macOS.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn extract_oci_layer_applies_whiteouts() {
+        // SAFETY: geteuid is always safe.
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("skipping: extract_oci_layer whiteout test needs root (mknod/setxattr)");
+            return;
+        }
+        use std::os::unix::fs::FileTypeExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path();
+
+        // Build a layer tar: a real file, a `.wh.` delete marker shipped as a
+        // hardlink to that file (the issue #397 shape), and an opaque dir.
+        let mut buf = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut buf);
+            let mut header = tar::Header::new_gnu();
+            let body = b"repo-contents";
+            header.set_path("tmp/CERN.repo").unwrap();
+            header.set_size(body.len() as u64);
+            header.set_entry_type(tar::EntryType::Regular);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder.append(&header, &body[..]).unwrap();
+
+            // Whiteout as a hardlink to the sibling file (would crash busybox tar).
+            let mut wh = tar::Header::new_gnu();
+            wh.set_entry_type(tar::EntryType::Link);
+            wh.set_size(0);
+            wh.set_mode(0o644);
+            wh.set_path("tmp/.wh.RPM-GPG-KEY-kojiv2").unwrap();
+            wh.set_link_name("tmp/CERN.repo").unwrap();
+            wh.set_cksum();
+            builder.append(&wh, std::io::empty()).unwrap();
+
+            // Opaque marker for an `etc` directory.
+            let mut opq = tar::Header::new_gnu();
+            opq.set_entry_type(tar::EntryType::Regular);
+            opq.set_size(0);
+            opq.set_mode(0o644);
+            opq.set_path("etc/.wh..wh..opq").unwrap();
+            opq.set_cksum();
+            builder.append(&opq, std::io::empty()).unwrap();
+
+            builder.finish().unwrap();
+        }
+
+        extract_oci_layer(&buf[..], dest).expect("extraction should succeed");
+
+        // The real file extracted.
+        assert_eq!(
+            std::fs::read(dest.join("tmp/CERN.repo")).unwrap(),
+            b"repo-contents"
+        );
+        // The whiteout became an overlayfs char-device whiteout (0/0).
+        let wh = dest.join("tmp/RPM-GPG-KEY-kojiv2");
+        let meta = std::fs::symlink_metadata(&wh).expect("whiteout node exists");
+        assert!(
+            meta.file_type().is_char_device(),
+            "whiteout is a char device"
+        );
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(meta.rdev(), 0, "whiteout device number is 0/0");
+        // The `.wh.` marker file itself is gone.
+        assert!(!dest.join("tmp/.wh.RPM-GPG-KEY-kojiv2").exists());
+        // The opaque xattr is set on the directory, and the marker file is gone.
+        assert!(dest.join("etc").is_dir());
+        assert_eq!(read_opaque_xattr(&dest.join("etc")), Some(b"y".to_vec()));
+        assert!(!dest.join("etc/.wh..wh..opq").exists());
+    }
+
+    /// Read `trusted.overlay.opaque` for the extraction test (root-only).
+    #[cfg(target_os = "linux")]
+    fn read_opaque_xattr(path: &Path) -> Option<Vec<u8>> {
+        use std::os::unix::ffi::OsStrExt;
+        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+        let name = std::ffi::CString::new("trusted.overlay.opaque").ok()?;
+        let mut buf = [0u8; 16];
+        // SAFETY: path/name are NUL-terminated; buf/len describe a valid buffer.
+        let len = unsafe {
+            libc::getxattr(
+                c_path.as_ptr(),
+                name.as_ptr(),
+                buf.as_mut_ptr() as *mut libc::c_void,
+                buf.len(),
+            )
+        };
+        if len < 0 {
+            return None;
+        }
+        Some(buf[..len as usize].to_vec())
+    }
+
+    #[test]
     fn test_oci_platform_to_arch_linux_amd64() {
         assert_eq!(oci_platform_to_arch("linux/amd64"), "amd64");
     }
@@ -3328,9 +3945,99 @@ mod tests {
         assert_eq!(oci_platform_to_arch("unknown"), "unknown");
     }
 
+    /// Collect (name, value) for env vars explicitly set on a Command, with
+    /// inherited vars filtered out. `Command::get_envs()` yields a tuple per
+    /// explicit `.env()` / `.env_remove()` call: the value is `None` for
+    /// removals and `Some(_)` for sets. We only care about sets here.
+    fn explicit_envs(cmd: &Command) -> Vec<(String, String)> {
+        cmd.get_envs()
+            .filter_map(|(k, v)| {
+                v.map(|val| {
+                    (
+                        k.to_string_lossy().into_owned(),
+                        val.to_string_lossy().into_owned(),
+                    )
+                })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn apply_proxy_env_sets_http_and_https_when_proxy_present() {
+        let mut cmd = Command::new("crane");
+        apply_proxy_env(&mut cmd, Some("http://proxy.example.com:3128"), None);
+
+        let envs = explicit_envs(&cmd);
+        assert!(envs.contains(&(
+            "HTTP_PROXY".to_string(),
+            "http://proxy.example.com:3128".to_string()
+        )));
+        assert!(envs.contains(&(
+            "HTTPS_PROXY".to_string(),
+            "http://proxy.example.com:3128".to_string()
+        )));
+        // No NO_PROXY when not asked for — silent overreach would be a bug.
+        assert!(!envs.iter().any(|(k, _)| k == "NO_PROXY"));
+    }
+
+    #[test]
+    fn apply_proxy_env_sets_no_proxy_when_present() {
+        let mut cmd = Command::new("crane");
+        apply_proxy_env(&mut cmd, None, Some("127.0.0.1,.internal"));
+
+        let envs = explicit_envs(&cmd);
+        assert!(envs.contains(&("NO_PROXY".to_string(), "127.0.0.1,.internal".to_string())));
+        // proxy=None must not set HTTP_PROXY / HTTPS_PROXY.
+        assert!(!envs.iter().any(|(k, _)| k == "HTTP_PROXY"));
+        assert!(!envs.iter().any(|(k, _)| k == "HTTPS_PROXY"));
+    }
+
+    #[test]
+    fn apply_proxy_env_with_both_sets_all_three() {
+        let mut cmd = Command::new("crane");
+        apply_proxy_env(
+            &mut cmd,
+            Some("http://192.168.127.254:3128"),
+            Some("127.0.0.1,localhost"),
+        );
+
+        let envs = explicit_envs(&cmd);
+        assert_eq!(
+            envs.len(),
+            3,
+            "expected exactly HTTP_PROXY, HTTPS_PROXY, NO_PROXY"
+        );
+        let map: std::collections::HashMap<_, _> = envs.into_iter().collect();
+        assert_eq!(
+            map.get("HTTP_PROXY").map(String::as_str),
+            Some("http://192.168.127.254:3128")
+        );
+        assert_eq!(
+            map.get("HTTPS_PROXY").map(String::as_str),
+            Some("http://192.168.127.254:3128")
+        );
+        assert_eq!(
+            map.get("NO_PROXY").map(String::as_str),
+            Some("127.0.0.1,localhost")
+        );
+    }
+
+    #[test]
+    fn apply_proxy_env_with_none_is_noop() {
+        let mut cmd = Command::new("crane");
+        apply_proxy_env(&mut cmd, None, None);
+
+        // Without explicit envs the iterator is empty — no accidental fallbacks.
+        assert_eq!(explicit_envs(&cmd).len(), 0);
+    }
+
     #[test]
     fn test_sanitize_image_name() {
-        assert_eq!(sanitize_image_name("alpine:latest"), "alpine_latest");
+        // sanitize_image_name operates on already-canonical refs
+        assert_eq!(
+            sanitize_image_name("docker.io/library/alpine:latest"),
+            "docker.io_library_alpine_latest"
+        );
         assert_eq!(
             sanitize_image_name("docker.io/library/alpine:3.18"),
             "docker.io_library_alpine_3.18"
@@ -3342,13 +4049,22 @@ mod tests {
     }
 
     #[test]
-    fn test_blob_image_reference_strips_manifest_digest() {
-        assert_eq!(blob_image_reference("alpine@sha256:abc123"), "alpine");
+    fn test_unsanitize_image_name() {
+        // Normal tag case
         assert_eq!(
-            blob_image_reference("alpine:3.19@sha256:abc123"),
-            "alpine:3.19"
+            unsanitize_image_name("docker.io_library_alpine_3.20"),
+            "docker.io/library/alpine:3.20"
         );
-        assert_eq!(blob_image_reference("alpine:3.19"), "alpine:3.19");
+        assert_eq!(
+            unsanitize_image_name("ghcr.io_owner_repo_v1"),
+            "ghcr.io/owner/repo:v1"
+        );
+        // Digest case
+        let hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        assert_eq!(
+            unsanitize_image_name(&format!("docker.io_library_alpine_sha256_{hex}")),
+            format!("docker.io/library/alpine@sha256:{hex}")
+        );
     }
 
     #[test]
@@ -3392,6 +4108,23 @@ mod tests {
         assert_eq!(overlay_resolv_conf_contents(), "nameserver 100.96.0.1\n");
 
         std::env::remove_var(guest_env::BACKEND);
+        std::env::remove_var(guest_env::DNS);
+    }
+
+    #[test]
+    fn overlay_resolv_conf_uses_custom_dns_under_tsi() {
+        // TSI sets SMOLVM_NETWORK_DNS without SMOLVM_NETWORK_BACKEND. The guest
+        // must honor the custom resolver (--dns) rather than the public default.
+        let _guard = env_lock().lock().unwrap();
+        std::env::remove_var(guest_env::DNS_FILTER);
+        std::env::remove_var(guest_env::BACKEND);
+        std::env::set_var(guest_env::DNS, "100.100.100.100");
+
+        assert_eq!(
+            overlay_resolv_conf_contents(),
+            "nameserver 100.100.100.100\n"
+        );
+
         std::env::remove_var(guest_env::DNS);
     }
 
@@ -3499,42 +4232,84 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn test_default_workspace_symlink_is_replaced_for_mount() {
+    fn test_ensure_mount_target_under_root_replaces_intra_rootfs_symlink_with_dir() {
         use std::os::unix::fs::symlink;
 
+        // Simulates the agent-rootfs having a pre-baked /workspace symlink from
+        // a previous VM run (via virtiofs write-through). The function must
+        // replace it with a real directory so the bind mount can claim the path.
         let root = tempfile::tempdir().unwrap();
         let rootfs = root.path().join("rootfs");
-        std::fs::create_dir_all(&rootfs).unwrap();
-        symlink(DEFAULT_WORKSPACE_SYMLINK_TARGET, rootfs.join("workspace")).unwrap();
+        let target_dir = rootfs.join("storage").join("workspace");
+        std::fs::create_dir_all(&target_dir).unwrap();
 
-        replace_default_workspace_symlink_for_mount(&rootfs, "/workspace").unwrap();
+        // /workspace → /storage/workspace (relative to rootfs) — symlink within rootfs
+        let workspace_link = rootfs.join("workspace");
+        symlink(&target_dir, &workspace_link).unwrap();
+        assert!(workspace_link.is_symlink());
 
-        let meta = std::fs::symlink_metadata(rootfs.join("workspace")).unwrap();
-        assert!(meta.is_dir());
-        assert!(!meta.file_type().is_symlink());
-        assert_eq!(
-            ensure_mount_target_under_root(&rootfs, "/workspace").unwrap(),
-            rootfs.canonicalize().unwrap().join("workspace")
+        let result = ensure_mount_target_under_root(&rootfs, "/workspace");
+        assert!(result.is_ok(), "expected Ok, got {:?}", result);
+
+        // The symlink must have been replaced with a real directory.
+        assert!(
+            !workspace_link.is_symlink(),
+            "/workspace should no longer be a symlink"
+        );
+        assert!(
+            workspace_link.is_dir(),
+            "/workspace should now be a directory"
         );
     }
 
-    #[cfg(unix)]
     #[test]
-    fn test_non_default_workspace_symlink_is_not_replaced() {
-        use std::os::unix::fs::symlink;
+    fn ordered_packed_layers_honor_index_over_name_sort() {
+        // Two layers whose digest-named dirs sort base-above-overlay (the bug):
+        // base "fff…" sorts after overlay "4c8…", so a plain name sort + rev
+        // would stack the base on top and shadow the overlay's modified files.
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["fff3795b4371", "4c857248e0e2"] {
+            std::fs::create_dir_all(dir.path().join(name)).unwrap();
+        }
+        // A stray non-layer dir (e.g. macOS .fseventsd) must be excluded when an
+        // index is present.
+        std::fs::create_dir_all(dir.path().join(".fseventsd")).unwrap();
 
-        let root = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
-        let rootfs = root.path().join("rootfs");
-        std::fs::create_dir_all(&rootfs).unwrap();
-        symlink(outside.path(), rootfs.join("workspace")).unwrap();
+        // Index records true OCI order, bottom→top: base then overlay.
+        std::fs::write(
+            dir.path().join(LAYER_ORDER_FILE),
+            "fff3795b4371\n4c857248e0e2\n",
+        )
+        .unwrap();
 
-        replace_default_workspace_symlink_for_mount(&rootfs, "/workspace").unwrap();
+        let ordered = ordered_packed_layer_names(dir.path()).unwrap();
+        assert_eq!(
+            ordered,
+            vec!["fff3795b4371".to_string(), "4c857248e0e2".to_string()],
+            "must follow the index (base→overlay), not the name sort, and drop .fseventsd"
+        );
+    }
 
-        assert!(std::fs::symlink_metadata(rootfs.join("workspace"))
-            .unwrap()
-            .file_type()
-            .is_symlink());
-        assert!(ensure_mount_target_under_root(&rootfs, "/workspace").is_err());
+    #[test]
+    fn ordered_packed_layers_fall_back_to_name_sort_without_index() {
+        // No index → legacy behavior: ascending name sort (correct for the
+        // single-flattened-layer common case).
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["bbb", "aaa"] {
+            std::fs::create_dir_all(dir.path().join(name)).unwrap();
+        }
+        let ordered = ordered_packed_layer_names(dir.path()).unwrap();
+        assert_eq!(ordered, vec!["aaa".to_string(), "bbb".to_string()]);
+    }
+
+    #[test]
+    fn ordered_packed_layers_ignore_index_entries_without_a_dir() {
+        // An index naming a missing layer falls back to the name sort rather
+        // than silently dropping real layers.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("aaa")).unwrap();
+        std::fs::write(dir.path().join(LAYER_ORDER_FILE), "does-not-exist\n").unwrap();
+        let ordered = ordered_packed_layer_names(dir.path()).unwrap();
+        assert_eq!(ordered, vec!["aaa".to_string()]);
     }
 }

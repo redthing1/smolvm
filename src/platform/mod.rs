@@ -207,6 +207,41 @@ pub fn native_platform() -> &'static str {
     CURRENT_PLATFORM.oci_platform()
 }
 
+/// Reject a packed artifact whose guest CPU architecture differs from this host's.
+///
+/// A `.smolmachine` carries architecture-specific native binaries — a VM-mode pack
+/// holds a compiled guest rootfs, an image-mode pack holds per-arch OCI layers — so
+/// an `arm64` artifact cannot run under an `amd64` guest kernel, or vice versa. Used
+/// by `machine create --from` and the serve create handler before they extract or
+/// boot, so the failure is an immediate, actionable message rather than a cryptic
+/// exec-format crash mid-boot.
+///
+/// Unlike the single-file `pack run` path — which additionally requires a matching
+/// host OS because it dlopens the libs bundled *into* the executable — a sidecar
+/// rehydrated via `create --from` boots through the HOST's own libkrun, so only the
+/// guest ARCHITECTURE must match; the host OS (macOS vs Linux) is irrelevant. That
+/// is what lets a VM packed on a Mac rehydrate on a same-arch Linux node.
+///
+/// `artifact_platform` is the manifest's guest platform (e.g. `"linux/arm64"`). A
+/// blank or unrecognized arch is allowed through rather than risk falsely rejecting
+/// an otherwise-valid artifact.
+pub fn ensure_artifact_arch_matches_host(artifact_platform: &str) -> crate::Result<()> {
+    let host_arch = Arch::current().oci_arch();
+    let artifact_arch = artifact_platform.rsplit('/').next().unwrap_or("").trim();
+    if matches!(artifact_arch, "amd64" | "arm64") && artifact_arch != host_arch {
+        return Err(crate::Error::agent(
+            "platform mismatch",
+            format!(
+                "this artifact is built for architecture '{artifact_arch}' (platform \
+                 '{artifact_platform}'), but this host is '{host_arch}'. A packed VM or image \
+                 carries native binaries and cannot run on a different CPU architecture — re-pack \
+                 on an '{artifact_arch}' host, or use an '{host_arch}' artifact."
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// Get the platform-specific VM executor.
 ///
 /// Returns an executor that handles platform differences in VM execution,
@@ -237,6 +272,24 @@ pub fn rosetta() -> linux::LinuxRosetta {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_artifact_arch_guard() {
+        let host = Arch::current().oci_arch();
+        let other = if host == "amd64" { "arm64" } else { "amd64" };
+
+        // Matching arch (with the linux/ prefix) is accepted.
+        assert!(ensure_artifact_arch_matches_host(&format!("linux/{host}")).is_ok());
+        // Bare arch string also accepted when it matches.
+        assert!(ensure_artifact_arch_matches_host(host).is_ok());
+        // The opposite arch is rejected.
+        assert!(ensure_artifact_arch_matches_host(&format!("linux/{other}")).is_err());
+        // Host OS is irrelevant — only the arch matters (Mac-built pack on Linux).
+        assert!(ensure_artifact_arch_matches_host(&format!("darwin/{host}")).is_ok());
+        // Blank / unrecognized arch is allowed through rather than false-rejected.
+        assert!(ensure_artifact_arch_matches_host("").is_ok());
+        assert!(ensure_artifact_arch_matches_host("linux/riscv64").is_ok());
+    }
 
     #[test]
     fn test_current_platform_is_valid() {

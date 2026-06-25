@@ -16,7 +16,7 @@
 //! and overlay filesystem management.
 
 use crate::data::consts::BYTES_PER_GIB;
-pub use crate::data::disk::{DiskType, Overlay, Storage};
+pub use crate::data::disk::{DiskFormat, DiskType, Overlay, Storage};
 pub use crate::data::storage::{
     DEFAULT_OVERLAY_SIZE_GIB, DEFAULT_STORAGE_SIZE_GIB, OVERLAY_DISK_FILENAME,
     STORAGE_DISK_FILENAME,
@@ -26,6 +26,139 @@ use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
+
+/// Seed a VM-mode machine's overlay+storage disks from extracted pack templates so
+/// it boots the source VM's filesystem rather than a freshly-mkfs'd empty overlay.
+///
+/// VM-mode (`--from-vm`) packs carry the source VM's rootfs DISKS, but the packed
+/// template has its trailing zero extent stripped, so the disk must be grown back to
+/// its logical size before boot. The caller's [`AgentManager`] has already created
+/// default `.qcow2` overlays backed by the EMPTY default template; this removes them
+/// and writes the seeded RAW disks under their place so [`resolve_disk_image`] picks
+/// these at start. A `.formatted` marker stops the host from reformatting the
+/// inherited (already-formatted) filesystem; the guest still grows it with resize2fs.
+///
+/// The template → disk copy uses [`crate::disk_utils::clone_or_copy_file`] (clonefile
+/// CoW on macOS, `SEEK_HOLE` sparse copy on Linux), NOT a dense `fs::copy`: the
+/// templates are sparse (~25 MiB of real data in a multi-GiB logical file), so a dense
+/// copy would balloon every machine to its full logical size (~28 GiB) on disk.
+///
+/// `disk_dir` is the machine's data dir (the parent of `manager.storage_path()`).
+/// Shared by both the serve API create path and the `smolvm machine create --from`
+/// CLI path so a VM-mode pack restores identically through either entry point.
+///
+/// [`AgentManager`]: crate::agent::AgentManager
+/// [`resolve_disk_image`]: crate::agent::manager::resolve_disk_image
+pub fn seed_vm_mode_disks(
+    disk_dir: &Path,
+    cache_dir: &Path,
+    overlay_template: Option<&str>,
+    storage_template: Option<&str>,
+    overlay_logical_size: Option<u64>,
+    overlay_gb: Option<u64>,
+    storage_gb: Option<u64>,
+) -> std::io::Result<()> {
+    // Drop the manager's default qcow2 overlays (backed by the empty default
+    // template) so the seeded raw disks below are what start resolves.
+    for raw_filename in [STORAGE_DISK_FILENAME, OVERLAY_DISK_FILENAME] {
+        let stem = Path::new(raw_filename);
+        let _ = std::fs::remove_file(disk_dir.join(stem.with_extension("qcow2")));
+    }
+
+    // The overlay carries the rootfs and is grown back to its (pre-truncation)
+    // logical size; storage to the requested size. Both VM-mode templates are
+    // normally present, but tolerate a missing one with an empty disk.
+    seed_one_disk(
+        cache_dir,
+        overlay_template,
+        &disk_dir.join(OVERLAY_DISK_FILENAME),
+        overlay_logical_size,
+        overlay_gb,
+    )?;
+    seed_one_disk(
+        cache_dir,
+        storage_template,
+        &disk_dir.join(STORAGE_DISK_FILENAME),
+        None,
+        storage_gb,
+    )?;
+    Ok(())
+}
+
+/// Sparse-copy one packed template into `dest`, grow it to the largest of its copied
+/// size / the source's logical size / any requested size, and mark it formatted
+/// (the copy carries the source's ext4; the guest grows it with resize2fs). With no
+/// template, write an empty sparse disk for the guest to format (no formatted marker).
+fn seed_one_disk(
+    cache_dir: &Path,
+    template: Option<&str>,
+    dest: &Path,
+    logical_size: Option<u64>,
+    size_gb_override: Option<u64>,
+) -> std::io::Result<()> {
+    let _ = std::fs::remove_file(dest);
+    let formatted_marker = dest.with_extension("formatted");
+
+    let Some(rel) = template else {
+        // No template (rare for VM mode): an empty sparse disk the guest formats.
+        let _ = std::fs::remove_file(&formatted_marker);
+        let size = size_gb_override
+            .map(|gb| gb * BYTES_PER_GIB)
+            .unwrap_or(512 * 1024 * 1024);
+        std::fs::File::create(dest)?.set_len(size)?;
+        return Ok(());
+    };
+
+    let src = resolve_template_in_cache(cache_dir, rel)?;
+    if !src.exists() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("VM-mode template not found: {}", src.display()),
+        ));
+    }
+    crate::disk_utils::clone_or_copy_file(&src, dest)
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+
+    // Grow back to the logical/requested size (set_len extends sparsely; the guest
+    // resize2fs expands the ext4 to fill it at boot).
+    let copied = std::fs::metadata(dest)?.len();
+    let target = [
+        Some(copied),
+        logical_size,
+        size_gb_override.map(|gb| gb * BYTES_PER_GIB),
+    ]
+    .into_iter()
+    .flatten()
+    .max()
+    .unwrap_or(copied);
+    if target > copied {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(dest)?
+            .set_len(target)?;
+    }
+
+    std::fs::write(&formatted_marker, b"")?;
+    Ok(())
+}
+
+/// Resolve a pack template's relative path within `cache_dir`, rejecting anything
+/// that isn't a plain in-tree path (no `..`, absolute, or other escaping component)
+/// so a hostile pack manifest can't redirect the copy outside the cache.
+fn resolve_template_in_cache(cache_dir: &Path, rel: &str) -> std::io::Result<PathBuf> {
+    let rel_path = Path::new(rel);
+    let safe = !rel.is_empty()
+        && rel_path
+            .components()
+            .all(|c| matches!(c, std::path::Component::Normal(_)));
+    if !safe {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("invalid VM-mode template path: {rel:?}"),
+        ));
+    }
+    Ok(cache_dir.join(rel_path))
+}
 
 /// Disk format version info (stored at `/.smolvm/version.json` in ext4 disk).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -51,7 +184,7 @@ impl DiskVersion {
     pub fn new(base_digest: impl Into<String>) -> Self {
         Self {
             format_version: Self::CURRENT_VERSION,
-            created_at: crate::util::current_timestamp(),
+            created_at: crate::util::current_timestamp().to_string(),
             base_digest: base_digest.into(),
             smolvm_version: env!("CARGO_PKG_VERSION").to_string(),
         }
@@ -68,6 +201,7 @@ impl DiskVersion {
 pub struct VmDisk<K> {
     path: PathBuf,
     size_bytes: u64,
+    format: DiskFormat,
     _kind: PhantomData<K>,
 }
 
@@ -112,6 +246,7 @@ impl<K: DiskType> VmDisk<K> {
             Ok(Self {
                 path: path.to_path_buf(),
                 size_bytes: metadata.len(),
+                format: DiskFormat::Raw,
                 _kind: PhantomData,
             })
         } else {
@@ -119,9 +254,116 @@ impl<K: DiskType> VmDisk<K> {
             Ok(Self {
                 path: path.to_path_buf(),
                 size_bytes,
+                format: DiskFormat::Raw,
                 _kind: PhantomData,
             })
         }
+    }
+
+    /// Open an existing disk image with an explicit on-disk format, without
+    /// creating or formatting it. Used for fork-clone qcow2 overlays, which are
+    /// created up front by the fork path and inherit the backing disk's
+    /// already-formatted filesystem.
+    pub fn open_existing_with_format(path: &Path, format: DiskFormat) -> Result<Self> {
+        let metadata = std::fs::metadata(path)?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            size_bytes: metadata.len(),
+            format,
+            _kind: PhantomData,
+        })
+    }
+
+    /// Open the disk for a fresh (non-clone) VM. On Linux at this disk type's
+    /// DEFAULT size, when the shipped template has already been sized to the
+    /// default virtual size **at install time**, create an instant qcow2
+    /// copy-on-write overlay over the read-only template (O(metadata), no byte
+    /// copy) — so N concurrent boots don't thrash the host disk the way N full
+    /// template copies do. Anything else (a custom size, a pre-existing disk, a
+    /// not-yet-sized legacy template, non-Linux, or an overlay-create failure)
+    /// falls back to the raw create + format-time copy. The template is treated
+    /// as immutable here: sizing it is an install-time concern (see
+    /// `scripts/install.sh`), never a per-boot mutation of a shared file.
+    pub fn open_or_overlay_at(raw_path: &Path, size_gb: u64) -> Result<Self> {
+        #[cfg(target_os = "linux")]
+        if !raw_path.exists() && size_gb == K::DEFAULT_SIZE_GIB {
+            let size_bytes = size_gb * BYTES_PER_GIB;
+            // Only overlay when the template already presents the full virtual
+            // size. A legacy/too-small template would make the overlay inherit an
+            // undersized device, so degrade to the copy path rather than mutate
+            // the shared template.
+            if Self::template_at_least(size_bytes) {
+                let overlay_path = raw_path.with_extension(DiskFormat::Qcow2.extension());
+                match Self::create_overlay_from_template(&overlay_path, size_bytes) {
+                    Ok(disk) => return Ok(disk),
+                    Err(error) => {
+                        tracing::warn!(
+                            disk_type = K::NAME, %error,
+                            "qcow2 overlay create failed; falling back to raw template copy"
+                        );
+                    }
+                }
+            }
+        }
+        Self::open_or_create_at(raw_path, size_gb)
+    }
+
+    /// True if a disk template exists and already presents at least `size_bytes`
+    /// of virtual size (sized at install). Used to decide whether the fast qcow2
+    /// overlay path is safe without ever mutating the shared template.
+    #[cfg(target_os = "linux")]
+    fn template_at_least(size_bytes: u64) -> bool {
+        Self::template_path()
+            .and_then(|p| std::fs::metadata(p).ok())
+            .map(|m| m.len() >= size_bytes)
+            .unwrap_or(false)
+    }
+
+    /// Create a `.qcow2` CoW overlay backed by the read-only template instead of
+    /// copying it. The overlay inherits the backing file's VIRTUAL size; the
+    /// template is sized to the default at install time (see
+    /// `scripts/install.sh`) while its ext4 stays 512 MiB, so the guest grows the
+    /// inherited filesystem with resize2fs at boot, exactly as on the copy path.
+    /// The template is opened read-only and never mutated — if it is not yet
+    /// sized to `size_bytes`, this refuses (the caller falls back to the copy
+    /// path) rather than truncate a shared file under concurrent boots. Marks the
+    /// disk formatted so it is never reformatted (the overlay shares the
+    /// template's filesystem). Linux only; called only via [`Self::open_or_overlay_at`].
+    #[cfg(target_os = "linux")]
+    fn create_overlay_from_template(overlay_path: &Path, size_bytes: u64) -> Result<Self> {
+        let template = Self::template_path()
+            .ok_or_else(|| Error::storage("overlay from template", "no disk template found"))?;
+
+        // The template must already present the full virtual size (install-time
+        // sizing). Refuse rather than mutate a shared file under concurrent boots.
+        let template_len = std::fs::metadata(&template)
+            .map_err(|e| Error::storage("read template size", e.to_string()))?
+            .len();
+        if template_len < size_bytes {
+            return Err(Error::storage(
+                "overlay from template",
+                format!("template virtual size {template_len} < required {size_bytes}; not sized at install"),
+            ));
+        }
+
+        if let Some(parent) = overlay_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        // The backing path is written verbatim into the overlay header, so it
+        // must be absolute (canonicalized).
+        let base = template
+            .canonicalize()
+            .map_err(|e| Error::storage("canonicalize template", e.to_string()))?;
+        crate::agent::create_disk_overlays(&[(overlay_path.to_path_buf(), base, DiskFormat::Raw)])?;
+
+        let disk = Self {
+            path: overlay_path.to_path_buf(),
+            size_bytes,
+            format: DiskFormat::Qcow2,
+            _kind: PhantomData,
+        };
+        disk.mark_formatted()?;
+        Ok(disk)
     }
 
     /// Pre-format the disk with ext4 on the host.
@@ -132,6 +374,13 @@ impl<K: DiskType> VmDisk<K> {
     ///
     /// The template approach eliminates the e2fsprogs dependency for end users.
     pub fn ensure_formatted(&self) -> Result<()> {
+        if self.format == DiskFormat::Qcow2 {
+            // A qcow2 CoW overlay inherits its backing disk's already-formatted
+            // filesystem; formatting it would write a fresh fs into the overlay
+            // and diverge from the backing image.
+            return Ok(());
+        }
+
         if !self.needs_format() {
             tracing::debug!(
                 path = %self.path.display(),
@@ -153,6 +402,11 @@ impl<K: DiskType> VmDisk<K> {
     /// Get the path to the disk image.
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Get the on-disk image format (raw, or qcow2 for fork-clone overlays).
+    pub fn format(&self) -> DiskFormat {
+        self.format
     }
 
     /// Get the disk size in bytes.

@@ -7,7 +7,7 @@
 //! For backward compatibility, `SmolvmConfig` maintains an in-memory cache of VMs
 //! and provides the same API as the old confy-based implementation.
 
-use crate::data::network::DEFAULT_DNS;
+use crate::data::network;
 use crate::data::resources::{DEFAULT_MICROVM_CPU_COUNT, DEFAULT_MICROVM_MEMORY_MIB};
 use crate::db::SmolvmDb;
 use crate::error::Result;
@@ -181,7 +181,7 @@ impl SmolvmConfig {
             version: 1,
             default_cpus: DEFAULT_MICROVM_CPU_COUNT,
             default_mem: DEFAULT_MICROVM_MEMORY_MIB,
-            default_dns: DEFAULT_DNS.to_string(),
+            default_dns: network::default_dns(),
             #[cfg(target_os = "macos")]
             storage_volume: String::new(),
             vms: HashMap::new(),
@@ -215,7 +215,7 @@ impl SmolvmConfig {
         let default_dns = config_map
             .get("default_dns")
             .cloned()
-            .unwrap_or_else(|| DEFAULT_DNS.to_string());
+            .unwrap_or_else(network::default_dns);
 
         #[cfg(target_os = "macos")]
         let storage_volume = config_map
@@ -329,8 +329,9 @@ pub struct VmRecord {
     /// VM name/ID.
     pub name: String,
 
-    /// Creation timestamp.
-    pub created_at: String,
+    /// Creation timestamp (seconds since Unix epoch).
+    #[serde(deserialize_with = "deserialize_timestamp", default)]
+    pub created_at: u64,
 
     /// VM lifecycle state.
     #[serde(default)]
@@ -395,9 +396,21 @@ pub struct VmRecord {
     #[serde(default)]
     pub env: Vec<(String, String)>,
 
-    /// Working directory for init commands.
+    /// Secret references declared by a Smolfile `[secrets]` section, keyed
+    /// by the guest-side env var name. Resolved to plaintext at each VM
+    /// start (and for `machine exec`) and appended to the env vector — the
+    /// plaintext values never touch this record or the DB.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub secret_refs: std::collections::BTreeMap<String, crate::secrets::SecretRef>,
+
+    /// Working directory for the container workload.
     #[serde(default)]
     pub workdir: Option<String>,
+
+    /// Container user (UID or username). Resolved from image metadata at first
+    /// launch and stored so restart can replay the same identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
 
     /// Storage disk size in GiB (None = default 20 GiB).
     #[serde(default)]
@@ -414,6 +427,10 @@ pub struct VmRecord {
     /// Preferred network backend override for machine launch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network_backend: Option<NetworkBackend>,
+
+    /// Custom DNS resolver for the guest. None = backend default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dns: Option<std::net::Ipv4Addr>,
 
     /// OCI image for auto-container creation on start.
     #[serde(default)]
@@ -469,11 +486,37 @@ pub struct VmRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_smolmachine: Option<String>,
 
-    /// Imported-image store key this machine was created from.
-    /// When set, `machine start` mounts that local image entry instead of
-    /// pulling the image from a registry.
+    /// Image-store key for machines created from a local OCI archive/rootfs.
+    /// When set, `machine start` remounts the imported layers instead of pulling.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_imported_image: Option<String>,
+
+    /// Name of the golden VM this machine was forked from, if any. A clone's
+    /// block disks are copy-on-write overlays backed by the golden's disks, so
+    /// the golden must outlive its clones. The disk *format* is not recorded
+    /// here — it is derived from the on-disk file (`.qcow2` vs `.raw`), which is
+    /// the single source of truth (see `agent::resolve_disk_image`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub golden: Option<String>,
+}
+
+/// Deserialize `created_at` from either a legacy JSON string `"1705312345"` or
+/// the current integer `1705312345`. Old DB records stored it as a string.
+fn deserialize_timestamp<'de, D>(deserializer: D) -> std::result::Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StrOrU64 {
+        Str(String),
+        U64(u64),
+    }
+    match StrOrU64::deserialize(deserializer)? {
+        StrOrU64::U64(n) => Ok(n),
+        StrOrU64::Str(s) => s.parse::<u64>().map_err(serde::de::Error::custom),
+    }
 }
 
 fn default_cpus() -> u8 {
@@ -512,11 +555,14 @@ impl VmRecord {
             init: Vec::new(),
             init_completed: false,
             env: Vec::new(),
+            secret_refs: std::collections::BTreeMap::new(),
             workdir: None,
+            user: None,
             storage_gb: None,
             overlay_gb: None,
             allowed_cidrs: None,
             network_backend: None,
+            dns: None,
             image: None,
             image_user: None,
             entrypoint: Vec::new(),
@@ -531,6 +577,7 @@ impl VmRecord {
             ephemeral: false,
             source_smolmachine: None,
             source_imported_image: None,
+            golden: None,
         }
     }
 
@@ -562,11 +609,14 @@ impl VmRecord {
             init: Vec::new(),
             init_completed: false,
             env: Vec::new(),
+            secret_refs: std::collections::BTreeMap::new(),
             workdir: None,
+            user: None,
             storage_gb: None,
             overlay_gb: None,
             allowed_cidrs: None,
             network_backend: None,
+            dns: None,
             image: None,
             image_user: None,
             entrypoint: Vec::new(),
@@ -581,6 +631,7 @@ impl VmRecord {
             ephemeral: false,
             source_smolmachine: None,
             source_imported_image: None,
+            golden: None,
         }
     }
 
@@ -641,6 +692,7 @@ impl VmRecord {
             storage_gib: self.storage_gb,
             overlay_gib: self.overlay_gb,
             allowed_cidrs: self.allowed_cidrs.clone(),
+            dns: self.dns,
         }
     }
 }
@@ -664,6 +716,45 @@ mod tests {
         let deserialized: VmRecord = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.name, record.name);
         assert_eq!(deserialized.mounts, record.mounts);
+    }
+
+    #[test]
+    fn test_vm_record_secret_refs_roundtrip() {
+        use crate::secrets::SecretRef;
+        let mut record = VmRecord::new("r".into(), 1, 256, vec![], vec![], false);
+        record.secret_refs.insert(
+            "TLS_KEY".into(),
+            SecretRef {
+                from_env: None,
+                from_file: Some("/run/secrets/tls.key".into()),
+            },
+        );
+        record.secret_refs.insert(
+            "DB_URL".into(),
+            SecretRef {
+                from_env: Some("PROD_DB".into()),
+                from_file: None,
+            },
+        );
+
+        let json = serde_json::to_string(&record).unwrap();
+        // Ref metadata — not sensitive — roundtrips through serde_json.
+        assert!(json.contains("TLS_KEY"));
+        assert!(json.contains("PROD_DB"));
+
+        let back: VmRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.secret_refs.len(), 2);
+        assert_eq!(
+            back.secret_refs["TLS_KEY"]
+                .from_file
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned()),
+            Some("/run/secrets/tls.key".to_string())
+        );
+        assert_eq!(
+            back.secret_refs["DB_URL"].from_env.as_deref(),
+            Some("PROD_DB")
+        );
     }
 
     #[test]

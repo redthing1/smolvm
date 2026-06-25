@@ -26,6 +26,7 @@
 //! - the relay thread owns the host-facing TCP socket
 //! - channels bridge payloads between them
 
+use crate::egress::EgressPolicy;
 use crate::queues::WakePipe;
 use crate::virtio_net_log;
 use smoltcp::iface::{Interface, SocketHandle, SocketSet};
@@ -35,7 +36,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
+use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -60,6 +61,9 @@ pub struct TcpRelayTable {
     used_published_ports: HashSet<u16>,
     next_published_port: u16,
     max_connections: usize,
+    /// Outbound allow-list applied before opening a host connection for a
+    /// guest-initiated flow. Inbound published-port connections bypass it.
+    egress: EgressPolicy,
 }
 
 /// Newly established guest connection ready for a host relay thread.
@@ -93,6 +97,9 @@ struct TrackedConnection {
     pending_proxy_endpoints: Option<PendingProxyEndpoints>,
     // once true, a dedicated host relay thread exists
     relay_spawned: bool,
+    // partial guest->host payload already consumed from smoltcp but not yet
+    // accepted by the relay thread channel
+    buffered_guest_data: Option<Vec<u8>>,
     // partial host->guest payload not yet fully accepted by smoltcp
     buffered_proxy_data: Option<(Vec<u8>, usize)>,
     // bounded retry count for closing with unsent buffered data
@@ -165,13 +172,14 @@ impl RelayExitState {
 
 impl TcpRelayTable {
     /// Create a new relay table.
-    pub fn new(max_connections: Option<usize>) -> Self {
+    pub fn new(max_connections: Option<usize>, egress: EgressPolicy) -> Self {
         Self {
             connections: HashMap::new(),
             connection_keys: HashSet::new(),
             used_published_ports: HashSet::new(),
             next_published_port: PUBLISHED_PORT_START,
             max_connections: max_connections.unwrap_or(MAX_CONNECTIONS),
+            egress,
         }
     }
 
@@ -207,15 +215,23 @@ impl TcpRelayTable {
             return false;
         }
 
+        // Egress policy: drop the guest SYN before any socket is created when the
+        // destination isn't allowed, so the guest just sees the connection fail.
+        // Inbound published-port flows take a separate path and are unaffected.
+        if !self.egress.allows(destination.ip()) {
+            tracing::debug!(
+                %destination,
+                "virtio-net: blocking outbound connection by egress policy"
+            );
+            return false;
+        }
+
         let rx_buffer = tcp::SocketBuffer::new(vec![0u8; TCP_RX_BUFFER_BYTES]);
         let tx_buffer = tcp::SocketBuffer::new(vec![0u8; TCP_TX_BUFFER_BYTES]);
         let mut socket = tcp::Socket::new(rx_buffer, tx_buffer);
-        let std::net::IpAddr::V4(destination_ip) = destination.ip() else {
-            return false;
-        };
 
         let listen_endpoint = IpListenEndpoint {
-            addr: Some(destination_ip.into()),
+            addr: Some(destination.ip().into()),
             port: destination.port(),
         };
         if socket.listen(listen_endpoint).is_err() {
@@ -242,6 +258,7 @@ impl TcpRelayTable {
                     relay_target: RelayTarget::Connect(destination),
                 }),
                 relay_spawned: false,
+                buffered_guest_data: None,
                 buffered_proxy_data: None,
                 close_attempts: 0,
                 exit_state,
@@ -287,6 +304,8 @@ impl TcpRelayTable {
             return false;
         };
 
+        // Inbound published connections always target the guest's IPv4 on the
+        // internal link (the host listener family is independent of this).
         let std::net::IpAddr::V4(destination_ip) = destination.ip() else {
             self.used_published_ports.remove(&local_port);
             return false;
@@ -332,6 +351,7 @@ impl TcpRelayTable {
                     relay_target: RelayTarget::Attached(host_stream),
                 }),
                 relay_spawned: false,
+                buffered_guest_data: None,
                 buffered_proxy_data: None,
                 close_attempts: 0,
                 exit_state,
@@ -380,11 +400,12 @@ impl TcpRelayTable {
                 RelayExitMode::Running => {}
             }
 
-            while socket.can_recv() {
+            flush_guest_data(connection);
+            while connection.buffered_guest_data.is_none() && socket.can_recv() {
                 match socket.recv_slice(&mut read_buffer) {
                     Ok(bytes_read) if bytes_read > 0 => {
                         let payload = read_buffer[..bytes_read].to_vec();
-                        if connection.to_proxy.try_send(payload).is_err() {
+                        if !send_guest_payload(connection, payload) {
                             break;
                         }
                     }
@@ -477,7 +498,7 @@ impl TcpRelayTable {
 /// - connect a host `TcpStream` to the guest-requested destination
 /// - copy bytes guest->host from `from_smoltcp`
 /// - copy bytes host->guest into `to_smoltcp`
-/// - wake the poll loop when host->guest data arrives
+/// - wake the poll loop when host->guest data arrives or guest->host backpressure eases
 /// - report termination mode through `exit_state`
 pub fn spawn_tcp_relay(
     destination: SocketAddr,
@@ -584,29 +605,60 @@ fn tcp_relay_loop(
     stream.set_nonblocking(true)?;
 
     let mut guest_write_closed = false;
+    let mut guest_channel_closed = false;
+    let mut pending_guest_data: Option<(Vec<u8>, usize)> = None;
     let mut read_buffer = [0u8; RELAY_BUFFER_BYTES];
 
     loop {
         let mut did_work = false;
 
-        loop {
+        if pending_guest_data.is_none() && !guest_channel_closed {
             match from_smoltcp.try_recv() {
                 Ok(payload) => {
-                    stream.write_all(&payload)?;
+                    pending_guest_data = Some((payload, 0));
+                    // Consuming from the bounded guest->host channel may free
+                    // capacity for a payload buffered in the smoltcp poll
+                    // thread. Wake it so backpressure clears promptly even for
+                    // one-way guest->host streams.
+                    relay_wake.wake();
                     did_work = true;
                 }
-                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Empty) => {}
                 Err(TryRecvError::Disconnected) => {
-                    // The guest side closed its write half. Mirror that toward
-                    // the remote peer once, then keep reading until the remote
-                    // side closes too.
-                    if !guest_write_closed {
-                        let _ = stream.shutdown(Shutdown::Write);
-                        guest_write_closed = true;
-                    }
-                    break;
+                    guest_channel_closed = true;
                 }
             }
+        }
+
+        if let Some((payload, offset)) = &mut pending_guest_data {
+            while *offset < payload.len() {
+                match stream.write(&payload[*offset..]) {
+                    Ok(0) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::WriteZero,
+                            "host TCP relay wrote zero bytes",
+                        ));
+                    }
+                    Ok(bytes_written) => {
+                        *offset += bytes_written;
+                        did_work = true;
+                    }
+                    Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(err) => return Err(err),
+                }
+            }
+
+            if *offset >= payload.len() {
+                pending_guest_data = None;
+            }
+        }
+
+        if guest_channel_closed && pending_guest_data.is_none() && !guest_write_closed {
+            // The guest side closed its write half. Mirror that toward the
+            // remote peer only after all buffered guest bytes were written.
+            let _ = stream.shutdown(Shutdown::Write);
+            guest_write_closed = true;
         }
 
         match stream.read(&mut read_buffer) {
@@ -625,6 +677,24 @@ fn tcp_relay_loop(
         if !did_work {
             thread::sleep(PROXY_IDLE_SLEEP);
         }
+    }
+}
+
+fn flush_guest_data(connection: &mut TrackedConnection) {
+    let Some(payload) = connection.buffered_guest_data.take() else {
+        return;
+    };
+    send_guest_payload(connection, payload);
+}
+
+fn send_guest_payload(connection: &mut TrackedConnection, payload: Vec<u8>) -> bool {
+    match connection.to_proxy.try_send(payload) {
+        Ok(()) => true,
+        Err(TrySendError::Full(payload)) => {
+            connection.buffered_guest_data = Some(payload);
+            false
+        }
+        Err(TrySendError::Disconnected(_)) => false,
     }
 }
 
@@ -667,5 +737,43 @@ fn flush_proxy_data(socket: &mut tcp::Socket<'_>, connection: &mut TrackedConnec
             }
             Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_connection(to_proxy: SyncSender<Vec<u8>>) -> TrackedConnection {
+        let (_from_proxy_tx, from_proxy) = mpsc::sync_channel(CHANNEL_CAPACITY);
+        TrackedConnection {
+            source: SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 12_345),
+            destination: SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 80),
+            to_proxy,
+            from_proxy,
+            pending_proxy_endpoints: None,
+            relay_spawned: true,
+            buffered_guest_data: None,
+            buffered_proxy_data: None,
+            close_attempts: 0,
+            exit_state: RelayExitState::new(),
+            reserved_published_port: None,
+        }
+    }
+
+    #[test]
+    fn guest_payload_is_buffered_when_relay_channel_is_full() {
+        let (to_proxy, from_smoltcp) = mpsc::sync_channel(1);
+        to_proxy.send(vec![1]).unwrap();
+        let mut connection = test_connection(to_proxy);
+
+        assert!(!send_guest_payload(&mut connection, vec![2]));
+        assert_eq!(connection.buffered_guest_data.as_deref(), Some(&[2][..]));
+
+        assert_eq!(from_smoltcp.recv().unwrap(), vec![1]);
+        flush_guest_data(&mut connection);
+
+        assert!(connection.buffered_guest_data.is_none());
+        assert_eq!(from_smoltcp.recv().unwrap(), vec![2]);
     }
 }

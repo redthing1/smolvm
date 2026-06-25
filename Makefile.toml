@@ -22,6 +22,170 @@ exec ./scripts/run.sh "${ARGS[@]}"
 '''
 ]
 
+# =============================================================================
+# Build Tasks
+# =============================================================================
+
+[tasks.build]
+description = "Build release binary"
+category = "Build"
+command = "cargo"
+args = ["build", "--release"]
+
+[tasks.build-agent]
+description = "Build agent for Linux (size-optimized)"
+category = "Build"
+script_runner = "bash"
+script = [
+'''
+if [ "$(uname -s)" = "Linux" ]; then
+  cargo build --profile release-small -p smolvm-agent --target x86_64-unknown-linux-musl
+else
+  docker run --rm -v "$(pwd):/work" -w /work rust:alpine sh -c 'apk add musl-dev && cargo build --profile release-small -p smolvm-agent'
+fi
+'''
+]
+
+# =============================================================================
+# libkrun Tasks
+# =============================================================================
+
+[tasks.build-libkrunfw]
+description = "Build libkrunfw guest kernel and update lib/ (slow: downloads and compiles Linux 6.x)"
+category = "Build"
+script_runner = "bash"
+script = [
+'''
+set -e
+ARCH=$(uname -m)
+FULL_VERSION=$(grep '^FULL_VERSION' libkrunfw/Makefile | cut -d= -f2 | tr -d ' ')
+KERNEL_SRC=$(grep '^KERNEL_VERSION' libkrunfw/Makefile | cut -d= -f2 | tr -d ' ')
+
+# If the kernel source tree already exists, update its .config and force
+# kernel.c to regenerate — otherwise make skips both steps.
+if [ -d "libkrunfw/${KERNEL_SRC}" ]; then
+  cp libkrunfw/config-libkrunfw_x86_64 libkrunfw/${KERNEL_SRC}/.config
+  make -C libkrunfw/${KERNEL_SRC} olddefconfig
+  rm -f libkrunfw/kernel.c
+fi
+
+make -C libkrunfw
+mkdir -p lib/linux-${ARCH}
+cp libkrunfw/libkrunfw.so.${FULL_VERSION} lib/linux-${ARCH}/libkrunfw.so.${FULL_VERSION}
+cd lib/linux-${ARCH}
+ln -sf libkrunfw.so.${FULL_VERSION} libkrunfw.so.5
+ln -sf libkrunfw.so.5 libkrunfw.so
+echo "✓ libkrunfw ${FULL_VERSION} built and installed to lib/linux-${ARCH}/"
+'''
+]
+
+[tasks.build-libkrun]
+description = "Build libkrun with BLK and GPU support and copy into lib/ (run build-libkrunfw first if kernel config changed)"
+category = "Build"
+script_runner = "bash"
+script = [
+'''
+set -e
+ARCH=$(uname -m)
+make -C libkrun BLK=1 GPU=1
+if [ "$(uname -s)" = "Darwin" ]; then
+  # macOS: the dylib lives in lib/ (alongside libkrunfw.5.dylib).
+  cp libkrun/target/release/libkrun.dylib lib/libkrun.dylib
+  ./scripts/stamp-libkrun-provenance.sh lib --skip-libkrunfw
+  echo "✓ libkrun built and copied to lib/libkrun.dylib"
+else
+  mkdir -p lib/linux-${ARCH}
+  cp libkrun/target/release/libkrun.so lib/linux-${ARCH}/libkrun.so
+  ./scripts/stamp-libkrun-provenance.sh lib/linux-${ARCH} --skip-libkrunfw
+  echo "✓ libkrun built and copied to lib/linux-${ARCH}/libkrun.so"
+fi
+'''
+]
+
+# =============================================================================
+# Distribution Tasks
+# =============================================================================
+
+[tasks.dist]
+description = "Build distribution package"
+category = "Distribution"
+script_runner = "bash"
+script = [
+'''
+./scripts/build-dist.sh "$@"
+'''
+]
+
+# =============================================================================
+# Agent Tasks
+# =============================================================================
+
+[tasks.agent-rootfs]
+description = "Build agent rootfs"
+category = "Agent"
+script_runner = "bash"
+script = [
+'''
+./scripts/build-agent-rootfs.sh
+'''
+]
+
+[tasks.agent-rebuild]
+description = "Rebuild agent and update rootfs"
+category = "Agent"
+dependencies = ["build-agent", "agent-rootfs"]
+script_runner = "bash"
+script = [
+'''
+./scripts/rebuild-agent.sh
+'''
+]
+
+# =============================================================================
+# Test Tasks
+# =============================================================================
+
+[tasks.test]
+description = "Run all feature suites (11 groups, ~10 min)"
+category = "Test"
+dependencies = ["test-lib"]
+script_runner = "bash"
+script = [
+'''
+./tests/run_tests.sh
+'''
+]
+
+[tasks.test-cli]
+description = "Run CLI tests only"
+category = "Test"
+script_runner = "bash"
+script = [
+'''
+./tests/run_tests.sh cli
+'''
+]
+
+[tasks.test-pack]
+description = "Run pack tests only"
+category = "Test"
+script_runner = "bash"
+script = [
+'''
+./tests/run_tests.sh pack
+'''
+]
+
+[tasks.test-lib]
+description = "Run unit tests (no VM required)"
+category = "Test"
+command = "cargo"
+args = ["test", "--lib"]
+
+# =============================================================================
+# Install Tasks
+# =============================================================================
+
 [tasks.install]
 description = "Build from source and install locally"
 category = "Install"

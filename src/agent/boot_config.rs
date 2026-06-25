@@ -8,6 +8,7 @@
 //!
 //! This module defines the serializable config passed to that subprocess.
 
+use crate::data::disk::DiskFormat;
 use crate::data::network::PortMapping;
 use crate::data::resources::VmResources;
 use crate::data::storage::HostMount;
@@ -45,13 +46,15 @@ pub struct BootConfig {
     /// When set, a vsock port is registered so the guest can reach the host's SSH agent.
     #[serde(default)]
     pub ssh_agent_socket: Option<PathBuf>,
-    /// Hostnames from `--allow-host` to re-resolve for egress policy refresh.
+    /// Hostnames for DNS filtering. When set, the host starts a DNS filter
+    /// listener and the guest agent proxies DNS queries through it.
     #[serde(default)]
-    pub egress_policy_hosts: Option<Vec<String>>,
-    /// Host directory containing image data mounted for the guest agent.
+    pub dns_filter_hosts: Option<Vec<String>>,
+    /// Pre-extracted OCI layers directory for .smolmachine-sourced machines.
     #[serde(default)]
-    pub preloaded_image_dir: Option<PathBuf>,
-    /// Additional disk images to attach (path, read_only).
+    pub packed_layers_dir: Option<PathBuf>,
+    /// Additional disk images to attach (path, read_only, format). The format
+    /// lets the `pack --from-vm` exporter attach a source qcow2 disk read-only.
     #[serde(default)]
-    pub extra_disks: Vec<(PathBuf, bool)>,
+    pub extra_disks: Vec<(PathBuf, bool, DiskFormat)>,
 }

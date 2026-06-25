@@ -23,7 +23,7 @@
 //! High-level flow:
 //!
 //! ```text
-//! host client connects to 127.0.0.1:HOST
+//! host client connects to 127.0.0.1:HOST (or [::1]:HOST)
 //!   -> TcpPortListeners accepts TcpStream
 //!   -> AcceptedTcpConnection sent over a bounded channel
 //!   -> relay_wake wakes the smoltcp poll loop
@@ -34,7 +34,7 @@
 use crate::queues::WakePipe;
 use crate::PortMapping;
 use std::io;
-use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::sync::Arc;
@@ -73,44 +73,75 @@ impl TcpPortListeners {
         let shutdown = Arc::new(AtomicBool::new(false));
         let mut handles = Vec::with_capacity(port_mappings.len());
 
+        // Published ports bind loopback by default. `SMOLVM_PUBLISH_ADDR`
+        // widens that for fleet nodes whose ingress proxy connects from
+        // another host (the control plane): `0.0.0.0` (or any address) makes
+        // the cross-host hop possible — pair it with a firewall on the port
+        // range, since whatever can reach the address can reach the port.
+        let publish_addr: Ipv4Addr = std::env::var("SMOLVM_PUBLISH_ADDR")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(Ipv4Addr::LOCALHOST);
+        let publish_v6 = if publish_addr == Ipv4Addr::UNSPECIFIED {
+            Ipv6Addr::UNSPECIFIED
+        } else {
+            Ipv6Addr::LOCALHOST
+        };
+
         for mapping in port_mappings {
-            let listener = match TcpListener::bind((Ipv4Addr::LOCALHOST, mapping.host)) {
+            // The IPv4 listener is required; the IPv6 one is best-effort so
+            // hosts without IPv6 still publish normally.
+            let listener = match TcpListener::bind((publish_addr, mapping.host)) {
                 Ok(listener) => listener,
                 Err(err) => {
                     shutdown_all(&shutdown, &mut handles);
                     return Err(err);
                 }
             };
-            if let Err(err) = listener.set_nonblocking(true) {
-                shutdown_all(&shutdown, &mut handles);
-                return Err(err);
-            }
+            let listener_v6 = match TcpListener::bind((publish_v6, mapping.host)) {
+                Ok(listener) => Some(listener),
+                Err(err) => {
+                    tracing::debug!(
+                        host_port = mapping.host,
+                        error = %err,
+                        "skipping IPv6 listener for published port"
+                    );
+                    None
+                }
+            };
 
-            let tcp_sender = tcp_sender.clone();
-            let publish_wake = publish_wake.clone();
-            let shutdown_flag = shutdown.clone();
-            let host_port = mapping.host;
-            let guest_port = mapping.guest;
-
-            let handle = thread::Builder::new()
-                .name(format!("smolvm-tcp-{host_port}"))
-                .spawn(move || {
-                    run_tcp_port_listener(
-                        listener,
-                        host_port,
-                        guest_port,
-                        tcp_sender,
-                        publish_wake,
-                        shutdown_flag,
-                    )
-                })
-                .map_err(|err| {
+            for listener in std::iter::once(listener).chain(listener_v6) {
+                if let Err(err) = listener.set_nonblocking(true) {
                     shutdown_all(&shutdown, &mut handles);
-                    io::Error::other(format!(
-                        "failed to spawn published-port listener thread for {host_port}: {err}"
-                    ))
-                })?;
-            handles.push(handle);
+                    return Err(err);
+                }
+
+                let tcp_sender = tcp_sender.clone();
+                let publish_wake = publish_wake.clone();
+                let shutdown_flag = shutdown.clone();
+                let host_port = mapping.host;
+                let guest_port = mapping.guest;
+
+                let handle = thread::Builder::new()
+                    .name(format!("smolvm-tcp-{host_port}"))
+                    .spawn(move || {
+                        run_tcp_port_listener(
+                            listener,
+                            host_port,
+                            guest_port,
+                            tcp_sender,
+                            publish_wake,
+                            shutdown_flag,
+                        )
+                    })
+                    .map_err(|err| {
+                        shutdown_all(&shutdown, &mut handles);
+                        io::Error::other(format!(
+                            "failed to spawn published-port listener thread for {host_port}: {err}"
+                        ))
+                    })?;
+                handles.push(handle);
+            }
         }
 
         Ok(Self { shutdown, handles })

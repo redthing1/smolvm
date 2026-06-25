@@ -9,8 +9,8 @@
 //! Communication is via vsock on port 6000.
 
 use smolvm_protocol::{
-    error_codes, ports, AgentRequest, AgentResponse, Envelope, RegistryAuth, LAYER_CHUNK_SIZE,
-    PROTOCOL_VERSION,
+    error_codes, guest_env, ports, AgentRequest, AgentResponse, Envelope, RegistryAuth,
+    AGENT_READY_MARKER, LAYER_CHUNK_SIZE, PROTOCOL_VERSION,
 };
 use std::io::{Read, Write};
 use std::os::unix::io::AsRawFd;
@@ -58,7 +58,14 @@ fn format_boot_log(level: &str, msg: &str) -> String {
 /// Write a structured JSON log line to stderr during early boot,
 /// before tracing_subscriber is initialized. This keeps
 /// agent-console.log as valid JSON throughout.
-/// Also writes to /dev/kmsg so messages appear in dmesg.
+/// Also mirrors to /dev/kmsg so messages appear in `dmesg` inside the VM.
+///
+/// These timing lines (`boot agent_entry`, `mounts_done`, `rootfs_done`, etc.)
+/// are intentionally permanent support logs — they are not gated on RUST_LOG
+/// because they run before the tracing subscriber exists. Output goes only to
+/// `agent-console.log` (readable via `~/Library/Caches/smolvm/vms/<id>/`) and
+/// the in-VM kernel ring buffer, neither of which is visible to end users in
+/// normal operation.
 fn boot_log(level: &str, msg: &str) {
     let line = format_boot_log(level, msg);
     eprintln!("{}", line);
@@ -106,19 +113,6 @@ const NETWORK_TEST_TIMEOUT_SECS: u64 = 10;
 /// Poll interval for checking process completion in VM exec.
 const PROCESS_POLL_INTERVAL_MS: u64 = 10;
 
-/// Env var the host sets on guest init to signal GPU was requested.
-///
-/// This literal must match `smolvm::data::consts::ENV_SMOLVM_GPU` on
-/// the host. The agent crate does not depend on the host crate, so we
-/// redeclare the string here; a unit test on the host
-/// (`agent_env_constants_match`) asserts the two are in sync so a
-/// rename on one side can't silently desync the other.
-const ENV_SMOLVM_GPU: &str = "SMOLVM_GPU";
-
-/// Value signaling "on" for boolean SMOLVM_* sentinel env vars.
-/// Matches `smolvm::data::consts::ENV_VALUE_ON`.
-const ENV_VALUE_ON: &str = "1";
-
 /// Get system uptime in milliseconds (for timing relative to boot).
 fn uptime_ms() -> u64 {
     if let Ok(contents) = std::fs::read_to_string("/proc/uptime") {
@@ -131,6 +125,19 @@ fn uptime_ms() -> u64 {
     0
 }
 
+/// Get uptime via CLOCK_BOOTTIME syscall — works before /proc is mounted.
+#[cfg(target_os = "linux")]
+fn boottime_ms() -> u64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    unsafe {
+        libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut ts);
+    }
+    (ts.tv_sec as u64) * 1000 + (ts.tv_nsec as u64) / 1_000_000
+}
+
 fn main() {
     // Quick --version check (used by init script to detect rootfs updates)
     if std::env::args().any(|a| a == "--version") {
@@ -138,21 +145,37 @@ fn main() {
         std::process::exit(0);
     }
 
+    // Earliest possible timing point — CLOCK_BOOTTIME works before /proc exists.
+    #[cfg(target_os = "linux")]
+    boot_log(
+        "INFO",
+        &format!("boot agent_entry uptime_ms={}", boottime_ms()),
+    );
+
     // CRITICAL: Mount essential filesystems FIRST, before anything else.
     // When running as init (PID 1), we need these for the system to function.
     // This must happen before logging (which needs /dev for output).
     mount_essential_filesystems();
+    boot_log(
+        "INFO",
+        &format!("boot mounts_done uptime_ms={}", uptime_ms()),
+    );
 
-    // Create /dev/dri device nodes if virtio-gpu is present.
-    // libkrun's init.c mounts /dev as a basic tmpfs, so DRM nodes are not
-    // auto-created by devtmpfs. We read major:minor from /sys/class/drm/ and
-    // mknod them so containers can access the GPU render node.
+    // Create /dev/dri device nodes only when GPU is enabled. The setup
+    // function polls up to 500ms for the virtio-gpu driver to finish probing —
+    // running it on non-GPU machines wastes the full polling window.
     #[cfg(target_os = "linux")]
-    setup_gpu_dev_nodes();
+    if std::env::var(guest_env::GPU).as_deref() == Ok(guest_env::VALUE_ON) {
+        setup_gpu_dev_nodes();
+    }
 
     // Set up persistent rootfs overlay (if /dev/vdb exists).
     // This does overlayfs + pivot_root before anything else touches the filesystem.
     setup_persistent_rootfs();
+    boot_log(
+        "INFO",
+        &format!("boot rootfs_done uptime_ms={}", uptime_ms()),
+    );
 
     // Start seatd AFTER pivot_root so its socket lands at /run/seatd.sock in
     // the live root. Wayland compositors (Weston, sway) and DRI3-capable X
@@ -160,7 +183,7 @@ fn main() {
     // devices. Without seatd, GPU-accelerated display workloads fail with
     // "No backend was able to open a seat."
     #[cfg(target_os = "linux")]
-    if std::env::var(ENV_SMOLVM_GPU).as_deref() == Ok(ENV_VALUE_ON) {
+    if std::env::var(guest_env::GPU).as_deref() == Ok(guest_env::VALUE_ON) {
         start_seatd();
     }
 
@@ -174,23 +197,36 @@ fn main() {
             std::process::exit(1);
         }
     };
+    boot_log(
+        "INFO",
+        &format!("boot vsock_bound uptime_ms={}", uptime_ms()),
+    );
 
     // Set up signal handlers for graceful shutdown (sync before exit)
     setup_signal_handlers();
 
-    // Signal readiness to host IMMEDIATELY after vsock listener is active.
-    // The host detects this marker, then connects and sends its first request.
-    // That connection takes ~10-30ms, giving us time to finish deferred init
-    // below before the first request arrives.
-    signal_ready_to_host();
-
-    // --- Deferred init: runs while host is detecting marker + connecting ---
+    // --- Deferred init: runs before the host is allowed to send requests ---
+    //
+    // Keep the ready marker hidden until the guest has completed the boot-time
+    // work that init commands may depend on:
+    // - guest networking
+    // - storage mount
+    // - packed layers
+    // - volume mounts and /workspace setup
+    // - SSH agent / DNS proxy bridges
+    //
+    // `machine run` can reach init very quickly, so signaling readiness too
+    // early creates a race where init starts before the guest is actually ready
+    // to resolve or connect to the network. Named-machine startup has enough
+    // extra host-side work to mostly hide this, but the guest itself should not
+    // report "ready" until the boot prerequisites are complete.
     // Storage mount is behind a OnceLock (ensure_storage_mounted) so it
     // happens exactly once — either here or on first storage-dependent request.
 
     let start_uptime = uptime_ms();
 
-    // Initialize logging (deferred past ready signal — uses boot_log before this).
+    // Initialize logging after deferred boot work begins; boot_log is still
+    // used for the earliest readiness breadcrumbs.
     tracing_subscriber::fmt()
         .json()
         .with_env_filter(
@@ -202,7 +238,7 @@ fn main() {
     info!(
         version = env!("CARGO_PKG_VERSION"),
         uptime_ms = start_uptime,
-        "smolvm-agent started, vsock listener already ready"
+        "smolvm-agent started, deferred boot work in progress"
     );
 
     let t0 = uptime_ms();
@@ -223,11 +259,7 @@ fn main() {
         }
     }
 
-    // Mount storage disk eagerly during deferred init. If a request arrives
-    // before this point, ensure_storage_mounted() handles the mount on demand.
-    ensure_storage_mounted();
-
-    // Initialize preloaded image data if the launcher provided it.
+    // Initialize packed layers support (if SMOLVM_PACKED_LAYERS env var is set)
     let t0 = uptime_ms();
     if let Some(image_dir) = storage::get_preloaded_image_dir() {
         info!(
@@ -263,10 +295,18 @@ fn main() {
     // exist. The symlink makes /workspace available in both modes.
     // Placed AFTER init_volume_mounts so that `-v host:/workspace` takes
     // priority — the exists() check sees the bind mount and skips.
+    //
+    // The target `/storage/workspace` is created by the storage mount, which
+    // now runs *after* this block (it was moved below signal_ready_to_host()
+    // to overlap with the host connect). So the symlink is created even when
+    // the target doesn't exist yet — a dangling symlink is fine, it resolves
+    // once storage mounts, which always completes before the accept loop reads
+    // any request. Gating on `workspace_target.exists()` here would silently
+    // skip the symlink for bare VMs and is what regressed `/workspace`.
     {
         let workspace_link = std::path::Path::new("/workspace");
         let workspace_target = std::path::Path::new("/storage/workspace");
-        if !workspace_link.exists() && workspace_target.exists() {
+        if !workspace_link.exists() {
             let _ = std::os::unix::fs::symlink(workspace_target, workspace_link);
         }
     }
@@ -292,7 +332,7 @@ fn main() {
     // the missing GPU much later — when their workload makes a
     // rendering call and crashes with a confused EGL/Vulkan error.
     #[cfg(target_os = "linux")]
-    if std::env::var(ENV_SMOLVM_GPU).as_deref() == Ok(ENV_VALUE_ON) {
+    if std::env::var(guest_env::GPU).as_deref() == Ok(guest_env::VALUE_ON) {
         log_gpu_status();
     }
 
@@ -302,6 +342,22 @@ fn main() {
         "agent init complete, entering accept loop"
     );
 
+    // Only now is the guest safe to accept host requests for init/exec.
+    // Network is configured above; storage is mounted below while the host is
+    // establishing its vsock connection (~10-30ms), so the accept loop always
+    // sees storage ready without that mount adding to the user-visible boot time.
+    signal_ready_to_host();
+    boot_log(
+        "INFO",
+        &format!("boot ready_sent uptime_ms={}", uptime_ms()),
+    );
+
+    // Mount storage after signaling ready. The accept loop has not started yet,
+    // so no request can arrive before this completes. The OnceLock in
+    // ensure_storage_mounted() also guards any concurrent call from a request
+    // that races in the brief window on very fast hosts.
+    ensure_storage_mounted();
+
     // Start accepting connections (listener already bound)
     if let Err(e) = run_server_with_listener(listener) {
         error!(error = %e, "server error");
@@ -309,38 +365,33 @@ fn main() {
     }
 }
 
-/// Well-known filename for the ready marker.
-/// The agent creates this file in the virtiofs rootfs to signal readiness.
-/// The host watches for it via inotify/kqueue instead of the vsock socket.
-const READY_MARKER_FILENAME: &str = ".smolvm-ready";
-
 /// Signal to the host that the agent is fully initialized and ready.
 ///
-/// Creates a marker file in the virtiofs rootfs directory. Since virtiofs is
-/// shared between host and guest, the host can detect this file instantly
-/// via inotify/kqueue. This is more reliable than watching the vsock socket
-/// file (which is created by libkrun's muxer thread before the agent boots).
-///
-/// After pivot_root, the virtiofs root is mounted at /oldroot.
-/// Without overlay, the virtiofs root is /.
+/// Writes a marker file to the virtiofs rootfs. The host polls for this file.
+/// The virtiofs FUSE write is visible on the host filesystem within ~1ms
+/// (hv_gic_set_spi interrupt injection is 0–15µs; no event_manager involvement).
 fn signal_ready_to_host() {
     use std::path::Path;
 
     let content = uptime_ms().to_string();
 
+    // The host gives each VM its own marker name (SMOLVM_READY_MARKER) so
+    // concurrent boots don't race on one shared rootfs file and, under uid
+    // isolation, the host can pre-create it owned by this VM's uid. Fall back to
+    // the shared protocol constant if the host didn't set it (older host).
+    let marker =
+        std::env::var(guest_env::READY_MARKER).unwrap_or_else(|_| AGENT_READY_MARKER.to_string());
+
     // Try /oldroot first (overlay mode: virtiofs is the lower layer after pivot_root)
     // Before pivot_root: virtiofs is at /, so the / path works.
-    let paths = [
-        format!("/oldroot/{}", READY_MARKER_FILENAME),
-        format!("/{}", READY_MARKER_FILENAME),
-    ];
+    let paths = [format!("/oldroot/{}", marker), format!("/{}", marker)];
 
     for path in &paths {
-        if Path::new(path).parent().is_some_and(|p| p.exists())
-            && std::fs::write(path, content.as_bytes()).is_ok()
-        {
-            debug!(path = path, "ready marker written");
-            return;
+        if Path::new(path).parent().map_or(false, |p| p.exists()) {
+            if std::fs::write(path, content.as_bytes()).is_ok() {
+                boot_log("INFO", &format!("ready marker written: {path}"));
+                return;
+            }
         }
     }
 }
@@ -409,6 +460,25 @@ impl MountEntry {
 /// Uses direct syscalls to avoid any overhead.
 #[cfg(target_os = "linux")]
 fn mount_essential_filesystems() {
+    // The guest root filesystem is read-only, and neither libkrun's init.c nor
+    // the kernel mounts /tmp. A writable /tmp is the idiomatic home for
+    // ephemeral runtime files (the registry-auth config, crun console sockets,
+    // the ssh-agent socket, …), so mount a tmpfs over it. Best-effort: a
+    // failure here must not abort boot, and the individual writers that target
+    // /storage still work without it. Runs unconditionally — before the
+    // init.c-already-mounted early return below — because init.c never mounts
+    // /tmp.
+    let tmp = MountEntry {
+        source: "tmpfs",
+        target: "/tmp",
+        fstype: "tmpfs",
+        flags: libc::MS_NOSUID | libc::MS_NODEV,
+        data: Some("mode=1777"),
+    };
+    if let Err(e) = tmp.mount() {
+        warn!("smolvm-agent: failed to mount tmpfs on /tmp: {}", e);
+    }
+
     // libkrun's init.c mounts /proc, /sys, /dev, /dev/pts before exec'ing
     // the agent. Skip redundant mounts if already present.
     if std::path::Path::new("/proc/uptime").exists() {
@@ -617,7 +687,7 @@ fn start_seatd() {
 
 /// Log whether the GPU is accessible in the guest.
 ///
-/// Called at startup when `ENV_SMOLVM_GPU` is set. Checks whether the virtio-gpu
+/// Called at startup when `guest_env::GPU` is set. Checks whether the virtio-gpu
 /// render node appeared in `/dev/dri/` after `setup_gpu_dev_nodes` ran. If not,
 /// the kernel was built without `virtio-gpu` or `drm` support and the workload
 /// will fail at Vulkan/EGL init rather than here — log a clear warning so the
@@ -632,6 +702,34 @@ fn log_gpu_status() {
             "GPU: requested but /dev/dri/renderD128 not found — \
              the guest kernel may lack virtio-gpu/drm support; \
              Vulkan/EGL workloads will fail"
+        );
+    }
+}
+
+/// Ensure a mount-point directory exists on the agent rootfs, logging a WARN
+/// (rather than failing) if it can't be created.
+///
+/// The boot-critical mount points (/mnt/{overlay,storage,newroot}) are baked
+/// into the rootfs at build time — see the `mkdir` block in
+/// scripts/build-agent-rootfs.sh. This runtime `create_dir_all` is a backstop
+/// for rootfs images that predate that change or are assembled differently.
+///
+/// On a writable rootfs the dir already exists (no-op) or is created here. On a
+/// read-only rootfs the mkdir fails; we surface that as a WARN so the resulting
+/// failed overlay/storage mount is diagnosable instead of presenting as a
+/// silent boot-without-persistence. It also flags drift: a newly added `/mnt`
+/// mount point that wasn't baked into the build script will WARN here on a RO
+/// rootfs rather than fail mysteriously.
+#[cfg(target_os = "linux")]
+fn ensure_mount_dir(path: &str) {
+    if let Err(e) = std::fs::create_dir_all(path) {
+        boot_log(
+            "WARN",
+            &format!(
+                "could not create mount point {} ({}); rootfs may be read-only and \
+                 missing baked-in mount dirs — the following mount will likely fail",
+                path, e
+            ),
         );
     }
 }
@@ -716,7 +814,58 @@ fn setup_persistent_rootfs() {
         return;
     }
 
-    let _ = std::fs::create_dir_all(OVERLAY_MOUNT);
+    ensure_mount_dir(OVERLAY_MOUNT);
+
+    // Probe and mount storage disk in parallel with the overlay ext4 operations.
+    // Spawning here (before the /dev/vdb ext4 mount) lets storage work overlap
+    // with both the virtiofs activity between probe and mount (~27ms gap) and
+    // the /dev/vdb ext4 mount itself (~10ms, req=4–17). On warm boots this
+    // removes storage mount latency from the critical path entirely.
+    let storage_handle = if Path::new(STORAGE_DEVICE).exists() {
+        ensure_mount_dir(STORAGE_TEMP_MOUNT);
+        Some(std::thread::spawn(|| {
+            // Resize before mount — template may be smaller than device.
+            // Skip if filesystem already fills the device (subsequent boots).
+            // If resize fails (e.g. macOS-created template with incompatible features),
+            // skip mount — mount_storage_disk() will handle mkfs fallback.
+            if !ext4_already_full_size(STORAGE_DEVICE)
+                && !resize_ext4_if_needed(STORAGE_DEVICE, "storage")
+            {
+                boot_log(
+                    "WARN",
+                    "storage: resize failed, deferring to mount_storage_disk",
+                );
+                return false;
+            }
+
+            let dev = cstr(STORAGE_DEVICE);
+            let mnt = cstr(STORAGE_TEMP_MOUNT);
+            let ext4 = cstr("ext4");
+            // SAFETY: mount /dev/vda as ext4 at /mnt/storage with noatime
+            let mounted = unsafe {
+                libc::mount(
+                    dev.as_ptr(),
+                    mnt.as_ptr(),
+                    ext4.as_ptr(),
+                    libc::MS_NOATIME,
+                    std::ptr::null(),
+                ) == 0
+            };
+            if !mounted {
+                let err = std::io::Error::last_os_error();
+                boot_log(
+                    "WARN",
+                    &format!(
+                        "storage: parallel mount failed ({}), deferring to mount_storage_disk",
+                        err
+                    ),
+                );
+            }
+            mounted
+        }))
+    } else {
+        None
+    };
 
     // Resize ext4 on the UNMOUNTED device before mounting. The host copies
     // from a small template (~512MB) then extends the sparse file. resize2fs
@@ -771,81 +920,41 @@ fn setup_persistent_rootfs() {
         } != 0
         {
             boot_log("ERROR", "failed to mount overlay disk after formatting");
+            // Clean up the parallel storage mount so mount_storage_disk() fallback
+            // does not hit EBUSY from an already-mounted /dev/vda.
+            if let Some(handle) = storage_handle {
+                if handle.join().unwrap_or(false) {
+                    let mnt = cstr(STORAGE_TEMP_MOUNT);
+                    // SAFETY: umount /mnt/storage that the parallel thread mounted
+                    unsafe {
+                        libc::umount(mnt.as_ptr());
+                    }
+                }
+            }
             return;
         }
     }
 
-    // Resize + mount storage disk in parallel while we set up overlayfs.
-    // The resize + ext4 mount of /dev/vda overlaps with overlayfs setup
-    // and overlay dir creation, saving that time from the critical path.
-    let storage_handle = if Path::new(STORAGE_DEVICE).exists() {
-        let _ = std::fs::create_dir_all(STORAGE_TEMP_MOUNT);
-        Some(std::thread::spawn(|| {
-            // Resize before mount — template may be smaller than device.
-            // Skip if filesystem already fills the device (subsequent boots).
-            // If resize fails (e.g. macOS-created template with incompatible features),
-            // skip mount — mount_storage_disk() will handle mkfs fallback.
-            if !ext4_already_full_size(STORAGE_DEVICE)
-                && !resize_ext4_if_needed(STORAGE_DEVICE, "storage")
-            {
-                boot_log(
-                    "WARN",
-                    "storage: resize failed, deferring to mount_storage_disk",
-                );
-                return false;
-            }
-
-            let dev = cstr(STORAGE_DEVICE);
-            let mnt = cstr(STORAGE_TEMP_MOUNT);
-            let ext4 = cstr("ext4");
-            // SAFETY: mount /dev/vda as ext4 at /mnt/storage with noatime
-            let mounted = unsafe {
-                libc::mount(
-                    dev.as_ptr(),
-                    mnt.as_ptr(),
-                    ext4.as_ptr(),
-                    libc::MS_NOATIME,
-                    std::ptr::null(),
-                ) == 0
-            };
-            if !mounted {
-                let err = std::io::Error::last_os_error();
-                boot_log(
-                    "WARN",
-                    &format!(
-                        "storage: parallel mount failed ({}), deferring to mount_storage_disk",
-                        err
-                    ),
-                );
-            }
-            mounted
-        }))
-    } else {
-        None
-    };
-
     // Create overlay directories
     let _ = std::fs::create_dir_all(format!("{}/upper", OVERLAY_MOUNT));
     let _ = std::fs::create_dir_all(format!("{}/work", OVERLAY_MOUNT));
-    let _ = std::fs::create_dir_all(NEWROOT);
+    ensure_mount_dir(NEWROOT);
 
     // Mount overlayfs: initramfs (lower, read-only) + persistent disk (upper)
     let overlay_src = cstr("overlay");
     let newroot = cstr(NEWROOT);
     let overlay_type = cstr("overlay");
-    // index=on: enables the overlayfs index dir for stable file handle tracking across
-    //   copy-up operations (prevents stale handles after writes to lower-layer files).
-    // redirect_dir=on: enables redirect xattrs so cross-directory renames work correctly
-    //   on the upper layer without corrupting the lower layer view.
-    // uuid=on: stores a stable UUID in the upper dir for consistent inode numbering.
+    // Simple overlayfs without index/redirect_dir/uuid — these options trigger
+    // ext4 xattr writes + journal flushes on every mount. On macOS/HVF each
+    // ext4 journal flush (FUA/barrier) serializes to an APFS fsync (~10-30ms).
+    // With 15-30 flushes per mount, they add 200-900ms to every boot.
     //
-    // Note: these options do NOT enable Docker overlay2 stacking on the rootfs overlay.
-    // The rootfs overlay's lower layer is the initramfs (ramfs), which has no file-handle
-    // support. The kernel falls back to index=off for any overlay whose upper/work dir sits
-    // on this rootfs overlay, making it unusable as a Docker overlay2 upper dir regardless
-    // of these options. Docker's data root must be bind-mounted to ext4 (/storage/).
+    // These options also do NOT enable Docker overlay2 on this overlay — the
+    // lower layer is the initramfs (ramfs) which has no file-handle support,
+    // so the kernel falls back to index=off for any overlay2 upper dir on this
+    // root regardless. Docker's data root is on /storage/ (bare ext4), not here.
     let overlay_opts = cstr(&format!(
-        "index=on,redirect_dir=on,uuid=on,lowerdir=/,upperdir={}/upper,workdir={}/work",
+        "lowerdir=/,upperdir={}/upper,workdir={}/work",
         OVERLAY_MOUNT, OVERLAY_MOUNT
     ));
     // SAFETY: mount overlayfs with the specified options
@@ -1481,6 +1590,36 @@ fn run_server_with_listener(
     }
 }
 
+/// Patch `timeout_ms` on request variants where serde may have silently dropped
+/// the field due to the flatten + internally-tagged enum limitation.
+/// Re-extracts the value from the raw JSON payload.
+fn patch_timeout_ms(request: &mut AgentRequest, raw: &[u8]) {
+    let needs_patch = matches!(
+        request,
+        AgentRequest::VmExec {
+            timeout_ms: None,
+            ..
+        } | AgentRequest::Run {
+            timeout_ms: None,
+            ..
+        }
+    );
+    if !needs_patch {
+        return;
+    }
+
+    if let Ok(map) = serde_json::from_slice::<serde_json::Value>(raw) {
+        if let Some(ms) = map.get("timeout_ms").and_then(|v| v.as_u64()) {
+            match request {
+                AgentRequest::VmExec { timeout_ms, .. } | AgentRequest::Run { timeout_ms, .. } => {
+                    *timeout_ms = Some(ms);
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
 /// Handle a single connection.
 fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::error::Error>> {
     let mut buf = vec![0u8; REQUEST_BUFFER_SIZE];
@@ -1531,7 +1670,7 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
 
         // Parse request (Envelope wraps the request with an optional trace_id).
         // Falls back to bare AgentRequest for backward compatibility with old hosts.
-        let (request, trace_id) =
+        let (mut request, trace_id) =
             match serde_json::from_slice::<Envelope<AgentRequest>>(&buf[..len]) {
                 Ok(env) => (env.body, env.trace_id),
                 Err(_) => match serde_json::from_slice::<AgentRequest>(&buf[..len]) {
@@ -1550,14 +1689,19 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
                 },
             };
 
+        // Work around serde flatten + internally-tagged enum limitation:
+        // fields with #[serde(default)] can be silently dropped during
+        // deserialization. Re-extract timeout_ms from the raw JSON.
+        patch_timeout_ms(&mut request, &buf[..len]);
+
         let _span = if let Some(ref tid) = trace_id {
-            tracing::info_span!("request", trace_id = %tid, method = ?request)
+            tracing::info_span!("request", trace_id = %tid, method = %request.log_summary())
         } else {
-            tracing::info_span!("request", method = ?request)
+            tracing::info_span!("request", method = %request.log_summary())
         };
         let _guard = _span.enter();
 
-        debug!(?request, "received request");
+        debug!(method = %request.log_summary(), "received request");
 
         // Check if this is an interactive run request
         if let AgentRequest::Run {
@@ -1592,9 +1736,18 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
             ref image,
             ref oci_platform,
             ref auth,
+            ref proxy,
+            ref no_proxy,
         } = request
         {
-            handle_streaming_pull(stream, image, oci_platform.as_deref(), auth.as_ref())?;
+            handle_streaming_pull(
+                stream,
+                image,
+                oci_platform.as_deref(),
+                auth.as_ref(),
+                proxy.as_deref(),
+                no_proxy.as_deref(),
+            )?;
             continue;
         }
 
@@ -1624,8 +1777,10 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
             total_size,
         } = request
         {
-            // Drop any leftover session (Drop cleans its tmp file).
-            drop(write_session.take());
+            // Drop any leftover session now (Drop cleans its tmp file) before
+            // starting a new one. `take()` makes the drop explicit and keeps the
+            // value from looking like a dead store.
+            let _ = write_session.take();
             let (new_session, response) = handle_file_write_begin(path, mode, total_size);
             write_session = new_session;
             send_response(stream, &response)?;
@@ -1646,7 +1801,7 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
         // already handled cleanup.
         if write_session.is_some() {
             debug!(
-                method = ?request,
+                method = %request.log_summary(),
                 "dropping in-flight FileWrite session: non-chunk request arrived"
             );
             write_session = None;
@@ -1817,8 +1972,16 @@ fn handle_request(
             timeout_ms,
             interactive: false,
             tty: false,
+            stdin_data,
             ..
-        } => handle_vm_exec(&command, &env, workdir.as_deref(), timeout_ms, client_fd),
+        } => handle_vm_exec(
+            &command,
+            &env,
+            workdir.as_deref(),
+            timeout_ms,
+            client_fd,
+            stdin_data.as_deref(),
+        ),
 
         AgentRequest::VmExec { .. } => {
             // Interactive mode should be handled by handle_interactive_vm_exec
@@ -1839,7 +2002,9 @@ fn handle_request(
             interactive: false,
             tty: false,
             detached: false,
+            unprivileged,
             persistent_overlay_id,
+            stdin_data,
             background,
         } => {
             if background {
@@ -1851,6 +2016,7 @@ fn handle_request(
                     user.as_deref(),
                     &mounts,
                     persistent_overlay_id.as_deref(),
+                    unprivileged,
                 )
             } else {
                 handle_run(storage::RunCommandRequest {
@@ -1861,9 +2027,11 @@ fn handle_request(
                     user: user.as_deref(),
                     mounts: &mounts,
                     timeout_ms,
-                    persistent_overlay_id: persistent_overlay_id.as_deref(),
+                    persistent_overlay_id.as_deref(),
+                    stdin_data.as_deref(),
                     client_fd,
-                })
+                    unprivileged,
+                )
             }
         }
 
@@ -2516,7 +2684,35 @@ fn handle_streaming_file_read(
             return Ok(());
         }
     };
-    let size = file.metadata().ok().map(|m| m.len()).unwrap_or(0);
+    // Only stream regular files. Directories and special files (e.g. /dev/zero,
+    // FIFOs) `open()` successfully but misbehave on read — a directory fails with
+    // EISDIR *after* the chunk stream has started (desyncing the wire and bricking
+    // the connection), and an unbounded device never EOFs (hangs the caller). We
+    // must reject them with a clean error BEFORE the first DataChunk frame.
+    let metadata = match file.metadata() {
+        Ok(m) => m,
+        Err(e) => {
+            send_response(
+                stream,
+                &AgentResponse::error(
+                    format!("failed to stat {}: {}", path, e),
+                    error_codes::FILE_IO_FAILED,
+                ),
+            )?;
+            return Ok(());
+        }
+    };
+    if !metadata.is_file() {
+        send_response(
+            stream,
+            &AgentResponse::error(
+                format!("not a regular file: {}", path),
+                error_codes::FILE_IO_FAILED,
+            ),
+        )?;
+        return Ok(());
+    }
+    let size = metadata.len();
     info!(path = %path, size, "streaming file read");
     send_data_chunks(
         stream,
@@ -2533,38 +2729,50 @@ fn handle_interactive_run(
     request: AgentRequest,
 ) -> Result<(), Box<dyn std::error::Error>> {
     ensure_storage_mounted();
-    let (image, command, env, workdir, user, mounts, timeout_ms, tty, persistent_overlay_id) =
-        match request {
-            AgentRequest::Run {
-                image,
-                command,
-                env,
-                workdir,
-                user,
-                mounts,
-                timeout_ms,
-                tty,
-                persistent_overlay_id,
-                ..
-            } => (
-                image,
-                command,
-                env,
-                workdir,
-                user,
-                mounts,
-                timeout_ms,
-                tty,
-                persistent_overlay_id,
-            ),
-            _ => {
-                send_response(
-                    stream,
-                    &AgentResponse::error("expected Run request", error_codes::INVALID_REQUEST),
-                )?;
-                return Ok(());
-            }
-        };
+    let (
+        image,
+        command,
+        env,
+        workdir,
+        user,
+        mounts,
+        timeout_ms,
+        tty,
+        persistent_overlay_id,
+        unprivileged,
+    ) = match request {
+        AgentRequest::Run {
+            image,
+            command,
+            env,
+            workdir,
+            user,
+            mounts,
+            timeout_ms,
+            tty,
+            persistent_overlay_id,
+            unprivileged,
+            ..
+        } => (
+            image,
+            command,
+            env,
+            workdir,
+            user,
+            mounts,
+            timeout_ms,
+            tty,
+            persistent_overlay_id,
+            unprivileged,
+        ),
+        _ => {
+            send_response(
+                stream,
+                &AgentResponse::error("expected Run request", error_codes::INVALID_REQUEST),
+            )?;
+            return Ok(());
+        }
+    };
 
     let is_persistent = persistent_overlay_id.is_some();
     info!(image = %image, command = ?command, tty = tty, persistent = is_persistent, "starting interactive run");
@@ -2609,6 +2817,7 @@ fn handle_interactive_run(
         &mounts,
         tty,
         persistent_overlay_id.as_deref(),
+        unprivileged,
     ) {
         Ok(result) => result,
         Err(e) => {
@@ -2650,6 +2859,36 @@ fn handle_interactive_run(
     Ok(())
 }
 
+/// Resolve the command for a container run.
+///
+/// If the caller supplied a command, use it verbatim. Otherwise fall back to
+/// the image's OCI `ENTRYPOINT` + `CMD` (read from the stored image config),
+/// so an image can run its own init without the caller having to know it.
+/// Errors if no command was given and the image defines neither.
+#[cfg(target_os = "linux")]
+fn resolve_image_command(
+    image: &str,
+    command: Vec<String>,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    if !command.is_empty() {
+        return Ok(command);
+    }
+    match storage::query_image(image)? {
+        Some(info) => {
+            let mut resolved = info.entrypoint;
+            resolved.extend(info.cmd);
+            if resolved.is_empty() {
+                return Err(format!(
+                    "no command given and image '{image}' defines no entrypoint or cmd"
+                )
+                .into());
+            }
+            Ok(resolved)
+        }
+        None => Err(format!("image not found: {image}").into()),
+    }
+}
+
 /// Write an OCI bundle (`config.json`) and return a freshly generated container ID.
 ///
 /// Shared by [`handle_run_detached`] and [`spawn_interactive_command`] to avoid
@@ -2666,12 +2905,28 @@ fn write_oci_bundle(
     user: Option<&str>,
     mounts: &[(String, String, bool)],
     tty: bool,
+    unprivileged: bool,
 ) -> Result<String, Box<dyn std::error::Error>> {
     use std::path::Path;
 
     let workdir_str = workdir.unwrap_or("/");
     let identity = oci::resolve_process_identity(rootfs_path, user)?;
-    let mut spec = oci::OciSpec::new(command, env, workdir_str, tty, &identity);
+    let mut spec = oci::OciSpec::new(command, env, workdir_str, tty, &identity, unprivileged);
+
+    if tty {
+        // Give the PTY a non-zero starting size. The host follows up with a
+        // Resize message carrying the real terminal dimensions as soon as
+        // the interactive session starts.
+        spec.process.console_size = Some(oci::OciConsoleSize {
+            height: 24,
+            width: 80,
+        });
+    }
+
+    // Interactive and detached containers use this bundle writer instead of
+    // storage::run_command(). Mirror that path's GPU wiring so `-i`/`-t`
+    // shells see /dev/dri when the VM was started with --gpu.
+    spec.add_gpu_devices_if_available();
 
     for (tag, container_path, read_only) in mounts {
         let virtiofs_mount = Path::new(paths::VIRTIOFS_MOUNT_ROOT).join(tag);
@@ -2682,11 +2937,7 @@ fn write_oci_bundle(
         );
     }
 
-    // Shared workspace: /storage/workspace → /workspace inside container.
-    let workspace_src = Path::new("/storage/workspace");
-    if workspace_src.exists() {
-        spec.add_bind_mount(&workspace_src.to_string_lossy(), "/workspace", false);
-    }
+    storage::add_workspace_fallback(&mut spec, mounts);
 
     ssh_agent::inject_into_container(&mut spec);
     spec.write_to(bundle_path)
@@ -2713,42 +2964,40 @@ fn handle_run_detached(
 
     ensure_storage_mounted();
 
-    let (image, command, env, workdir, user, mounts, persistent_overlay_id) = match request {
-        AgentRequest::Run {
-            image,
-            command,
-            env,
-            workdir,
-            user,
-            mounts,
-            persistent_overlay_id,
-            ..
-        } => (
-            image,
-            command,
-            env,
-            workdir,
-            user,
-            mounts,
-            persistent_overlay_id,
-        ),
-        _ => {
-            send_response(
-                stream,
-                &AgentResponse::error("expected Run request", error_codes::INVALID_REQUEST),
-            )?;
-            return Ok(());
-        }
-    };
+    let (image, mut command, env, workdir, user, mounts, persistent_overlay_id, unprivileged) =
+        match request {
+            AgentRequest::Run {
+                image,
+                command,
+                env,
+                workdir,
+                user,
+                mounts,
+                persistent_overlay_id,
+                unprivileged,
+                ..
+            } => (
+                image,
+                command,
+                env,
+                workdir,
+                user,
+                mounts,
+                persistent_overlay_id,
+                unprivileged,
+            ),
+            _ => {
+                send_response(
+                    stream,
+                    &AgentResponse::error("expected Run request", error_codes::INVALID_REQUEST),
+                )?;
+                return Ok(());
+            }
+        };
 
-    // Validate inputs before creating any overlay state.
-    if command.is_empty() {
-        send_response(
-            stream,
-            &AgentResponse::error("empty command", error_codes::INVALID_REQUEST),
-        )?;
-        return Ok(());
-    }
+    // An empty command is allowed here: it means "run the image's own
+    // ENTRYPOINT/CMD". We resolve it from the image config below, after the
+    // image has been prepared (so its config is guaranteed present).
 
     let overlay_id = match persistent_overlay_id {
         Some(id) => id,
@@ -2778,6 +3027,23 @@ fn handle_run_detached(
             return Ok(());
         }
     };
+
+    // Resolve the command from the image's OCI ENTRYPOINT+CMD when the caller
+    // gave none — this is what lets service-style images (whose ENTRYPOINT
+    // orchestrates a supervised stack) run as their authors intended.
+    if command.is_empty() {
+        command = match resolve_image_command(&image, command) {
+            Ok(c) => c,
+            Err(e) => {
+                send_response(
+                    stream,
+                    &AgentResponse::error(e.to_string(), error_codes::INVALID_REQUEST),
+                )?;
+                return Ok(());
+            }
+        };
+        info!(image = %image, command = ?command, "resolved command from image config");
+    }
 
     if let Err(e) = storage::setup_mounts(&prepared.rootfs_path, &mounts) {
         send_response(
@@ -2825,6 +3091,7 @@ fn handle_run_detached(
         user.as_deref(),
         &mounts,
         false,
+        unprivileged,
     ) {
         Ok(id) => id,
         Err(e) => {
@@ -2999,6 +3266,13 @@ pub fn is_container_running(_container_id: &str) -> bool {
 /// Used when a main workload container is already running for this overlay —
 /// the new command joins its existing PID/mount/cgroup namespaces rather than
 /// creating an isolated new container.
+///
+/// When `tty` is true the PTY is obtained from crun via `--console-socket`,
+/// exactly like the fresh `crun run` path in [`spawn_interactive_command`].
+/// Letting crun allocate the PTY (rather than handing it a slave from an
+/// agent-owned pair) is what makes `TIOCSWINSZ` resizes reach the process
+/// inside the container; without it TUIs never redraw on host resize. See
+/// GH #156.
 #[cfg(target_os = "linux")]
 fn spawn_exec_in_container(
     container_id: &str,
@@ -3007,7 +3281,9 @@ fn spawn_exec_in_container(
     workdir: Option<&str>,
     tty: bool,
 ) -> Result<(Child, Option<pty::PtyMaster>), Box<dyn std::error::Error>> {
+    use std::io::Read as _;
     use std::os::unix::io::AsRawFd as _;
+    use std::sync::atomic::Ordering;
 
     info!(
         container_id = %container_id,
@@ -3017,6 +3293,54 @@ fn spawn_exec_in_container(
     );
 
     if tty {
+        // Preferred: console socket (resizable). Mirrors the create path.
+        if CONSOLE_SOCKET_WORKS.load(Ordering::Relaxed) {
+            let console = pty::ConsoleSocket::bind(container_id)?;
+            let mut child = crun::CrunCommand::exec_with_console(
+                container_id,
+                env,
+                command,
+                workdir,
+                console.path(),
+            )
+            .spawn()?;
+            match console.recv_master(std::time::Duration::from_secs(3)) {
+                Ok(pty_master) => {
+                    let _ = pty_master.set_window_size(80, 24);
+                    if let Some(mut err) = child.stderr.take() {
+                        std::thread::spawn(move || {
+                            let mut sink = Vec::new();
+                            let _ = err.read_to_end(&mut sink);
+                        });
+                    }
+                    return Ok((child, Some(pty_master)));
+                }
+                Err(e) => {
+                    // A transient timeout (crun slow to hand back the console)
+                    // must not permanently disable console sockets for the rest
+                    // of the VM's life — that would silently lose resize on
+                    // every later session. Only latch off when the runtime
+                    // genuinely doesn't support them (a non-timeout failure).
+                    if e.kind() != std::io::ErrorKind::TimedOut {
+                        CONSOLE_SOCKET_WORKS.store(false, Ordering::Relaxed);
+                    }
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let stderr = child
+                        .stderr
+                        .take()
+                        .map(|mut s| {
+                            let mut buf = String::new();
+                            let _ = s.read_to_string(&mut buf);
+                            buf
+                        })
+                        .unwrap_or_default();
+                    warn!(error = %e, crun_stderr = %stderr.trim(), "exec console socket unavailable; falling back to stdio PTY");
+                }
+            }
+        }
+
+        // Fallback: attach the agent's PTY slave as crun exec's stdio.
         let (pty_master, slave_fd) = pty::open_pty(80, 24)?;
         let slave_raw = slave_fd.as_raw_fd();
         // SAFETY: slave_fd is a valid open fd from openpty.
@@ -3074,12 +3398,27 @@ pub fn resolve_main_container(_persistent_overlay_id: Option<&str>) -> Option<St
     None
 }
 
+/// Whether the runtime's `--console-socket` handshake works in this environment.
+/// We attempt it once; if the runtime never hands back the console master (older
+/// crun, or a guest where it doesn't work), we flip this off and use the
+/// stdio-PTY fallback for the rest of the process's life — so only the first
+/// interactive session pays the connect timeout. The console path gives dynamic
+/// terminal resize; the fallback works everywhere but doesn't propagate resize.
+#[cfg(target_os = "linux")]
+static CONSOLE_SOCKET_WORKS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
 /// Spawn a command for interactive execution using crun OCI runtime.
 ///
-/// When `tty` is true, allocates a PTY pair and attaches the slave to crun's
-/// stdio. The OCI spec sets `terminal: true` so that crun handles the
-/// controlling terminal setup (setsid + TIOCSCTTY) inside the container.
-/// In foreground `crun run` mode, this doesn't require `--console-socket`.
+/// When `tty` is true, the OCI spec sets `terminal: true` and the agent
+/// asks crun to allocate the container's PTY via `--console-socket`.
+/// crun sends the PTY master fd back to the agent over an AF_UNIX socket
+/// using `SCM_RIGHTS`; the agent then reads, writes, and resizes that
+/// master directly. This is the only way to make `TIOCSWINSZ` reach the
+/// process inside the container. Without `--console-socket` crun
+/// allocates its own PTY that the agent has no handle on, and every
+/// resize message is silently applied to the wrong terminal. See GH
+/// #156.
 #[cfg(target_os = "linux")]
 #[allow(clippy::too_many_arguments)]
 fn spawn_interactive_command(
@@ -3091,9 +3430,12 @@ fn spawn_interactive_command(
     mounts: &[(String, String, bool)],
     tty: bool,
     persistent_overlay_id: Option<&str>,
+    unprivileged: bool,
 ) -> Result<(Child, Option<pty::PtyMaster>), Box<dyn std::error::Error>> {
+    use std::io::Read as _;
     use std::os::unix::io::AsRawFd as _;
     use std::path::Path;
+    use std::sync::atomic::Ordering;
 
     if command.is_empty() {
         return Err("empty command".into());
@@ -3114,8 +3456,9 @@ fn spawn_interactive_command(
         return Err(format!("bundle directory not found: {}", bundle_path.display()).into());
     }
 
-    // Build the OCI bundle (config.json) and get a fresh container ID.
-    // When tty=true, the spec sets terminal:true so crun handles setsid + TIOCSCTTY.
+    // Build the OCI bundle (config.json) and get a fresh container ID. When
+    // tty=true the spec sets terminal:true and a starting consoleSize, and the
+    // PTY master is obtained from crun via --console-socket below.
     let container_id = write_oci_bundle(
         rootfs_path,
         &bundle_path,
@@ -3125,6 +3468,7 @@ fn spawn_interactive_command(
         user,
         mounts,
         tty,
+        unprivileged,
     )?;
 
     // Persist the container ID so subsequent execs join this container.
@@ -3148,12 +3492,57 @@ fn spawn_interactive_command(
     );
 
     if tty {
-        // Allocate a PTY pair — slave goes to crun's stdio, master returned to caller.
-        // With terminal:true in the OCI spec, crun sets up the controlling terminal
-        // for the container process.
+        // Preferred path: take the container's console over a socket so the
+        // master we hold is the process's real tty (resize works).
+        if CONSOLE_SOCKET_WORKS.load(Ordering::Relaxed) {
+            let console = pty::ConsoleSocket::bind(&container_id)?;
+            let mut child =
+                crun::CrunCommand::run_with_console(&bundle_path, &container_id, console.path())
+                    .spawn()?;
+            match console.recv_master(std::time::Duration::from_secs(3)) {
+                Ok(pty_master) => {
+                    let _ = pty_master.set_window_size(80, 24);
+                    // Drain crun's stderr so a chatty runtime can't fill the pipe.
+                    if let Some(mut err) = child.stderr.take() {
+                        std::thread::spawn(move || {
+                            let mut sink = Vec::new();
+                            let _ = err.read_to_end(&mut sink);
+                        });
+                    }
+                    return Ok((child, Some(pty_master)));
+                }
+                Err(e) => {
+                    // A transient timeout (crun slow to hand back the console)
+                    // must not permanently disable console sockets for the rest
+                    // of the VM's life — that would silently lose resize on
+                    // every later session. Only latch off when the runtime
+                    // genuinely doesn't support them (a non-timeout failure).
+                    if e.kind() != std::io::ErrorKind::TimedOut {
+                        CONSOLE_SOCKET_WORKS.store(false, Ordering::Relaxed);
+                    }
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let stderr = child
+                        .stderr
+                        .take()
+                        .map(|mut s| {
+                            let mut buf = String::new();
+                            let _ = s.read_to_string(&mut buf);
+                            buf
+                        })
+                        .unwrap_or_default();
+                    warn!(error = %e, crun_stderr = %stderr.trim(), "console socket unavailable; falling back to stdio PTY (resize will not propagate)");
+                    // The failed `crun run --console-socket` may have registered
+                    // container state under this id; clear it so the fallback
+                    // `crun run` with the same id doesn't hit "already exists".
+                    let _ = crun::CrunCommand::delete(&container_id, true).output();
+                }
+            }
+        }
+
+        // Fallback: attach the agent's PTY slave as crun's stdio.
         let (pty_master, slave_fd) = pty::open_pty(80, 24)?;
         let slave_raw = slave_fd.as_raw_fd();
-
         // SAFETY: slave_fd is a valid open fd from openpty.
         let child = unsafe {
             crun::CrunCommand::run(&bundle_path, &container_id)
@@ -3162,10 +3551,7 @@ fn spawn_interactive_command(
                 .stderr_from_fd(libc::dup(slave_raw))
                 .spawn()?
         };
-
-        // Close slave in parent — crun has its own copies.
         drop(slave_fd);
-
         Ok((child, Some(pty_master)))
     } else {
         let child = crun::CrunCommand::run(&bundle_path, &container_id)
@@ -3178,6 +3564,7 @@ fn spawn_interactive_command(
 
 /// Non-Linux stub for spawn_interactive_command.
 #[cfg(not(target_os = "linux"))]
+#[allow(clippy::too_many_arguments)]
 fn spawn_interactive_command(
     rootfs: &str,
     command: &[String],
@@ -3187,6 +3574,7 @@ fn spawn_interactive_command(
     mounts: &[(String, String, bool)],
     _tty: bool,
     _persistent_overlay_id: Option<&str>,
+    unprivileged: bool,
 ) -> Result<(Child, Option<()>), Box<dyn std::error::Error>> {
     use std::path::Path;
 
@@ -3206,7 +3594,7 @@ fn spawn_interactive_command(
 
     let workdir_str = workdir.unwrap_or("/");
     let identity = oci::resolve_process_identity(rootfs_path, user)?;
-    let mut spec = oci::OciSpec::new(command, env, workdir_str, false, &identity);
+    let mut spec = oci::OciSpec::new(command, env, workdir_str, false, &identity, unprivileged);
     spec.add_gpu_devices_if_available();
 
     for (tag, container_path, read_only) in mounts {
@@ -3218,11 +3606,7 @@ fn spawn_interactive_command(
         );
     }
 
-    // Shared workspace: /storage/workspace → /workspace inside container
-    let workspace_src = std::path::Path::new("/storage/workspace");
-    if workspace_src.exists() {
-        spec.add_bind_mount(&workspace_src.to_string_lossy(), "/workspace", false);
-    }
+    storage::add_workspace_fallback(&mut spec, mounts);
 
     // Forward SSH agent into the container if enabled at boot.
     ssh_agent::inject_into_container(&mut spec);
@@ -3293,7 +3677,7 @@ fn run_interactive_loop(
                 &mut stdout_buf,
                 &mut stderr_buf,
             )?;
-            return Ok(status.code().unwrap_or(-1));
+            return Ok(process::exit_code_from_status(&status));
         }
 
         // Check timeout
@@ -3508,7 +3892,7 @@ fn run_interactive_loop_pty(
                     Err(_) => break,
                 }
             }
-            return Ok(status.code().unwrap_or(-1));
+            return Ok(process::exit_code_from_status(&status));
         }
 
         // Check timeout.
@@ -3600,7 +3984,7 @@ fn run_interactive_loop_pty(
         // If the slave closed, the process is exiting — reap it now.
         if slave_closed {
             let status = child.wait()?;
-            return Ok(status.code().unwrap_or(-1));
+            return Ok(process::exit_code_from_status(&status));
         }
 
         // Read incoming request from host — only when poll confirms data
@@ -3625,8 +4009,26 @@ fn run_interactive_loop_pty(
 
             match request {
                 AgentRequest::Stdin { data } => {
-                    // For PTY, empty stdin is not EOF (Ctrl+D is a byte).
-                    if !data.is_empty() {
+                    if data.is_empty() {
+                        // Host stdin reached EOF. A PTY cannot have one
+                        // direction closed, so signal end-of-input to the
+                        // child by writing the EOF control character (VEOF,
+                        // Ctrl-D / 0x04). In canonical mode VEOF makes the
+                        // pending line available to the child's read()
+                        // immediately; a read() that finds an empty line
+                        // buffer returns 0, which is the EOF the child waits
+                        // for. Without it a stdin-reading child (cat, sh,
+                        // read) never terminates and the exec session hangs.
+                        //
+                        // Send it twice: if the host's final stdin chunk was
+                        // not newline-terminated, the first VEOF only flushes
+                        // that partial line (delivered as data, not EOF), so a
+                        // second VEOF — now at an empty line buffer — is what
+                        // produces the zero-length read. When the buffer is
+                        // already empty the first VEOF yields EOF and the
+                        // second is harmlessly consumed after the child exits.
+                        let _ = pty_master.write_all(&[0x04, 0x04]);
+                    } else {
                         let _ = pty_master.write_all(&data);
                     }
                 }
@@ -3965,6 +4367,7 @@ fn test_tcp_syscall(target: &str) -> serde_json::Value {
 /// would leak because nothing waits for the container to exit to clean it
 /// up. The returned PID is the crun process, which stays alive as long as
 /// the container's init process runs.
+#[allow(clippy::too_many_arguments)]
 fn handle_run_background(
     image: &str,
     command: &[String],
@@ -3973,6 +4376,7 @@ fn handle_run_background(
     user: Option<&str>,
     mounts: &[(String, String, bool)],
     persistent_overlay_id: Option<&str>,
+    unprivileged: bool,
 ) -> AgentResponse {
     info!(image = %image, command = ?command, mounts = ?mounts, "running command in background");
 
@@ -3983,7 +4387,16 @@ fn handle_run_background(
         );
     };
 
-    match storage::spawn_in_overlay(image, command, env, workdir, user, mounts, overlay_id) {
+    match storage::spawn_in_overlay(
+        image,
+        command,
+        env,
+        workdir,
+        user,
+        mounts,
+        overlay_id,
+        unprivileged,
+    ) {
         Ok(pid) => AgentResponse::Completed {
             exit_code: 0,
             stdout: format!("{}", pid).into_bytes(),
@@ -3993,22 +4406,63 @@ fn handle_run_background(
     }
 }
 
-fn handle_run(request: storage::RunCommandRequest<'_>) -> AgentResponse {
-    info!(
-        image = %request.image,
-        command = ?request.command,
-        mounts = ?request.mounts,
-        timeout_ms = ?request.timeout_ms,
-        persistent = request.persistent_overlay_id.is_some(),
-        "running command"
-    );
+/// Non-streaming exec/run returns the whole output in a single wire frame. If it
+/// would exceed the frame budget, return a clear error instead of attempting an
+/// oversized frame — which otherwise fails mid-send and surfaces to the caller as
+/// a confusing connection drop / SIGPIPE-truncated result. Large output should
+/// use streaming exec (`exec_stream`/`execStream`). The budget leaves headroom
+/// under MAX_FRAME_SIZE for base64 of the byte fields (~4/3) plus the JSON envelope.
+fn oversized_output_error(stdout: &[u8], stderr: &[u8]) -> Option<AgentResponse> {
+    const BUDGET: usize = 20 * 1024 * 1024; // ~20 MiB raw → ~27 MiB base64, under the 32 MiB frame
+    let total = stdout.len() + stderr.len();
+    if total > BUDGET {
+        return Some(AgentResponse::error(
+            format!(
+                "command output too large ({total} bytes; limit {BUDGET}). \
+                 Use streaming exec (exec_stream / execStream) for large output."
+            ),
+            error_codes::EXEC_FAILED,
+        ));
+    }
+    None
+}
 
-    match storage::run_command(request) {
-        Ok(result) => AgentResponse::Completed {
-            exit_code: result.exit_code,
-            stdout: result.stdout,
-            stderr: result.stderr,
-        },
+#[allow(clippy::too_many_arguments)]
+fn handle_run(
+    image: &str,
+    command: &[String],
+    env: &[(String, String)],
+    workdir: Option<&str>,
+    user: Option<&str>,
+    mounts: &[(String, String, bool)],
+    timeout_ms: Option<u64>,
+    persistent_overlay_id: Option<&str>,
+    stdin_data: Option<&str>,
+    client_fd: Option<std::os::unix::io::RawFd>,
+    unprivileged: bool,
+) -> AgentResponse {
+    info!(image = %image, command = ?command, mounts = ?mounts, timeout_ms = ?timeout_ms, persistent = persistent_overlay_id.is_some(), stdin = stdin_data.is_some(), "running command");
+
+    match storage::run_command(
+        image,
+        command,
+        env,
+        workdir,
+        user,
+        mounts,
+        timeout_ms,
+        persistent_overlay_id,
+        stdin_data,
+        client_fd,
+        unprivileged,
+    ) {
+        Ok(result) => oversized_output_error(&result.stdout, &result.stderr).unwrap_or(
+            AgentResponse::Completed {
+                exit_code: result.exit_code,
+                stdout: result.stdout,
+                stderr: result.stderr,
+            },
+        ),
         Err(e) => AgentResponse::from_err(e, error_codes::RUN_FAILED),
     }
 }
@@ -4019,12 +4473,15 @@ fn handle_streaming_pull<S: Read + Write>(
     image: &str,
     oci_platform: Option<&str>,
     auth: Option<&RegistryAuth>,
+    proxy: Option<&str>,
+    no_proxy: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     ensure_storage_mounted();
     info!(
         image = %image,
         ?oci_platform,
         has_auth = auth.is_some(),
+        has_proxy = proxy.is_some(),
         "pulling image with progress"
     );
 
@@ -4045,7 +4502,14 @@ fn handle_streaming_pull<S: Read + Write>(
     };
 
     let response = AgentResponse::from_result(
-        storage::pull_image_with_progress_and_auth(image, oci_platform, auth, progress_callback),
+        storage::pull_image_with_progress_and_auth(
+            image,
+            oci_platform,
+            auth,
+            proxy,
+            no_proxy,
+            progress_callback,
+        ),
         error_codes::PULL_FAILED,
     );
 
@@ -4301,6 +4765,7 @@ fn handle_vm_exec(
     workdir: Option<&str>,
     timeout_ms: Option<u64>,
     client_fd: Option<std::os::unix::io::RawFd>,
+    stdin_data: Option<&str>,
 ) -> AgentResponse {
     info!(command = ?command, "executing directly in VM");
 
@@ -4321,6 +4786,13 @@ fn handle_vm_exec(
         cmd.current_dir(wd);
     }
 
+    // If stdin data is provided, pipe it to the command.
+    // Otherwise, give the command immediate EOF via /dev/null.
+    if stdin_data.is_some() {
+        cmd.stdin(Stdio::piped());
+    } else {
+        cmd.stdin(Stdio::null());
+    }
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
 
@@ -4367,8 +4839,11 @@ fn handle_vm_exec(
         std::thread::Builder::new()
             .name("exec-stdout".into())
             .spawn(move || {
+                // Read ONE byte past the cap so the handler can tell "exactly at
+                // cap" from "overflowed" and return a clear error instead of a
+                // silently truncated result (+ a SIGPIPE exit on the child).
                 let mut buf = Vec::new();
-                let _ = out.take(MAX_OUTPUT as u64).read_to_end(&mut buf);
+                let _ = out.take(MAX_OUTPUT as u64 + 1).read_to_end(&mut buf);
                 buf
             })
     });
@@ -4378,9 +4853,25 @@ fn handle_vm_exec(
             .name("exec-stderr".into())
             .spawn(move || {
                 let mut buf = Vec::new();
-                let _ = err.take(MAX_OUTPUT as u64).read_to_end(&mut buf);
+                let _ = err.take(MAX_OUTPUT as u64 + 1).read_to_end(&mut buf);
                 buf
             })
+    });
+
+    // Write stdin on a separate thread after stdout/stderr drains are live.
+    // This keeps the timeout/disconnect loop below active even when the child
+    // never reads stdin and the pipe buffer fills.
+    let stdin_handle = stdin_data.and_then(|data| {
+        child.stdin.take().map(|mut child_stdin| {
+            let data = data.to_owned();
+            std::thread::Builder::new()
+                .name("exec-stdin".into())
+                .spawn(move || {
+                    use std::io::Write;
+                    child_stdin.write_all(data.as_bytes())
+                    // child_stdin is dropped here, closing the pipe → child sees EOF.
+                })
+        })
     });
 
     // Wait for exit with timeout
@@ -4389,7 +4880,7 @@ fn handle_vm_exec(
 
     let exit_code = loop {
         match child.try_wait() {
-            Ok(Some(status)) => break status.code().unwrap_or(-1),
+            Ok(Some(status)) => break process::exit_code_from_status(&status),
             Ok(None) => {
                 // Client disconnected — kill the orphan child so the accept
                 // loop isn't blocked waiting for it. Fixes BUG-12/20: SIGTERM
@@ -4447,6 +4938,31 @@ fn handle_vm_exec(
         .and_then(|h| h.join().ok())
         .unwrap_or_default();
 
+    if let Some(Ok(handle)) = stdin_handle {
+        if handle.is_finished() {
+            match handle.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+                Ok(Err(e)) => debug!(error = %e, "stdin writer finished with error"),
+                Err(_) => debug!("stdin writer thread panicked"),
+            }
+        } else {
+            debug!("stdin writer still blocked after command exit; detaching");
+        }
+    }
+
+    // If either stream exceeded the cap (we read one byte past it), the output
+    // was truncated and the child likely took a SIGPIPE — return a clear error
+    // instead of a silently-truncated success. Large output should stream.
+    if stdout.len() > MAX_OUTPUT || stderr.len() > MAX_OUTPUT {
+        return AgentResponse::error(
+            format!(
+                "command output exceeded {MAX_OUTPUT} bytes and was truncated. \
+                 Use streaming exec (exec_stream / execStream) for large output."
+            ),
+            error_codes::EXEC_FAILED,
+        );
+    }
     AgentResponse::Completed {
         exit_code,
         stdout,
@@ -4716,6 +5232,31 @@ mod bg_reap_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(unix)]
+    fn vm_exec_timeout_is_not_blocked_by_unread_stdin() {
+        let stdin_data = "x".repeat(8 * 1024 * 1024);
+        let start = std::time::Instant::now();
+
+        let response = handle_vm_exec(
+            &["sleep".to_string(), "5".to_string()],
+            &[],
+            None,
+            Some(100),
+            None,
+            Some(&stdin_data),
+        );
+
+        let AgentResponse::Completed { exit_code, .. } = response else {
+            panic!("expected completed response");
+        };
+        assert_eq!(exit_code, 124);
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "blocked stdin must not prevent timeout handling"
+        );
+    }
 
     // ========================================================================
     // Streaming file-upload session tests
@@ -5166,21 +5707,6 @@ mod tests {
         .unwrap();
 
         assert_eq!(resolved, merged.join("etc").join("hosts"));
-    }
-
-    /// Symmetric with `smolvm::data::consts::tests::host_guest_env_literals_are_stable`.
-    ///
-    /// The host declares `ENV_SMOLVM_GPU = "SMOLVM_GPU"` in
-    /// `src/data/consts.rs` and the agent redeclares the same literal
-    /// locally (the agent crate doesn't depend on the host crate).
-    /// Both tests pin the string; if either side is renamed alone,
-    /// its test fires and forces the other side to update in the
-    /// same change. Without the drift guard, a rename in the agent
-    /// would silently break the host→guest GPU-request signaling.
-    #[test]
-    fn host_guest_env_literals_are_stable() {
-        assert_eq!(ENV_SMOLVM_GPU, "SMOLVM_GPU");
-        assert_eq!(ENV_VALUE_ON, "1");
     }
 
     #[test]

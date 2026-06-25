@@ -86,6 +86,27 @@ init_smolvm() {
     echo "Using smolvm: $SMOLVM"
 }
 
+# Resolve a hostname to a single IPv4 address on the host, portably across
+# Linux and macOS. Linux glibc has `getent`; macOS does not, so fall back to
+# dig/python3/host (all present on a stock macOS or with bind tools). Prints the
+# IP on stdout, or nothing if resolution fails.
+resolve_host_ipv4() {
+    local host="$1" ip=""
+    if command -v getent >/dev/null 2>&1; then
+        ip=$(getent ahostsv4 "$host" 2>/dev/null | awk 'NR==1{print $1}')
+    fi
+    if [[ -z "$ip" ]] && command -v dig >/dev/null 2>&1; then
+        ip=$(dig +short "$host" A 2>/dev/null | grep -m1 -E '^[0-9]+(\.[0-9]+){3}$')
+    fi
+    if [[ -z "$ip" ]] && command -v python3 >/dev/null 2>&1; then
+        ip=$(python3 -c 'import socket,sys; print(socket.gethostbyname(sys.argv[1]))' "$host" 2>/dev/null)
+    fi
+    if [[ -z "$ip" ]] && command -v host >/dev/null 2>&1; then
+        ip=$(host -t A "$host" 2>/dev/null | awk '/has address/{print $NF; exit}')
+    fi
+    printf '%s' "$ip"
+}
+
 # Log helpers
 log_test() {
     echo -e "${YELLOW}[TEST]${NC} $1"
@@ -113,12 +134,24 @@ log_info() {
 FAILED_TESTS=()
 
 # Fail-fast mode: stop on first failure.
-# Set FAIL_FAST=1 or pass --fail-fast to run_all.sh.
+# Set FAIL_FAST=1 or use TEST_FILTER with run_tests.sh.
 FAIL_FAST="${FAIL_FAST:-0}"
 
 # Single test filter: only run tests whose name contains this string.
-# Usage: TEST_FILTER="from .smolmachine" bash tests/test_machine.sh
+# Usage: TEST_FILTER="port mapping" ./tests/run_tests.sh ports
 TEST_FILTER="${TEST_FILTER:-}"
+
+# Skip slow tests (≥25s intentional sleeps) when SMOLVM_SKIP_SLOW=1.
+# Usage inside a test function: skip_if_slow && return 0
+SMOLVM_SKIP_SLOW="${SMOLVM_SKIP_SLOW:-0}"
+
+skip_if_slow() {
+    if [[ "$SMOLVM_SKIP_SLOW" == "1" ]]; then
+        log_skip "slow test skipped (SMOLVM_SKIP_SLOW=1)"
+        return 0
+    fi
+    return 1
+}
 
 # Run a test function, capturing output and showing it on failure.
 run_test() {
@@ -200,12 +233,12 @@ print_summary() {
 
 # Get the data directory for a named machine.
 #
-# Delegates to `smolvm machine data-dir <name>` so the test helper never
+# Delegates to `smolvm machine data-dir --name <name>` so the test helper never
 # duplicates the hash logic. If Rust changes the on-disk layout, the test
 # suite automatically picks it up via this CLI call.
 vm_data_dir() {
     local name="${1:-default}"
-    $SMOLVM machine data-dir "$name" 2>/dev/null
+    $SMOLVM machine data-dir --name "$name" 2>/dev/null
 }
 
 # Cleanup helper - stop machine and remove named "default" from DB
@@ -213,7 +246,7 @@ vm_data_dir() {
 # manual testing or previous test runs).
 cleanup_machine() {
     $SMOLVM machine stop 2>/dev/null || true
-    $SMOLVM machine delete default -f 2>/dev/null || true
+    $SMOLVM machine delete --name default -f 2>/dev/null || true
 }
 
 # Verify that a VM's data directory was removed after deletion.
@@ -237,8 +270,8 @@ ensure_machine_running() {
     if [[ "$with_net" == "true" ]]; then
         # Stop and delete existing default VM, recreate with --net
         $SMOLVM machine stop 2>/dev/null || true
-        $SMOLVM machine delete default -f 2>/dev/null || true
-        $SMOLVM machine create default --net 2>/dev/null || true
+        $SMOLVM machine delete --name default -f 2>/dev/null || true
+        $SMOLVM machine create --name default --net 2>/dev/null || true
     fi
     $SMOLVM machine start 2>/dev/null || true
 
@@ -246,12 +279,37 @@ ensure_machine_running() {
     # the process is dead (stale PID), do a full cleanup and restart.
     if ! $SMOLVM machine exec -- true 2>/dev/null; then
         $SMOLVM machine stop 2>/dev/null || true
-        $SMOLVM machine delete default -f 2>/dev/null || true
+        $SMOLVM machine delete --name default -f 2>/dev/null || true
         if [[ "$with_net" == "true" ]]; then
-            $SMOLVM machine create default --net 2>/dev/null || true
+            $SMOLVM machine create --name default --net 2>/dev/null || true
         fi
         $SMOLVM machine start 2>/dev/null || true
     fi
+}
+
+# Poll until a VM responds to exec (i.e., the agent is ready to accept commands).
+# Replaces fixed sleep N readiness waits after machine start.
+#
+# Usage: wait_vm_ready [--name NAME] [TIMEOUT_SECS]
+#   --name NAME   Named VM (default: unnamed default VM)
+#   TIMEOUT_SECS  Give up after this many seconds (default: 10)
+#
+# Returns 0 when ready, 1 on timeout.
+wait_vm_ready() {
+    local name_flag="" timeout=10
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --name) name_flag="--name $2"; shift 2 ;;
+            *)      timeout="$1"; shift ;;
+        esac
+    done
+    local i=0
+    while [[ $i -lt $((timeout * 2)) ]]; do
+        $SMOLVM machine exec $name_flag -- true 2>/dev/null && return 0
+        sleep 0.5
+        ((i++)) || true
+    done
+    return 1
 }
 
 # Extract container ID from output
@@ -313,8 +371,16 @@ run_with_timeout() {
 #   - smolvm-bin machine start (VM processes from previous test runs)
 #   - Packed binaries running as daemons
 #
+# When SMOLVM_ORCHESTRATED=1 (set by run_tests.sh), this is a no-op: the
+# orchestrator does a single pre-flight kill before launching any suites, so
+# per-suite kills are skipped to avoid parallel suites killing each other's
+# in-flight VM starts.
+#
 # Call this before running tests to ensure clean state.
 kill_orphan_smolvm_processes() {
+    if [[ "${SMOLVM_ORCHESTRATED:-0}" == "1" ]]; then
+        return 0
+    fi
     local killed=0
 
     # Kill any smolvm serve processes

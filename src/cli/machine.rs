@@ -12,10 +12,11 @@
 use crate::cli::flush_output;
 use crate::cli::format_bytes;
 use crate::cli::parsers::{
-    mounts_to_virtiofs_bindings, parse_cidr, parse_duration, parse_env_list,
+    mounts_to_virtiofs_bindings, parse_cidr, parse_duration, parse_env_list, parse_image,
 };
 use crate::cli::vm_common::{self, DeleteVmOptions};
 use clap::{Args, Subcommand};
+use sha2::{Digest, Sha256};
 use smolvm::agent::{docker_config_mount, AgentClient, AgentManager, RunConfig, VmResources};
 use smolvm::data::network::PortMapping;
 use smolvm::data::resources::{DEFAULT_MICROVM_CPU_COUNT, DEFAULT_MICROVM_MEMORY_MIB};
@@ -23,7 +24,8 @@ use smolvm::data::storage::HostMount;
 use smolvm::network::{validate_requested_network_backend, NetworkBackend};
 use smolvm::{DEFAULT_IDLE_CMD, DEFAULT_SHELL_CMD};
 use std::io::Write;
-use std::path::PathBuf;
+use std::os::unix::process::CommandExt;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// Resolve `--allow-cidr`, `--allow-host`, and `--outbound-localhost-only` into a CIDR list,
@@ -31,6 +33,24 @@ use std::time::Duration;
 ///
 /// Resolution failure for `--allow-host` is a hard error — a typo or DNS outage
 /// should not silently weaken the security policy.
+/// Returns true when `s` structurally looks like an OCI image reference
+/// rather than an executable name or path.
+///
+/// Catches the common mistake of writing `smolvm machine run ubuntu:22.04 --
+/// bash` instead of `smolvm machine run --image ubuntu:22.04 -- bash`.
+/// Only unambiguous structural signals are checked:
+///   - `image:tag` form — colons are not valid in executable names
+///   - `registry/image` or `namespace/image` form (non-absolute slash path)
+///
+/// Bare names like `alpine` or `nginx` are intentionally not flagged here
+/// because they are indistinguishable from valid bare commands.
+fn is_likely_image_ref(s: &str) -> bool {
+    if s.contains(':') {
+        return true;
+    }
+    s.contains('/') && !s.starts_with('/') && !s.starts_with("./") && !s.starts_with("../")
+}
+
 fn resolve_egress_flags(
     mut allow_cidr: Vec<String>,
     allow_host: Vec<String>,
@@ -61,6 +81,98 @@ fn resolve_egress_flags(
     Ok((allow_cidr, net, egress_policy_hosts))
 }
 
+/// Parse `--secret-env KEY=HOST_VAR` and `--secret-file KEY=PATH` flag values
+/// into validated [`SecretRef`]s keyed by the guest-side env var name.
+///
+/// CLI-supplied refs are `TrustedLocal` (the host user invoked the command), so
+/// both source kinds are allowed; `validate_ref` still enforces structure and
+/// absolute `from_file` paths. A key that appears more than once — across or
+/// within the two flags — is a hard error, since silently keeping the last
+/// occurrence would mask a typo.
+fn parse_cli_secret_refs(
+    secret_env: &[String],
+    secret_file: &[String],
+) -> smolvm::Result<std::collections::BTreeMap<String, smolvm::secrets::SecretRef>> {
+    use smolvm::secrets::{env_ref, file_ref, validate_ref, ResolutionScope, SecretRef};
+    use std::collections::BTreeMap;
+
+    let mut out: BTreeMap<String, SecretRef> = BTreeMap::new();
+
+    let mut add =
+        |flag: &str, spec: &str, make: &dyn Fn(&str) -> SecretRef| -> smolvm::Result<()> {
+            let (key, value) = spec.split_once('=').ok_or_else(|| {
+                smolvm::Error::config(flag, format!("expected KEY=VALUE, got '{}'", spec))
+            })?;
+            if key.is_empty() {
+                return Err(smolvm::Error::config(
+                    flag,
+                    format!("empty secret name in '{}'", spec),
+                ));
+            }
+            let r = make(value);
+            validate_ref(&r, ResolutionScope::TrustedLocal)
+                .map_err(|e| smolvm::Error::config(flag, format!("secret '{}': {}", key, e)))?;
+            if out.insert(key.to_string(), r).is_some() {
+                return Err(smolvm::Error::config(
+                    flag,
+                    format!("secret '{}' specified more than once", key),
+                ));
+            }
+            Ok(())
+        };
+
+    for spec in secret_env {
+        add("--secret-env", spec, &|v| env_ref(v))?;
+    }
+    for spec in secret_file {
+        add("--secret-file", spec, &|v| file_ref(v))?;
+    }
+    Ok(out)
+}
+
+/// Spawn a detached `smolvm _cleanup-ephemeral` helper process so the parent
+/// CLI can exit immediately after flushing output.
+///
+/// Returns `true` if the helper was spawned successfully. The caller must then
+/// call `std::process::exit(exit_code)` without doing any further cleanup.
+///
+/// Returns `false` if spawn fails (binary not found, exec error, etc.).
+/// The caller falls back to synchronous cleanup in that case.
+fn try_spawn_detached_cleanup(
+    vm_name: &str,
+    pid: i32,
+    start_time: Option<u64>,
+    ephemeral_name: &str,
+) -> bool {
+    // Require a verified start time so the helper can use is_our_process_strict
+    // before sending SIGKILL. Without it, fall back to synchronous cleanup.
+    let start_time_val = match start_time {
+        Some(t) => t,
+        None => return false,
+    };
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    let result = std::process::Command::new(exe)
+        .arg("_cleanup-ephemeral")
+        .arg(vm_name)
+        .arg(pid.to_string())
+        .arg(start_time_val.to_string())
+        .arg(ephemeral_name)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        // New process group so the helper is immune to SIGHUP when the
+        // parent terminal closes. pgid = child pid.
+        .process_group(0)
+        .spawn();
+    // Drop the Child handle without waiting — we exit immediately after this.
+    // The OS will not create a zombie because the helper outlives us and its
+    // real parent (launchd/init) reaps it when it exits.
+    result.is_ok()
+}
+
 /// Manage machines
 #[derive(Subcommand, Debug)]
 pub enum MachineCmd {
@@ -75,6 +187,9 @@ pub enum MachineCmd {
 
     /// Start a machine
     Start(StartCmd),
+
+    /// Fork a running forkable machine into a new clone (CoW memory + disks)
+    Fork(ForkCmd),
 
     /// Stop a running machine
     Stop(StopCmd),
@@ -140,6 +255,7 @@ impl MachineCmd {
             MachineCmd::Exec(cmd) => cmd.run(),
             MachineCmd::Create(cmd) => cmd.run(),
             MachineCmd::Start(cmd) => cmd.run(),
+            MachineCmd::Fork(cmd) => cmd.run(),
             MachineCmd::Stop(cmd) => cmd.run(),
             MachineCmd::Delete(cmd) => cmd.run(),
             MachineCmd::Status(cmd) => cmd.run(),
@@ -175,8 +291,26 @@ impl MachineCmd {
 pub struct RunCmd {
     /// Container image (e.g., alpine, ubuntu:22.04, ghcr.io/org/image).
     /// Optional when a Smolfile provides the image, or for bare VM mode.
-    #[arg(short = 'I', long, value_name = "IMAGE")]
+    #[arg(short = 'I', long, value_name = "IMAGE", value_parser = parse_image)]
     pub image: Option<String>,
+
+    /// Raise the max accepted local image-archive size (e.g. 16GiB, 512M, or a
+    /// raw byte count); default 8GiB. For legitimately large images — sets
+    /// SMOLVM_MAX_IMAGE_BYTES for this run.
+    #[arg(long = "max-image-size", value_name = "SIZE",
+          value_parser = crate::cli::parsers::parse_size_bytes, help_heading = "Execution")]
+    pub max_image_size: Option<u64>,
+
+    /// Run a packed `.smolmachine` artifact ephemerally (the VM is discarded on
+    /// exit) — the one-shot equivalent of `machine create --from … + start`.
+    /// CPU/memory fall back to the artifact's baked manifest unless overridden.
+    #[arg(
+        long,
+        value_name = "PATH",
+        conflicts_with_all = ["image", "smolfile", "detach", "name", "gpu", "gpu_vram_mib", "oci_platform", "allow_cidr", "allow_host", "outbound_localhost_only", "secret_env", "secret_file"],
+        help_heading = "Machine source"
+    )]
+    pub from: Option<PathBuf>,
 
     /// Name a persistent machine when used with --detach.
     /// Matches the --name flag on start/stop/exec/status/resize. In foreground
@@ -245,13 +379,13 @@ pub struct RunCmd {
     pub net: bool,
 
     /// Select the networking backend.
-    #[arg(
-        long = "net-backend",
-        value_enum,
-        hide = true,
-        help_heading = "Network"
-    )]
+    #[arg(long = "net-backend", value_enum, help_heading = "Network")]
     pub net_backend: Option<NetworkBackend>,
+
+    /// Custom DNS resolver for the guest (implies --net). Use this when the
+    /// default public resolvers (8.8.8.8/1.1.1.1) are blocked on your network.
+    #[arg(long, value_name = "IP", help_heading = "Network")]
+    pub dns: Option<std::net::Ipv4Addr>,
 
     /// Allow egress to specific CIDR range (can be used multiple times, implies --net)
     #[arg(long = "allow-cidr", value_parser = parse_cidr, value_name = "CIDR", help_heading = "Network")]
@@ -311,11 +445,358 @@ pub struct RunCmd {
     /// Mount ~/.docker/ config into VM for registry authentication
     #[arg(long, help_heading = "Registry")]
     pub docker_config: bool,
+
+    /// Inject a secret from a host env var (GUEST_VAR=HOST_VAR), resolved at
+    /// launch. The value is never persisted to the machine record or a pack.
+    #[arg(
+        long = "secret-env",
+        value_name = "GUEST_VAR=HOST_VAR",
+        help_heading = "Security"
+    )]
+    pub secret_env: Vec<String>,
+
+    /// Inject a secret from a host file (GUEST_VAR=/abs/path), resolved at
+    /// launch. The value is never persisted to the machine record or a pack.
+    #[arg(
+        long = "secret-file",
+        value_name = "GUEST_VAR=PATH",
+        help_heading = "Security"
+    )]
+    pub secret_file: Vec<String>,
+
+    /// Skip the init-layer cache: re-run `init` on every ephemeral run instead of
+    /// baking `image + init` once into a cached, reusable artifact. Use this when
+    /// `init` depends on live volume contents (and so cannot be safely cached).
+    #[arg(long, help_heading = "Resources")]
+    pub no_init_cache: bool,
+
+    /// Rebuild the cached init layer even if a matching one already exists.
+    #[arg(long, help_heading = "Resources")]
+    pub rebuild_init_cache: bool,
+
+    /// Run the workload as an unprivileged container: restricted capabilities,
+    /// read-only cgroup, and no extra tmpfs. By default the workload is "VM-grade"
+    /// (the microVM is the isolation boundary, so it gets full privileges and any
+    /// image — incl. systemd — boots). Use this for defense-in-depth with untrusted
+    /// code. `init` always runs VM-grade (it needs privileges for apt/mounts).
+    #[arg(long, help_heading = "Security")]
+    pub unprivileged: bool,
+
+    #[command(flatten, next_help_heading = "Network")]
+    pub proxy_opts: crate::cli::proxy_opts::ProxyOpts,
+}
+
+/// Cache directory for baked init layers: a sibling of the per-VM cache
+/// (`<cache>/smolvm/init-layers`), derived from the same canonical root as
+/// [`smolvm::agent::vm_cache_root`] so it shares the install's cache location.
+fn init_layer_cache_dir() -> PathBuf {
+    smolvm::agent::vm_cache_root()
+        .parent()
+        .map(|smolvm_root| smolvm_root.join("init-layers"))
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp/smolvm-init-layers"))
+}
+
+/// Max real bytes the init-layer cache may occupy before eviction; override via
+/// `SMOLVM_INIT_CACHE_MAX_BYTES`. Default 10 GiB (~tens of layers).
+fn init_cache_max_bytes() -> u64 {
+    const DEFAULT: u64 = 10 * 1024 * 1024 * 1024;
+    std::env::var("SMOLVM_INIT_CACHE_MAX_BYTES")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT)
+}
+
+/// Evict least-recently-modified cached layers until the cache is at or below
+/// `max_bytes`, never evicting `keep` (the layer just published). Best-effort:
+/// per-entry errors are skipped. The `.smolmachine` sidecars are zstd-compressed
+/// (dense) files, so apparent length is an accurate size.
+fn prune_init_cache(dir: &Path, max_bytes: u64, keep: &Path) {
+    let mut layers: Vec<(PathBuf, std::time::SystemTime, u64)> = Vec::new();
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in rd.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|x| x.to_str()) != Some("smolmachine") {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        let mtime = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        layers.push((path, mtime, meta.len()));
+    }
+    let total: u64 = layers.iter().map(|(_, _, s)| *s).sum();
+    if total <= max_bytes {
+        return;
+    }
+    layers.sort_by_key(|(_, mtime, _)| *mtime); // oldest first
+    let mut over = total - max_bytes;
+    for (path, _, size) in layers {
+        if over == 0 {
+            break;
+        }
+        if path == keep {
+            continue;
+        }
+        if std::fs::remove_file(&path).is_ok() {
+            over = over.saturating_sub(size);
+        }
+    }
+}
+
+/// Best-effort sweep of leftover `init-bake-*` temp machines from crashed bakes.
+/// Age is taken from the DB record's `created_at` (always present — unlike the data
+/// dir, which a create-then-crash leaves absent) and gated on a generous threshold
+/// so an in-flight concurrent bake — which finishes in seconds — is never touched.
+/// Override the threshold (seconds) with `SMOLVM_INIT_BAKE_GC_SECS`.
+fn gc_stale_bake_machines(exe: &Path) {
+    let stale_after = std::env::var("SMOLVM_INIT_BAKE_GC_SECS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(30 * 60);
+    let Ok(cfg) = smolvm::config::SmolvmConfig::load() else {
+        return;
+    };
+    let now = smolvm::util::current_timestamp();
+    let stale: Vec<String> = cfg
+        .list_vms()
+        .filter(|(name, _)| name.starts_with("init-bake-"))
+        .filter(|(_, record)| now.saturating_sub(record.created_at) >= stale_after)
+        .map(|(name, _)| name.clone())
+        .collect();
+    for name in stale {
+        let _ = run_smolvm(exe, &["machine", "delete", "--name", &name, "-f"]);
+    }
+}
+
+/// Content key for an init layer: a hash of the image + init commands + env, so the
+/// cache rebuilds exactly when those inputs change.
+///
+/// PROTOTYPE LIMITATION: if `init` runs a script that lives on a mounted volume
+/// (e.g. `bash /project/init.sh`), the script's CONTENTS are not part of the key —
+/// inline the init steps into the Smolfile, or pass `--no-init-cache`.
+fn init_layer_key(image: Option<&str>, init: &[String], env: &[String]) -> String {
+    let mut h = Sha256::new();
+    h.update(image.unwrap_or("").as_bytes());
+    h.update([0u8]);
+    for c in init {
+        h.update(c.as_bytes());
+        h.update([0u8]);
+    }
+    h.update([0u8]);
+    for e in env {
+        h.update(e.as_bytes());
+        h.update([0u8]);
+    }
+    hex::encode(h.finalize())[..16].to_string()
+}
+
+/// Whether a `--image` value is an init-cache-bakeable source. Only registry
+/// refs are: the bake snapshots via `pack create --from-vm`, which sources base
+/// layers by pulling the image's registry manifest. A local archive or rootfs
+/// dir has no registry manifest (it is flattened on boot), so it takes the
+/// direct, uncached init path instead of a broken bake (#459).
+fn image_bakeable(image: Option<&str>) -> bool {
+    matches!(
+        image.map(smolvm::data::image_source::classify),
+        Some(smolvm::data::image_source::ImageSource::Registry(_))
+    )
+}
+
+/// Bake `image + init` into a cached `.smolmachine` (or reuse an existing one) and
+/// return its path. Runs the well-tested `machine create/start/stop` + `pack create
+/// --from-vm` flow as subprocesses of this same binary: create a temp machine from
+/// the Smolfile with the workload replaced by a `/bin/true` no-op so only `init`
+/// runs, snapshot it, and delete the temp machine. The real workload command is
+/// supplied at run time against the resulting artifact.
+fn ensure_init_layer(
+    params: &vm_common::CreateVmParams,
+    smolfile: Option<&Path>,
+    rebuild: bool,
+) -> smolvm::Result<PathBuf> {
+    // The bake here only ever receives a registry image: `ensure_init_layer` is
+    // gated on `image_bakeable()` (local archives/dirs take the direct path),
+    // because the `pack create --from-vm` snapshot below cannot source a local
+    // image's layers (they're flattened, with no registry manifest to pull).
+    let key = init_layer_key(params.image.as_deref(), &params.init, &params.env);
+    let dir = init_layer_cache_dir();
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| smolvm::Error::config("init-layer cache", e.to_string()))?;
+    let cached = dir.join(format!("{key}.smolmachine"));
+    if cached.exists() && !rebuild {
+        println!("Using cached init layer {key}");
+        return Ok(cached);
+    }
+
+    let smolfile = smolfile.ok_or_else(|| {
+        smolvm::Error::config(
+            "init-layer cache",
+            "init caching requires a --smolfile (the init source); pass --no-init-cache otherwise",
+        )
+    })?;
+    println!(
+        "Baking init layer (one-time; reused on later runs) [{key}, {} init step(s)]",
+        params.init.len()
+    );
+    let started = std::time::Instant::now();
+
+    let exe = std::env::current_exe()
+        .map_err(|e| smolvm::Error::config("init-layer cache", e.to_string()))?;
+    // Reap any temp machines orphaned by previously crashed bakes (age-gated so it
+    // never touches a concurrent in-flight bake).
+    gc_stale_bake_machines(&exe);
+    let pid = std::process::id();
+    let tmp = format!("init-bake-{key}-{pid}");
+    let sf = smolfile.to_string_lossy().to_string();
+
+    // Bake into a per-process staging dir, then atomically rename the sidecar into
+    // its final cache path. This makes an interrupted bake leave nothing usable (no
+    // truncated `.smolmachine` a later run would treat as valid), and makes two
+    // concurrent bakes of the same key safe — each stages independently and the last
+    // rename wins. The staging dir also absorbs `pack`'s stub binary, discarded when
+    // the dir is removed (the cache only needs the sidecar).
+    let staging = dir.join(format!(".staging-{key}-{pid}"));
+    let _ = std::fs::remove_dir_all(&staging);
+    std::fs::create_dir_all(&staging)
+        .map_err(|e| smolvm::Error::config("init-layer cache", e.to_string()))?;
+    let staged_out = staging.join("layer").to_string_lossy().to_string();
+    let staged_sidecar = staging.join("layer.smolmachine");
+
+    // Clear any temp machine left by a prior failed bake (best-effort; the common
+    // case is "doesn't exist", whose error is captured and discarded by run_smolvm).
+    let _ = run_smolvm(&exe, &["machine", "delete", "--name", &tmp, "-f"]);
+
+    let bake = (|| -> smolvm::Result<()> {
+        // Create from the Smolfile (init + volumes) but replace the workload with
+        // `/bin/true` so `start` runs init only. Forward the RESOLVED image and env
+        // (CLI overrides included) so the baked rootfs matches the cache key, which
+        // is derived from those same resolved params.
+        let mut create: Vec<String> = ["machine", "create", "--name", &tmp, "--smolfile", &sf]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        if let Some(image) = &params.image {
+            create.push("--image".into());
+            create.push(image.clone());
+        }
+        for e in &params.env {
+            create.push("-e".into());
+            create.push(e.clone());
+        }
+        create.push("--".into());
+        create.push("/bin/true".into());
+        let create: Vec<&str> = create.iter().map(String::as_str).collect();
+
+        println!("  · pulling image and running init...");
+        run_smolvm(&exe, &create)?;
+        run_smolvm(&exe, &["machine", "start", "--name", &tmp])?;
+        run_smolvm(&exe, &["machine", "stop", "--name", &tmp])?;
+        println!("  · snapshotting...");
+        run_smolvm(
+            &exe,
+            &["pack", "create", "--from-vm", &tmp, "-o", &staged_out],
+        )?;
+        if !staged_sidecar.exists() {
+            return Err(smolvm::Error::config(
+                "init-layer cache",
+                format!("bake did not produce {}", staged_sidecar.display()),
+            ));
+        }
+        Ok(())
+    })();
+    let _ = run_smolvm(&exe, &["machine", "delete", "--name", &tmp, "-f"]);
+
+    // Publish atomically only on success; always clear staging (drops the stub + any
+    // partial output) so a failed bake leaves the existing cache untouched.
+    let publish = bake.and_then(|_| {
+        std::fs::rename(&staged_sidecar, &cached).map_err(|e| {
+            smolvm::Error::config("init-layer cache", format!("publish cached layer: {e}"))
+        })
+    });
+    let _ = std::fs::remove_dir_all(&staging);
+    publish?;
+
+    // Bound the cache: evict oldest layers if we're over the cap (keeping the one
+    // just baked). Best-effort — failure to prune never fails the run.
+    prune_init_cache(&dir, init_cache_max_bytes(), &cached);
+
+    println!("  ✓ baked in {}s", started.elapsed().as_secs());
+    Ok(cached)
+}
+
+/// Run this same smolvm binary as a subprocess for one bake step. Output is
+/// CAPTURED (not inherited) so the bake's internal create/pull/pack chatter — and
+/// the harmless "vm not found" from the best-effort pre-clean — never reach the
+/// user's terminal; on failure the captured stderr tail is surfaced in the error.
+fn run_smolvm(exe: &Path, args: &[&str]) -> smolvm::Result<()> {
+    let out = std::process::Command::new(exe)
+        .args(args)
+        .output()
+        .map_err(|e| smolvm::Error::config("init-layer bake", e.to_string()))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let tail = stderr
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .rev()
+            .take(12)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+            .join("\n");
+        return Err(smolvm::Error::config(
+            "init-layer bake",
+            format!(
+                "`smolvm {}` failed ({}):\n{tail}",
+                args.join(" "),
+                out.status
+            ),
+        ));
+    }
+    Ok(())
 }
 
 impl RunCmd {
     pub fn run(self) -> smolvm::Result<()> {
         use smolvm::Error;
+
+        // --max-image-size raises the archive cap for this invocation by setting
+        // the env var the resolver reads (image_source::max_archive_bytes).
+        if let Some(bytes) = self.max_image_size {
+            std::env::set_var("SMOLVM_MAX_IMAGE_BYTES", bytes.to_string());
+        }
+
+        // `--from`: run a packed .smolmachine artifact ephemerally, reusing the
+        // proven pack-run path. Resource flags fall back to the artifact's baked
+        // manifest values (matching `machine create --from`); the remaining run
+        // flags pass through. Flags the sidecar runner can't honor are rejected
+        // at parse time via `conflicts_with_all` on `from`.
+        if let Some(from) = self.from {
+            return crate::cli::pack_run::PackRunCmd {
+                sidecar: Some(from),
+                command: self.command,
+                interactive: self.interactive,
+                tty: self.tty,
+                timeout: self.timeout,
+                workdir: self.workdir,
+                env: self.env,
+                volume: self.volume,
+                port: self.port,
+                net: self.net,
+                net_backend: self.net_backend,
+                cpus: (self.cpus != DEFAULT_MICROVM_CPU_COUNT).then_some(self.cpus),
+                mem: (self.mem != DEFAULT_MICROVM_MEMORY_MIB).then_some(self.mem),
+                storage: self.storage,
+                overlay: self.overlay,
+                force_extract: false,
+                info: false,
+                debug: false,
+            }
+            .run();
+        }
 
         let requested_name = self.name.clone();
         let vm_name = if self.detach {
@@ -330,7 +811,7 @@ impl RunCmd {
                 return Err(Error::config(
                     "machine run -d --name",
                     format!(
-                        "a machine named '{}' already exists. Use 'machine start --name {}' to start it, or 'machine delete {} -f' to remove it.",
+                        "a machine named '{}' already exists. Use 'machine start --name {}' to start it, or 'machine delete --name {} -f' to remove it.",
                         vm_name, vm_name, vm_name
                     ),
                 ));
@@ -355,25 +836,85 @@ impl RunCmd {
             self.port,
             net,
             self.net_backend,
+            self.dns,
             vec![],
             self.env,
             self.workdir,
-            self.smolfile,
+            self.smolfile.clone(),
             self.storage,
             self.overlay,
             cli_allow_cidrs,
         )?;
 
         let mut params = params;
-        params.egress_policy_hosts =
-            match (params.egress_policy_hosts.take(), cli_egress_policy_hosts) {
-                (Some(mut from_smolfile), Some(mut from_cli)) => {
-                    from_smolfile.append(&mut from_cli);
-                    Some(from_smolfile)
-                }
-                (Some(from_smolfile), None) => Some(from_smolfile),
-                (None, some) => some,
+        params.egress_policy_hosts = match (
+            params.egress_policy_hosts.take(),
+            cli_egress_policy_hosts,
+        ) {
+            (Some(mut from_smolfile), Some(mut from_cli)) => {
+                from_smolfile.append(&mut from_cli);
+                Some(from_smolfile)
+            }
+            (Some(from_smolfile), None) => Some(from_smolfile),
+            (None, some) => some,
+        };
+        // CLI `--secret-env`/`--secret-file` refs merge over any Smolfile
+        // `[secrets]` of the same name (CLI wins).
+        for (key, r) in parse_cli_secret_refs(&self.secret_env, &self.secret_file)? {
+            params.secret_refs.insert(key, r);
+        }
+
+        // Init-layer cache (prototype): for an ephemeral run of an IMAGE with `init`
+        // commands, bake `image + init` once into a cached `.smolmachine` and run from
+        // that artifact, so init's cost (e.g. `apt install`) is paid once and reused
+        // on every later run instead of re-running on each ephemeral boot. Skipped for
+        // detached/persistent runs (`-d`) and when `--no-init-cache` is set.
+        //
+        // Only REGISTRY images are baked. A local image (`--image -` / `--image
+        // file.tar` / a rootfs dir) is flattened with no registry manifest, so the
+        // bake's `pack create --from-vm` snapshot can't source its layers; and a
+        // `--image -` archive can't be re-read by the bake's child subprocess
+        // (null stdin) anyway. Local images take the direct path below, which
+        // stages the archive once in this process and runs init inline (#459).
+        if !self.no_init_cache
+            && !self.detach
+            && image_bakeable(params.image.as_deref())
+            && !params.init.is_empty()
+        {
+            let cached =
+                ensure_init_layer(&params, self.smolfile.as_deref(), self.rebuild_init_cache)?;
+            // The real workload: CLI trailing args win, else the Smolfile's
+            // entrypoint+cmd (the baked artifact's own command is a `/bin/true` no-op).
+            let command = if !self.command.is_empty() {
+                self.command.clone()
+            } else {
+                let mut c = params.entrypoint.clone();
+                c.extend(params.cmd.clone());
+                c
             };
+            return crate::cli::pack_run::PackRunCmd {
+                sidecar: Some(cached),
+                command,
+                interactive: self.interactive,
+                tty: self.tty,
+                timeout: self.timeout,
+                workdir: params.workdir.clone(),
+                env: params.env.clone(),
+                volume: params.volume.clone(),
+                port: params.port.clone(),
+                net: params.net,
+                net_backend: params.network_backend,
+                cpus: (params.cpus != DEFAULT_MICROVM_CPU_COUNT).then_some(params.cpus),
+                mem: (params.mem != DEFAULT_MICROVM_MEMORY_MIB).then_some(params.mem),
+                storage: params.storage_gb,
+                overlay: params.overlay_gb,
+                force_extract: false,
+                info: false,
+                debug: false,
+            }
+            .run();
+        }
+
         let mut mounts = HostMount::parse(&params.volume)?;
         let ports = params.port.clone();
         PortMapping::check_duplicates(&ports)
@@ -415,11 +956,58 @@ impl RunCmd {
             (self.interactive, self.tty)
         };
 
+        // `--image -` consumes stdin to read the archive; `-i`/`-t` also bind
+        // stdin to the guest. They cannot both own stdin.
+        if self.image.as_deref() == Some("-") && (interactive || tty) {
+            return Err(smolvm::Error::config(
+                "machine run",
+                "`--image -` reads the image archive from stdin and cannot be \
+                 combined with -i/-t, which also use stdin.\n\
+                 Pipe the archive from a file instead: --image ./image.tar",
+            ));
+        }
+
+        // Detect the common mistake of passing an image reference as a positional
+        // argument instead of using --image.  clap's trailing_var_arg captures any
+        // positional before "--" into `command`, so `smolvm machine run ubuntu:22.04
+        // -- bash` silently puts "ubuntu:22.04" into command[0] and fails with a
+        // confusing ENOENT after the VM boots.  Catching the unambiguous cases
+        // (image:tag, registry/image) here avoids an unnecessary boot round-trip.
+        {
+            let resolved_image = self.image.as_deref().or(params.image.as_deref());
+            if resolved_image.is_none()
+                && !self.command.is_empty()
+                && is_likely_image_ref(&self.command[0])
+            {
+                let cmd0 = &self.command[0];
+                // Strip the "--" separator that trailing_var_arg includes
+                // in the vec so the suggestion doesn't show a double "--".
+                let rest: Vec<&str> = self.command[1..]
+                    .iter()
+                    .filter(|s| s.as_str() != "--")
+                    .map(|s| s.as_str())
+                    .collect();
+                let suggestion = if rest.is_empty() {
+                    format!("smolvm machine run --image {cmd0}")
+                } else {
+                    format!("smolvm machine run --image {cmd0} -- {}", rest.join(" "))
+                };
+                return Err(Error::config(
+                    "machine run",
+                    format!(
+                        "'{cmd0}' looks like a container image reference, not a command.\n\
+                         To run a container, use --image:\n  {suggestion}"
+                    ),
+                ));
+            }
+        }
+
         let resources = VmResources {
             cpus: params.cpus,
             memory_mib: params.mem,
             network: params.net,
             network_backend: params.network_backend,
+            dns: params.dns,
             // CLI --gpu wins; Smolfile gpu = true also enables it.
             gpu: self.gpu || params.gpu,
             gpu_vram_mib: self.gpu_vram_mib.or(params.gpu_vram_mib),
@@ -438,18 +1026,12 @@ impl RunCmd {
                 .map_err(|e| Error::agent("create agent manager", e.to_string()))?;
 
         if self.detach {
-            println!("Starting persistent machine...");
+            eprintln!("Starting persistent machine...");
         } else {
-            println!("Starting ephemeral machine ({})...", vm_name);
+            eprintln!("Starting ephemeral machine ({})...", vm_name);
         }
 
         let imported_image = vm_common::resolve_imported_image(image.as_deref())?;
-        let imported_image_data_dir = imported_image
-            .as_ref()
-            .map(|image| {
-                smolvm::image_store::ImageStore::open().map(|s| s.image_data_dir(&image.key))
-            })
-            .transpose()?;
 
         let ssh_agent_socket = if self.ssh_agent || params.ssh_agent {
             match std::env::var("SSH_AUTH_SOCK") {
@@ -465,27 +1047,57 @@ impl RunCmd {
             None
         };
 
+        // Resolve the image source on the host before launch: registry refs
+        // pass through to the guest pull; a local `docker save` archive or an
+        // unpacked rootfs directory is staged/validated and mounted via
+        // virtiofs (the `.smolmachine` packed-layers path), so no pull happens.
+        let raw_image = self.image.clone().or(params.image.clone());
+        let mut packed_layers_dir = None;
+        let image = match raw_image.as_deref() {
+            Some(img) => {
+                use smolvm::data::image_source::{classify, resolve, ResolvedImage};
+                match resolve(classify(img))? {
+                    ResolvedImage::Registry(reference) => Some(reference),
+                    ResolvedImage::Local {
+                        reference,
+                        packed_layers_dir: dir,
+                    } => {
+                        packed_layers_dir = Some(dir);
+                        Some(reference)
+                    }
+                }
+            }
+            None => None,
+        };
+        let uses_packed_layers = packed_layers_dir.is_some();
+
         let features = smolvm::agent::LaunchFeatures {
             ssh_agent_socket,
-            egress_policy_hosts: params.egress_policy_hosts.clone(),
-            preloaded_image_dir: imported_image_data_dir,
+            dns_filter_hosts: params.egress_policy_hosts.clone(),
+            packed_layers_dir,
             extra_disks: Vec::new(),
+            ..Default::default()
         };
 
         let freshly_started = manager
             .ensure_running_with_full_config(mounts.clone(), ports, resources, features)
             .map_err(|e| Error::agent("start machine", e.to_string()))?;
 
-        // Register ephemeral VM for tracking (machine list, orphan cleanup)
+        // Register ephemeral VM for tracking (machine list, orphan cleanup).
+        // Detached runs are tracked via persist_named_running instead — skip
+        // ephemeral registration so the detach path does not leave an
+        // unreachable orphan record after persist_named_running succeeds.
         let ephemeral_name = smolvm::util::generate_machine_name();
-        vm_common::register_ephemeral_vm(
-            &ephemeral_name,
-            manager.child_pid(),
-            params.cpus,
-            params.mem,
-            params.net,
-            self.image.clone().or(params.image.clone()),
-        );
+        if !self.detach {
+            vm_common::register_ephemeral_vm(
+                &ephemeral_name,
+                manager.child_pid(),
+                params.cpus,
+                params.mem,
+                params.net,
+                image.clone(),
+            );
+        }
 
         let mut client = AgentClient::connect_with_retry(manager.vsock_socket())?;
 
@@ -494,13 +1106,18 @@ impl RunCmd {
         // exec (which has its own SIGINT handling).
         let sigint_guard = manager.child_pid().map(smolvm::process::SigintGuard::new);
 
-        // Pull image if one is specified
-        let image_info = if let Some(ref img) = image {
-            match vm_common::load_image_info(
+        // Resolve image: CLI > Smolfile > None (bare VM)
+        // Pull only registry images; a local source's layers are already
+        // mounted via virtiofs and the guest assembles its rootfs from them.
+        let image_info = if uses_packed_layers {
+            None
+        } else if let Some(ref img) = image {
+            match crate::cli::pull_with_progress(
                 &mut client,
                 img,
                 self.oci_platform.as_deref(),
-                imported_image.is_some(),
+                self.proxy_opts.proxy(),
+                self.proxy_opts.no_proxy(),
             ) {
                 Ok(info) => Some(info),
                 Err(e) if !params.net && imported_image.is_none() => {
@@ -519,6 +1136,14 @@ impl RunCmd {
         } else {
             None
         };
+
+        // Resolve Smolfile [secrets] for this launch. Tuples are plaintext;
+        // do not log them. Zeroizing buffers were scrubbed inside the helper.
+        // These are merged into `env`/`init_env` below but never flow into
+        // `params.env`, so the plaintext values never touch the persisted
+        // VM record — only the refs are stored (via DefaultVmOverrides), and
+        // they get re-resolved at each subsequent `machine start`.
+        let resolved_secrets = vm_common::resolve_secret_refs_for_env(&params.secret_refs)?;
 
         if freshly_started && !params.init.is_empty() {
             // Route through `run_init_commands` so init runs inside the
@@ -541,7 +1166,8 @@ impl RunCmd {
                     )
                 })
                 .collect();
-            let init_env = parse_env_list(&params.env);
+            let mut init_env = parse_env_list(&params.env);
+            init_env.extend(resolved_secrets.iter().cloned());
             // Use the machine name as the overlay ID so any rootfs changes
             // init makes (e.g. `pacman -S git`) are visible to a
             // subsequent `machine exec`. The exec path resolves the
@@ -605,7 +1231,8 @@ impl RunCmd {
             vec![DEFAULT_SHELL_CMD.to_string()]
         };
 
-        let env = parse_env_list(&params.env);
+        let mut env = parse_env_list(&params.env);
+        env.extend(resolved_secrets.iter().cloned());
         let mount_bindings = mounts_to_virtiofs_bindings(&mounts);
 
         // Two modes: with image or bare VM (no image)
@@ -625,7 +1252,8 @@ impl RunCmd {
                         .with_workdir(defaults.workdir.clone())
                         .with_user(defaults.user.clone())
                         .with_mounts(mount_bindings.clone())
-                        .with_persistent_overlay(Some(vm_name.clone()));
+                        .with_persistent_overlay(Some(vm_name.clone()))
+                        .with_unprivileged(self.unprivileged);
                     client.run_container_detached(run_config)?;
                 }
 
@@ -652,24 +1280,37 @@ impl RunCmd {
                             &vm_name,
                             manager.child_pid(),
                             Some(DefaultVmOverrides {
+                                // Persist the REFS (re-resolved at each start via
+                                // record_env_with_secrets), never the resolved
+                                // plaintext — see `env` below.
+                                secret_refs: params.secret_refs.clone(),
                                 cpus: params.cpus,
                                 mem: params.mem,
                                 mounts: mount_tuples,
                                 ports: port_tuples,
                                 network: params.net,
                                 network_backend: params.network_backend,
+                                dns: params.dns,
                                 storage_gb: params.storage_gb,
                                 overlay_gb: params.overlay_gb,
                                 allowed_cidrs: params.allowed_cidrs.clone(),
                                 init: params.init.clone(),
-                                env: env.clone(),
-                                workdir: params.workdir.clone(),
+                                // Strip resolved secret values so plaintext never
+                                // reaches the DB/pack record. defaults.env still
+                                // carries them for RUNNING the container above; the
+                                // record keeps only refs + non-secret env.
+                                env: defaults
+                                    .env
+                                    .iter()
+                                    .filter(|(k, _)| !params.secret_refs.contains_key(k))
+                                    .cloned()
+                                    .collect(),
+                                workdir: defaults.workdir.clone(),
+                                user: defaults.user.clone(),
                                 image: Some(img.clone()),
-                                image_user: defaults.user.clone().or_else(|| {
-                                    imported_image.as_ref().and_then(|image| image.user.clone())
-                                }),
-                                entrypoint: params.entrypoint.clone(),
-                                cmd: params.cmd.clone(),
+                                image_user: defaults.user.clone(),
+                                entrypoint: Vec::new(),
+                                cmd: command.clone(),
                                 ssh_agent: self.ssh_agent || params.ssh_agent,
                                 egress_policy_hosts: params.egress_policy_hosts.clone(),
                                 source_imported_image: imported_image
@@ -714,6 +1355,10 @@ impl RunCmd {
                     guard.disarm();
                 }
 
+                // Use the machine's persistent overlay so the foreground workload
+                // sees init's filesystem changes (init ran with the same overlay id).
+                // Without this the workload runs in a fresh overlay and init appears
+                // to "do nothing" (e.g. `apt install`ed binaries are missing).
                 let exit_code = if interactive || tty {
                     let config = RunConfig::new(img, command)
                         .with_env(defaults.env.clone())
@@ -721,7 +1366,9 @@ impl RunCmd {
                         .with_user(defaults.user.clone())
                         .with_mounts(mount_bindings)
                         .with_timeout(self.timeout)
-                        .with_tty(tty);
+                        .with_tty(tty)
+                        .with_persistent_overlay(Some(vm_name.clone()))
+                        .with_unprivileged(self.unprivileged);
                     client.run_interactive(config)?
                 } else {
                     let config = RunConfig::new(img, command)
@@ -729,7 +1376,9 @@ impl RunCmd {
                         .with_workdir(defaults.workdir)
                         .with_user(defaults.user)
                         .with_mounts(mount_bindings)
-                        .with_timeout(self.timeout);
+                        .with_timeout(self.timeout)
+                        .with_persistent_overlay(Some(vm_name.clone()))
+                        .with_unprivileged(self.unprivileged);
                     let (exit_code, stdout, stderr) = client.run_non_interactive(config)?;
                     if !stdout.is_empty() {
                         let _ = std::io::stdout().write_all(&stdout);
@@ -742,6 +1391,14 @@ impl RunCmd {
                 };
 
                 // Ephemeral run — tear down VM and its data directory.
+                // Spawn a detached helper so the parent exits immediately after
+                // flushing output. Falls back to synchronous cleanup if spawn fails.
+                let (pid, start_time) = manager.pid_and_start_time().unwrap_or((0, None));
+                if pid > 0 && try_spawn_detached_cleanup(&vm_name, pid, start_time, &ephemeral_name)
+                {
+                    std::process::exit(exit_code);
+                }
+                // Fallback: synchronous cleanup (helper spawn failed).
                 vm_common::deregister_ephemeral_vm(&ephemeral_name);
                 manager.kill();
                 manager.cleanup_data_dir();
@@ -789,18 +1446,23 @@ impl RunCmd {
                         &vm_name,
                         manager.child_pid(),
                         Some(DefaultVmOverrides {
+                            // Persist the refs so secrets re-resolve on restart
+                            // (env below is already secret-free: parse_env_list).
+                            secret_refs: params.secret_refs.clone(),
                             cpus: params.cpus,
                             mem: params.mem,
                             mounts: mount_tuples,
                             ports: port_tuples,
                             network: params.net,
                             network_backend: params.network_backend,
+                            dns: params.dns,
                             storage_gb: params.storage_gb,
                             overlay_gb: params.overlay_gb,
                             allowed_cidrs: params.allowed_cidrs.clone(),
                             init: params.init.clone(),
                             env: env.clone(),
                             workdir: params.workdir.clone(),
+                            user: None,
                             image: None,
                             image_user: None,
                             entrypoint: params.entrypoint.clone(),
@@ -847,8 +1509,33 @@ impl RunCmd {
                         tty,
                     )?
                 } else {
-                    let (exit_code, stdout, stderr) =
-                        client.vm_exec(command, env, params.workdir.clone(), self.timeout)?;
+                    // Capture for error context before command is moved into vm_exec.
+                    let cmd0 = command.first().cloned().unwrap_or_default();
+                    let (exit_code, stdout, stderr) = client
+                        .vm_exec(command, env, params.workdir.clone(), self.timeout, None)
+                        .map_err(|e| {
+                            // In bare VM mode a spawn ENOENT often means the user
+                            // forgot --image and passed the image name as a positional.
+                            // Name the command that wasn't found so the hint is actionable.
+                            let msg = e.to_string();
+                            if image.is_none()
+                                && (msg.contains("No such file or directory")
+                                    || msg.contains("os error 2"))
+                                && !cmd0.starts_with('/')
+                                && !cmd0.starts_with('.')
+                            {
+                                Error::agent(
+                                    "vm exec",
+                                    format!(
+                                        "{msg}\n\nNote: '{cmd0}' was not found in the VM. \
+                                         If you meant to run a container image, use --image:\n  \
+                                         smolvm machine run --image {cmd0} -- <command>"
+                                    ),
+                                )
+                            } else {
+                                e
+                            }
+                        })?;
                     if !stdout.is_empty() {
                         let _ = std::io::stdout().write_all(&stdout);
                     }
@@ -859,6 +1546,14 @@ impl RunCmd {
                     exit_code
                 };
                 // Ephemeral run — tear down VM and its data directory.
+                // Spawn a detached helper so the parent exits immediately after
+                // flushing output. Falls back to synchronous cleanup if spawn fails.
+                let (pid, start_time) = manager.pid_and_start_time().unwrap_or((0, None));
+                if pid > 0 && try_spawn_detached_cleanup(&vm_name, pid, start_time, &ephemeral_name)
+                {
+                    std::process::exit(exit_code);
+                }
+                // Fallback: synchronous cleanup (helper spawn failed).
                 vm_common::deregister_ephemeral_vm(&ephemeral_name);
                 manager.kill();
                 manager.cleanup_data_dir();
@@ -872,6 +1567,65 @@ impl RunCmd {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn init_layer_key_is_stable_and_input_sensitive() {
+        let init = vec!["apt-get install -y jq".to_string()];
+        let env = vec!["FOO=bar".to_string()];
+        let base = init_layer_key(Some("ubuntu:noble"), &init, &env);
+        // Deterministic for identical inputs.
+        assert_eq!(base, init_layer_key(Some("ubuntu:noble"), &init, &env));
+        assert_eq!(base.len(), 16);
+        // Sensitive to each input: image, init, env.
+        assert_ne!(base, init_layer_key(Some("ubuntu:jammy"), &init, &env));
+        assert_ne!(
+            base,
+            init_layer_key(Some("ubuntu:noble"), &["other".to_string()], &env)
+        );
+        assert_ne!(
+            base,
+            init_layer_key(Some("ubuntu:noble"), &init, &["FOO=baz".to_string()])
+        );
+        // Order of init steps matters (different layer).
+        let init_rev = vec!["b".to_string(), "a".to_string()];
+        let init_fwd = vec!["a".to_string(), "b".to_string()];
+        assert_ne!(
+            init_layer_key(Some("x"), &init_fwd, &[]),
+            init_layer_key(Some("x"), &init_rev, &[])
+        );
+    }
+
+    #[test]
+    fn parse_cli_secret_refs_builds_env_and_file_refs() {
+        let refs = parse_cli_secret_refs(
+            &["GUEST_TOKEN=HOST_TOKEN".to_string()],
+            &["GUEST_KEY=/abs/key".to_string()],
+        )
+        .unwrap();
+        assert_eq!(refs["GUEST_TOKEN"].from_env.as_deref(), Some("HOST_TOKEN"));
+        assert_eq!(
+            refs["GUEST_KEY"]
+                .from_file
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned()),
+            Some("/abs/key".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_cli_secret_refs_rejects_bad_specs() {
+        // Missing '='.
+        assert!(parse_cli_secret_refs(&["NO_EQUALS".to_string()], &[]).is_err());
+        // Empty key.
+        assert!(parse_cli_secret_refs(&["=HOST".to_string()], &[]).is_err());
+        // Relative from_file path (validate_ref under TrustedLocal).
+        assert!(parse_cli_secret_refs(&[], &["K=relative/path".to_string()]).is_err());
+        // Duplicate key across the two flags.
+        assert!(
+            parse_cli_secret_refs(&["DUP=HOST".to_string()], &["DUP=/abs/path".to_string()])
+                .is_err()
+        );
+    }
 
     #[derive(Parser, Debug)]
     #[command(name = "machine")]
@@ -891,6 +1645,79 @@ mod tests {
         };
         assert_eq!(cmd.name, Some("foo".to_string()));
         assert!(cmd.detach);
+    }
+
+    // Documents the clap parsing behaviour: positionals before "--" land in
+    // `command`, not `image`.  is_likely_image_ref() catches the unambiguous
+    // cases before a VM is booted.
+    #[test]
+    fn run_image_ref_as_positional_lands_in_command_vec() {
+        let cli = TestMachineCli::parse_from(["machine", "run", "ubuntu:22.04", "--", "bash"]);
+        let MachineCmd::Run(cmd) = cli.command else {
+            panic!("expected machine run command");
+        };
+        assert_eq!(cmd.image, None);
+        // With trailing_var_arg, clap includes the "--" separator in the vec.
+        assert_eq!(cmd.command, ["ubuntu:22.04", "--", "bash"]);
+        // is_likely_image_ref catches this before the VM starts
+        assert!(is_likely_image_ref(&cmd.command[0]));
+    }
+
+    #[test]
+    fn create_accepts_trailing_workload_command() {
+        let cli = TestMachineCli::parse_from([
+            "machine", "create", "--name", "golden", "--image", "alpine", "--", "echo", "hi",
+        ]);
+        let MachineCmd::Create(cmd) = cli.command else {
+            panic!("expected machine create command");
+        };
+        assert_eq!(cmd.name, Some("golden".to_string()));
+        assert_eq!(cmd.image, Some("alpine".to_string()));
+        // The trailing command is captured (clap may include the "--" separator).
+        let words: Vec<&str> = cmd
+            .command
+            .iter()
+            .map(String::as_str)
+            .filter(|s| *s != "--")
+            .collect();
+        assert_eq!(words, ["echo", "hi"]);
+    }
+
+    #[test]
+    fn create_without_command_leaves_command_empty() {
+        // Regression: adding the trailing COMMAND arg must not break the common
+        // no-command form `machine create --name <name> --net`.
+        let cli = TestMachineCli::parse_from(["machine", "create", "--name", "golden", "--net"]);
+        let MachineCmd::Create(cmd) = cli.command else {
+            panic!("expected machine create command");
+        };
+        assert_eq!(cmd.name, Some("golden".to_string()));
+        assert!(cmd.command.is_empty());
+        assert!(cmd.net);
+    }
+
+    #[test]
+    fn create_rejects_bare_positional_name() {
+        // Machine names are flags everywhere (issue #370). A bare positional —
+        // the old `machine create myvm` habit — must error, not be silently
+        // captured as the workload command.
+        assert!(TestMachineCli::try_parse_from(["machine", "create", "myvm"]).is_err());
+    }
+
+    #[test]
+    fn is_likely_image_ref_classifies_correctly() {
+        // Unambiguous image references
+        assert!(is_likely_image_ref("ubuntu:22.04")); // image:tag
+        assert!(is_likely_image_ref("ghcr.io/org/image")); // registry/path
+        assert!(is_likely_image_ref("library/alpine")); // namespace/image
+
+        // Bare names are not flagged — indistinguishable from commands at parse time
+        assert!(!is_likely_image_ref("alpine"));
+        assert!(!is_likely_image_ref("bash"));
+
+        // Absolute and relative paths are always commands
+        assert!(!is_likely_image_ref("/bin/sh"));
+        assert!(!is_likely_image_ref("./script.sh"));
     }
 }
 
@@ -924,6 +1751,16 @@ pub struct ExecCmd {
     /// Set environment variable (can be used multiple times)
     #[arg(short = 'e', long = "env", value_name = "KEY=VALUE")]
     pub env: Vec<String>,
+
+    /// Inject a secret from a host env var (GUEST_VAR=HOST_VAR) for this exec,
+    /// resolved on the host. The value never persists to the record.
+    #[arg(long = "secret-env", value_name = "GUEST_VAR=HOST_VAR")]
+    pub secret_env: Vec<String>,
+
+    /// Inject a secret from a host file (GUEST_VAR=/abs/path) for this exec,
+    /// resolved on the host. The value never persists to the record.
+    #[arg(long = "secret-file", value_name = "GUEST_VAR=PATH")]
+    pub secret_file: Vec<String>,
 
     /// Kill command after duration (e.g., "30s", "5m")
     #[arg(long, value_parser = parse_duration, value_name = "DURATION")]
@@ -990,6 +1827,26 @@ impl ExecCmd {
             .map(|r| mounts_to_virtiofs_bindings(&r.host_mounts()))
             .unwrap_or_default();
 
+        // Base env for the exec: the record's persisted `env` plus its
+        // `secret_refs` resolved to plaintext on the host (RecordReplay scope).
+        // CLI `--env` flags are layered on top via `merge_env_overrides`. The
+        // resolved plaintext lives only in this local for the exec's duration —
+        // it is never written back to the record or the DB.
+        let mut record_env: Vec<(String, String)> = match record.as_ref() {
+            Some(r) => vm_common::record_env_with_secrets(r)?,
+            None => Vec::new(),
+        };
+        // Ad-hoc `--secret-env`/`--secret-file` refs for this exec only. The CLI
+        // user is TrustedLocal; resolved plaintext lives only in this local and
+        // is layered under any explicit `--env` overrides below.
+        let exec_secret_refs = parse_cli_secret_refs(&self.secret_env, &self.secret_file)?;
+        record_env.extend(smolvm::secrets::expose_into_env(
+            smolvm::secrets::resolve_refs_to_env(
+                &exec_secret_refs,
+                smolvm::secrets::ResolutionScope::TrustedLocal,
+            )?,
+        ));
+
         if let Some(ref image) = record_image {
             let image_info = match client.query(image) {
                 Ok(info) => info,
@@ -1002,10 +1859,7 @@ impl ExecCmd {
                     None
                 }
             };
-            let configured_env = vm_common::merge_env_overrides(
-                record.as_ref().map(|r| r.env.as_slice()).unwrap_or(&[]),
-                &env,
-            );
+            let configured_env = vm_common::merge_env_overrides(&record_env, &env);
             let defaults = vm_common::resolve_image_runtime_defaults(
                 image_info.as_ref(),
                 &configured_env,
@@ -1058,12 +1912,8 @@ impl ExecCmd {
             vm_common::print_output_and_exit(&manager, exit_code, &stdout, &stderr);
         } else {
             // Bare VM: exec directly in the VM rootfs.
-            // Merge record env (from create/update) with CLI env, same as image path.
-            let env = vm_common::merge_env_overrides(
-                record.as_ref().map(|r| r.env.as_slice()).unwrap_or(&[]),
-                &env,
-            );
-
+            // Merge record env + resolved secrets with CLI env, same as image path.
+            let env = vm_common::merge_env_overrides(&record_env, &env);
             if self.stream {
                 let exit_code = client.vm_exec_streaming_with(
                     self.command.clone(),
@@ -1089,8 +1939,13 @@ impl ExecCmd {
                 std::process::exit(exit_code);
             }
 
-            let (exit_code, stdout, stderr) =
-                client.vm_exec(self.command.clone(), env, workdir.clone(), self.timeout)?;
+            let (exit_code, stdout, stderr) = client.vm_exec(
+                self.command.clone(),
+                env,
+                workdir.clone(),
+                self.timeout,
+                None,
+            )?;
             vm_common::print_output_and_exit(&manager, exit_code, &stdout, &stderr);
         }
     }
@@ -1123,6 +1978,8 @@ impl ShellCmd {
             name: self.name,
             workdir: None,
             env: vec![],
+            secret_env: vec![],
+            secret_file: vec![],
             timeout: None,
             interactive: true,
             tty: true,
@@ -1143,17 +2000,24 @@ impl ShellCmd {
 /// `smolvm machine exec --name <name> -- <command>` to run commands inside.
 ///
 /// Examples:
-///   smolvm machine create myvm
-///   smolvm machine create webserver --cpus 2 --mem 1024 -p 80:80
+///   smolvm machine create --name myvm
+///   smolvm machine create --name webserver --cpus 2 --mem 1024 -p 80:80
 #[derive(Args, Debug)]
 pub struct CreateCmd {
     /// Name for the machine (auto-generated if omitted)
-    #[arg(value_name = "NAME")]
+    #[arg(short = 'n', long, value_name = "NAME")]
     pub name: Option<String>,
 
     /// Container image (e.g., alpine, python:3.12-alpine)
-    #[arg(short = 'I', long, value_name = "IMAGE")]
+    #[arg(short = 'I', long, value_name = "IMAGE", value_parser = parse_image)]
     pub image: Option<String>,
+
+    /// Raise the max accepted local image-archive size (e.g. 16GiB, 512M, or a
+    /// raw byte count); default 8GiB. For legitimately large images — sets
+    /// SMOLVM_MAX_IMAGE_BYTES for this run.
+    #[arg(long = "max-image-size", value_name = "SIZE",
+          value_parser = crate::cli::parsers::parse_size_bytes)]
+    pub max_image_size: Option<u64>,
 
     /// Number of virtual CPUs
     #[arg(long, default_value_t = DEFAULT_MICROVM_CPU_COUNT, value_name = "N")]
@@ -1184,8 +2048,13 @@ pub struct CreateCmd {
     pub net: bool,
 
     /// Select the networking backend.
-    #[arg(long = "net-backend", value_enum, hide = true)]
+    #[arg(long = "net-backend", value_enum)]
     pub net_backend: Option<NetworkBackend>,
+
+    /// Custom DNS resolver for the guest (implies --net). Use this when the
+    /// default public resolvers (8.8.8.8/1.1.1.1) are blocked on your network.
+    #[arg(long, value_name = "IP")]
+    pub dns: Option<std::net::Ipv4Addr>,
 
     /// Allow egress to specific CIDR range (can be used multiple times, implies --net)
     #[arg(long = "allow-cidr", value_parser = parse_cidr, value_name = "CIDR")]
@@ -1228,6 +2097,16 @@ pub struct CreateCmd {
     #[arg(long)]
     pub ssh_agent: bool,
 
+    /// Inject a secret from a host env var (GUEST_VAR=HOST_VAR), resolved at
+    /// each launch. Only the reference is persisted, never the value.
+    #[arg(long = "secret-env", value_name = "GUEST_VAR=HOST_VAR")]
+    pub secret_env: Vec<String>,
+
+    /// Inject a secret from a host file (GUEST_VAR=/abs/path), resolved at
+    /// each launch. Only the reference is persisted, never the value.
+    #[arg(long = "secret-file", value_name = "GUEST_VAR=PATH")]
+    pub secret_file: Vec<String>,
+
     /// Load configuration from a Smolfile (TOML)
     #[arg(long = "smolfile", visible_short_alias = 's', value_name = "PATH")]
     pub smolfile: Option<PathBuf>,
@@ -1236,10 +2115,26 @@ pub struct CreateCmd {
     /// Uses pre-extracted layers instead of pulling from a registry.
     #[arg(long, value_name = "PATH", conflicts_with_all = ["image", "smolfile"])]
     pub from: Option<PathBuf>,
+
+    /// Command to run as the machine's persistent workload (image machines).
+    /// Launched as a detached container on every `start`, so it stays running
+    /// (e.g. a pre-warmed browser to be forked). Without this, an image machine
+    /// boots to a bare agent and the image's CMD is not run.
+    ///
+    /// `last = true` requires the `--` separator. With the machine name now a
+    /// flag, a bare positional (an old-style `machine create myvm`) must fail
+    /// loudly instead of being silently captured as the workload command.
+    #[arg(last = true, value_name = "COMMAND")]
+    pub command: Vec<String>,
 }
 
 impl CreateCmd {
     pub fn run(self) -> smolvm::Result<()> {
+        // --max-image-size raises the archive cap for this invocation by setting
+        // the env var the resolver reads (image_source::max_archive_bytes).
+        if let Some(bytes) = self.max_image_size {
+            std::env::set_var("SMOLVM_MAX_IMAGE_BYTES", bytes.to_string());
+        }
         // Branch for --from: create machine from .smolmachine artifact.
         if let Some(ref sidecar_path) = self.from {
             return self.run_from_smolmachine(sidecar_path);
@@ -1256,46 +2151,74 @@ impl CreateCmd {
             .name
             .unwrap_or_else(smolvm::util::generate_machine_name);
 
+        // Resolve a local image source (archive/dir) on the host now: stage it
+        // into the content-addressed cache and persist the resulting `local:…`
+        // reference, so `start` re-derives the mount dir without a registry
+        // pull. Registry refs pass through unchanged.
+        let image = match self.image.as_deref() {
+            Some(img) => {
+                use smolvm::data::image_source::{classify, resolve, ResolvedImage};
+                Some(match resolve(classify(img))? {
+                    ResolvedImage::Registry(reference) => reference,
+                    ResolvedImage::Local { reference, .. } => reference,
+                })
+            }
+            None => None,
+        };
+
         let params = crate::cli::smolfile::build_create_params(
             name,
-            self.image,
-            None,   // entrypoint: from Smolfile only
-            vec![], // cmd: from Smolfile only
+            image,
+            None,         // entrypoint: from Smolfile only
+            self.command, // persistent-workload command (detached container on start)
             self.cpus,
             self.mem,
             self.volume,
             self.port,
             net,
             self.net_backend,
+            self.dns,
             self.init,
             self.env,
             self.workdir,
-            self.smolfile,
+            self.smolfile.clone(),
             self.storage,
             self.overlay,
             cli_allow_cidrs,
         )?;
         let mut params = params;
-        params.egress_policy_hosts =
-            match (params.egress_policy_hosts.take(), cli_egress_policy_hosts) {
-                (Some(mut from_smolfile), Some(mut from_cli)) => {
-                    from_smolfile.append(&mut from_cli);
-                    Some(from_smolfile)
-                }
-                (Some(from_smolfile), None) => Some(from_smolfile),
-                (None, some) => some,
-            };
+        params.egress_policy_hosts = match (
+            params.egress_policy_hosts.take(),
+            cli_egress_policy_hosts,
+        ) {
+            (Some(mut from_smolfile), Some(mut from_cli)) => {
+                from_smolfile.append(&mut from_cli);
+                Some(from_smolfile)
+            }
+            (Some(from_smolfile), None) => Some(from_smolfile),
+            (None, some) => some,
+        };
+        // CLI `--secret-env`/`--secret-file` refs merge over any Smolfile
+        // `[secrets]` of the same name (CLI wins). Only refs are persisted.
+        for (key, r) in parse_cli_secret_refs(&self.secret_env, &self.secret_file)? {
+            params.secret_refs.insert(key, r);
+        }
         let resources = VmResources {
             cpus: params.cpus,
             memory_mib: params.mem,
             network: params.net,
             network_backend: params.network_backend,
+            dns: params.dns,
             gpu: params.gpu,
             gpu_vram_mib: params.gpu_vram_mib,
             storage_gib: params.storage_gb,
             overlay_gib: params.overlay_gb,
             allowed_cidrs: params.allowed_cidrs.clone(),
         };
+        // Reject zero-valued resources before the machine is persisted.
+        // Without this, `machine create` succeeds and the failure only
+        // surfaces later at `machine start` (see QA BUG-44).
+        resources.validate()?;
         validate_requested_network_backend(
             &resources,
             params.egress_policy_hosts.as_deref(),
@@ -1331,14 +2254,40 @@ impl CreateCmd {
         let manifest = smolvm_pack::packer::read_manifest_from_sidecar(sidecar_path)
             .map_err(|e| smolvm::Error::agent("read .smolmachine", e.to_string()))?;
 
-        // Pre-extract the sidecar so first `machine start` is fast.
+        // Reject a cross-architecture artifact up front: a packed VM/image carries
+        // native binaries and cannot boot under a different-arch guest kernel. Only
+        // the guest arch must match — the host OS does not (see the fn's docs).
+        smolvm::platform::ensure_artifact_arch_matches_host(&manifest.platform)?;
+
+        // Read the footer now; the bundle is extracted into the machine's own
+        // data dir after `create_vm` succeeds (below), so a duplicate-name create
+        // cannot clobber an existing machine's layers.
         let footer = smolvm_pack::packer::read_footer_from_sidecar(sidecar_path)
             .map_err(|e| smolvm::Error::agent("read sidecar footer", e.to_string()))?;
-        let cache_dir = smolvm_pack::extract::get_cache_dir(footer.checksum)
-            .map_err(|e| smolvm::Error::agent("get cache dir", e.to_string()))?;
-        println!("Extracting .smolmachine assets...");
-        smolvm_pack::extract::extract_sidecar(sidecar_path, &cache_dir, &footer, false, false)
-            .map_err(|e| smolvm::Error::agent("extract sidecar", e.to_string()))?;
+
+        // A VM-mode pack (`--from-vm`) carries the source VM's overlay+storage
+        // DISKS (the real rootfs), not OCI layers. Capture the templates before
+        // `manifest` is moved into `params`; the disks are seeded from them after
+        // extraction below, or the machine boots the bare agent-rootfs with no
+        // /bin/sh (mirrors pack_run + the serve API create path).
+        let vm_seed: Option<(Option<String>, Option<String>, Option<u64>)> =
+            if manifest.mode == smolvm_pack::format::PackMode::Vm {
+                Some((
+                    manifest
+                        .assets
+                        .overlay_template
+                        .as_ref()
+                        .map(|t| t.path.clone()),
+                    manifest
+                        .assets
+                        .storage_template
+                        .as_ref()
+                        .map(|t| t.path.clone()),
+                    manifest.assets.overlay_logical_size,
+                ))
+            } else {
+                None
+            };
 
         // Resolve the canonical path for storage in VmRecord.
         let canonical_path = sidecar_path
@@ -1351,6 +2300,9 @@ impl CreateCmd {
             .name
             .clone()
             .unwrap_or_else(smolvm::util::generate_machine_name);
+        // `name` is moved into `params` below; keep a copy for the post-create
+        // extraction that targets this machine's own data dir.
+        let name_for_layers = name.clone();
 
         // CLI flags override manifest defaults.
         let cpus = if self.cpus != DEFAULT_MICROVM_CPU_COUNT {
@@ -1364,9 +2316,34 @@ impl CreateCmd {
             manifest.mem
         };
 
+        // A .smolmachine is an untrusted, portable artifact: validate its secret
+        // refs under the Untrusted scope, which rejects every source kind. A
+        // packed `from_env`/`from_file` ref would otherwise read THIS host's
+        // env/files at exec time — reject at create rather than carry an exfil
+        // primitive. Configure secrets locally via the CLI instead.
+        for (key, r) in &manifest.secret_refs {
+            smolvm::secrets::validate_ref(r, smolvm::secrets::ResolutionScope::Untrusted).map_err(
+                |e| {
+                    smolvm::Error::config(
+                        "create from .smolmachine",
+                        format!("secret '{}': {} (packs may not carry secret refs)", key, e),
+                    )
+                },
+            )?;
+        }
+
         let params = vm_common::CreateVmParams {
+            secret_refs: manifest.secret_refs,
             name,
-            image: Some(manifest.image),
+            // A VM-mode pack is a VM, not a container: its synthetic `vm://<name>`
+            // label would make exec/start/re-pack treat it as a pullable image
+            // (the /bin/sh-not-found bug). None routes every `image.is_some()`
+            // consumer to VM behavior; provenance is in `source_smolmachine`.
+            image: if vm_seed.is_some() {
+                None
+            } else {
+                Some(manifest.image)
+            },
             entrypoint: manifest.entrypoint,
             cmd: manifest.cmd,
             cpus,
@@ -1375,6 +2352,7 @@ impl CreateCmd {
             port: self.port.clone(),
             net: self.net || manifest.network,
             network_backend: self.net_backend,
+            dns: self.dns,
             init: self.init.clone(),
             env: {
                 let mut env = manifest.env;
@@ -1401,7 +2379,97 @@ impl CreateCmd {
             image_user: manifest.user,
         };
 
-        vm_common::create_vm(params)
+        let record = vm_common::build_vm_record(&params)?;
+        let reservation = vm_common::CreateVmReservation::reserve(&name_for_layers)?;
+
+        // Create the machine data dir while the DB reservation is held, then
+        // extract before publishing the VM row. Other processes either see the
+        // reservation conflict or the finished VM, never a half-created record.
+        let create_result = (|| -> smolvm::Result<()> {
+            let manager = AgentManager::for_vm_with_sizes(
+                &name_for_layers,
+                params.storage_gb,
+                params.overlay_gb,
+            )?;
+
+            let cache_dir = smolvm::agent::machine_layers_cache_dir(&name_for_layers);
+            smolvm_pack::extract::force_detach_layers_volume(&cache_dir);
+            match std::fs::remove_dir_all(&cache_dir) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(smolvm::Error::agent(
+                        "clear packed layers cache",
+                        e.to_string(),
+                    ));
+                }
+            }
+
+            println!("Extracting .smolmachine assets...");
+            let result = smolvm_pack::extract::extract_sidecar(
+                sidecar_path,
+                &cache_dir,
+                &footer,
+                false,
+                false,
+            )
+            .map_err(|e| smolvm::Error::agent("extract sidecar", e.to_string()));
+            // Detach unconditionally: extraction mounts the case-sensitive volume on
+            // macOS even when it later fails, so the detach must run on both success
+            // and failure paths to honor the "mounted iff running" invariant.
+            smolvm_pack::extract::force_detach_layers_volume(&cache_dir);
+            result?;
+
+            // VM-mode pack: seed this machine's overlay+storage disks from the
+            // packed templates so a start boots the source VM's rootfs rather than
+            // the bare agent-rootfs. Shared with the serve API create path: it
+            // resizes the truncated templates into valid raw disks and removes the
+            // manager's default `.qcow2` overlays so the start resolves these.
+            // (Writing the resized copy onto `manager.overlay_path()` — the default
+            // `.qcow2` — handed the guest raw bytes named `.qcow2`, the /bin/sh-missing
+            // bug's disk counterpart.)
+            if let Some((overlay_template, storage_template, overlay_logical_size)) = &vm_seed {
+                let disk_dir = manager
+                    .storage_path()
+                    .parent()
+                    .map(std::path::Path::to_path_buf)
+                    .unwrap_or_else(|| smolvm::agent::vm_data_dir(&name_for_layers));
+                smolvm::storage::seed_vm_mode_disks(
+                    &disk_dir,
+                    &cache_dir,
+                    overlay_template.as_deref(),
+                    storage_template.as_deref(),
+                    *overlay_logical_size,
+                    params.overlay_gb,
+                    params.storage_gb,
+                )
+                .map_err(|e| smolvm::Error::agent("seed VM-mode disks", e.to_string()))?;
+            }
+
+            reservation.commit(&record)?;
+            Ok(())
+        })();
+
+        if let Err(e) = create_result {
+            smolvm_pack::extract::force_detach_layers_volume(
+                &smolvm::agent::machine_layers_cache_dir(&name_for_layers),
+            );
+            let data_dir = smolvm::agent::vm_data_dir(&name_for_layers);
+            if let Err(remove_err) = std::fs::remove_dir_all(&data_dir) {
+                if remove_err.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(
+                        machine = %name_for_layers,
+                        dir = %data_dir.display(),
+                        error = %remove_err,
+                        "failed to remove machine data dir after create failure"
+                    );
+                }
+            }
+            return Err(e);
+        }
+
+        vm_common::print_create_success(&params);
+        Ok(())
     }
 }
 
@@ -1417,21 +2485,80 @@ pub struct StartCmd {
     /// Machine to start (default: "default")
     #[arg(short = 'n', long, value_name = "NAME")]
     pub name: Option<String>,
+
+    /// Start as a fork base: back guest RAM with a memfd (CoW-cloneable) and
+    /// expose a control socket so the machine can be forked with `machine fork`.
+    #[arg(long)]
+    pub forkable: bool,
+
+    #[command(flatten, next_help_heading = "Network")]
+    pub proxy_opts: crate::cli::proxy_opts::ProxyOpts,
 }
 
 impl StartCmd {
     pub fn run(self) -> smolvm::Result<()> {
         let explicit_name = self.name.is_some();
         let name = self.name.unwrap_or_else(|| "default".to_string());
-        match vm_common::start_vm_named(&name) {
+        let proxy = self.proxy_opts.proxy();
+        let no_proxy = self.proxy_opts.no_proxy();
+        // Forkable start: memfd-back guest RAM and register a control socket at a
+        // known path so `machine fork` can later freeze this machine as a CoW base.
+        let fork = if self.forkable {
+            vm_common::forkable_launch(&name)
+        } else {
+            vm_common::ForkLaunch::default()
+        };
+        match vm_common::start_vm_named(
+            &name, proxy, no_proxy, /* from_snapshot */ false, fork,
+        ) {
             Ok(()) => Ok(()),
             Err(smolvm::Error::VmNotFound { .. }) if !explicit_name => {
                 // Only fall back to creating a default VM when no --name was given.
                 // With an explicit --name, VmNotFound is a real error.
-                vm_common::start_vm_default()
+                vm_common::start_vm_default(proxy, no_proxy)
             }
             Err(e) => Err(e),
         }
+    }
+}
+
+// ============================================================================
+// Fork Command
+// ============================================================================
+
+/// Fork a running forkable machine into a new clone.
+///
+/// Freezes the source (the "golden") via its control socket, copy-on-write
+/// clones its disks, and boots the new machine from the golden's in-memory
+/// snapshot instead of cold-booting — so the clone comes up already warm
+/// (same processes, same filesystem state), in well under a second.
+///
+/// The golden must have been started with `--forkable`.
+#[derive(Args, Debug)]
+pub struct ForkCmd {
+    /// The running, forkable source machine to clone from.
+    #[arg(long, value_name = "NAME")]
+    pub golden: String,
+
+    /// Name for the new clone machine.
+    #[arg(short = 'n', long = "name", value_name = "NAME")]
+    pub clone: String,
+
+    /// Make the clone itself forkable (memfd RAM + control socket), so it can
+    /// in turn be forked.
+    #[arg(long)]
+    pub forkable: bool,
+
+    /// Pin the clone's inbound port forwards (repeatable). Without this, the
+    /// golden's forwards are remapped to freshly-allocated host ports.
+    #[arg(short = 'p', long = "port", value_parser = PortMapping::parse, value_name = "HOST:GUEST", help_heading = "Network")]
+    pub port: Vec<PortMapping>,
+}
+
+impl ForkCmd {
+    pub fn run(self) -> smolvm::Result<()> {
+        let ports: Vec<(u16, u16)> = self.port.iter().map(|p| (p.host, p.guest)).collect();
+        vm_common::fork_vm(&self.golden, &self.clone, self.forkable, &ports)
     }
 }
 
@@ -1469,7 +2596,7 @@ impl StopCmd {
 #[derive(Args, Debug)]
 pub struct DeleteCmd {
     /// Machine to delete
-    #[arg(value_name = "NAME")]
+    #[arg(short = 'n', long, value_name = "NAME")]
     pub name: String,
 
     /// Skip confirmation prompt
@@ -1483,6 +2610,11 @@ impl DeleteCmd {
             &self.name,
             self.force,
             DeleteVmOptions {
+                // Stop the VM before removing its config and data dir.
+                // Without this, deleting a running machine orphans the
+                // `_boot-vm` process (leaking host RAM) and removes the data
+                // dir out from under the live VM. The API delete handler and
+                // `delete_vm`'s own teardown already do this.
                 stop_if_running: true,
             },
         )
@@ -1501,10 +2633,17 @@ pub struct StatusCmd {
     /// Machine to check (default: "default")
     #[arg(short = 'n', long, value_name = "NAME")]
     pub name: Option<String>,
+
+    /// Output in JSON format
+    #[arg(long)]
+    pub json: bool,
 }
 
 impl StatusCmd {
     pub fn run(self) -> smolvm::Result<()> {
+        if self.json {
+            return vm_common::status_vm_json(&self.name);
+        }
         vm_common::status_vm(&self.name, |_| {})
     }
 }
@@ -1600,14 +2739,14 @@ impl ResizeCmd {
 /// `machine start`. The machine must be stopped.
 ///
 /// Examples:
-///   smolvm machine update myvm -v ./src:/app -p 8080:8080
-///   smolvm machine update myvm --cpus 4 --mem 4096
-///   smolvm machine update myvm --remove-volume ./src:/app
-///   smolvm machine update myvm --net -e DEBUG=1
+///   smolvm machine update --name myvm -v ./src:/app -p 8080:8080
+///   smolvm machine update --name myvm --cpus 4 --mem 4096
+///   smolvm machine update --name myvm --remove-volume ./src:/app
+///   smolvm machine update --name myvm --net -e DEBUG=1
 #[derive(Args, Debug)]
 pub struct UpdateCmd {
     /// Machine to update
-    #[arg(value_name = "NAME")]
+    #[arg(short = 'n', long, value_name = "NAME")]
     pub name: String,
 
     /// Add volume mount (HOST:GUEST[:ro])
@@ -1906,11 +3045,19 @@ impl UpdateCmd {
 #[derive(Args, Debug)]
 pub struct DataDirCmd {
     /// Machine name.
+    #[arg(short = 'n', long, value_name = "NAME")]
     pub name: String,
 }
 
 impl DataDirCmd {
     pub fn run(self) -> smolvm::Result<()> {
+        // Error (exit 1) for a machine that does not exist, rather than
+        // printing a computed path for a name that was never created —
+        // consistent with `status`/`start`/`delete`.
+        let config = smolvm::config::SmolvmConfig::load()?;
+        if config.get_vm(&self.name).is_none() {
+            return Err(smolvm::Error::vm_not_found(&self.name));
+        }
         let dir = smolvm::agent::vm_data_dir(&self.name);
         println!("{}", dir.display());
         Ok(())
@@ -1941,7 +3088,7 @@ impl NetworkTestCmd {
         // Ensure machine is running
         let already_running = manager.try_connect_existing().is_some();
         if !already_running {
-            println!("Starting machine '{}'...", label);
+            eprintln!("Starting machine '{}'...", label);
             manager.ensure_running()?;
         }
 
@@ -2001,11 +3148,7 @@ impl ImagesCmd {
             manager.detach();
             false
         } else {
-            if self.json {
-                eprintln!("Starting machine '{}' to query storage...", self.name);
-            } else {
-                println!("Starting machine '{}' to query storage...", self.name);
-            }
+            eprintln!("Starting machine '{}' to query storage...", self.name);
             manager.start()?;
             true
         };
@@ -2123,7 +3266,7 @@ impl PruneCmd {
             started_for_prune = false;
             manager.detach();
         } else {
-            println!("Starting machine...");
+            eprintln!("Starting machine...");
             manager.start()?;
             started_for_prune = true;
         }
@@ -2135,33 +3278,60 @@ impl PruneCmd {
 
             if images.is_empty() {
                 println!("No cached images to remove.");
-                return Ok(());
-            }
-
-            let total_size: u64 = images.iter().map(|i| i.size).sum();
-
-            if self.dry_run {
-                println!(
-                    "Would remove {} images ({})",
-                    images.len(),
-                    format_bytes(total_size)
-                );
-                for image in &images {
+            } else if record.image.is_some() {
+                // An image-backed machine needs its cached image to restart, so
+                // purging it would brick a *stopped* machine ("image not found"
+                // on the next start). Keep the cache and reclaim only
+                // unreferenced layers; to reclaim everything, delete the machine.
+                let total_size: u64 = images.iter().map(|i| i.size).sum();
+                if self.dry_run {
+                    let would_free = client.garbage_collect(true, false)?;
                     println!(
-                        "  - {} ({}, {} layers)",
-                        image.reference,
-                        format_bytes(image.size),
-                        image.layer_count
+                        "Machine '{}' is image-backed: would keep {} cached image(s) ({}) it needs to restart, and free {} of unreferenced layers.",
+                        self.name,
+                        images.len(),
+                        format_bytes(total_size),
+                        format_bytes(would_free)
+                    );
+                } else {
+                    let freed = client.garbage_collect(false, false)?;
+                    println!(
+                        "Kept {} cached image(s) in use by machine '{}'; freed {} of unreferenced layers.",
+                        images.len(),
+                        self.name,
+                        format_bytes(freed)
+                    );
+                    eprintln!(
+                        "(--all keeps images a machine needs to restart; to reclaim everything: smolvm machine delete --name {})",
+                        self.name
                     );
                 }
             } else {
-                println!("Removing all cached images...");
-                let freed = client.garbage_collect(false, true)?;
-                println!(
-                    "Removed {} images, freed {}",
-                    images.len(),
-                    format_bytes(freed)
-                );
+                // Bare VM: nothing depends on the image cache, so purge all.
+                let total_size: u64 = images.iter().map(|i| i.size).sum();
+                if self.dry_run {
+                    println!(
+                        "Would remove {} images ({})",
+                        images.len(),
+                        format_bytes(total_size)
+                    );
+                    for image in &images {
+                        println!(
+                            "  - {} ({}, {} layers)",
+                            image.reference,
+                            format_bytes(image.size),
+                            image.layer_count
+                        );
+                    }
+                } else {
+                    println!("Removing all cached images...");
+                    let freed = client.garbage_collect(false, true)?;
+                    println!(
+                        "Removed {} images, freed {}",
+                        images.len(),
+                        format_bytes(freed)
+                    );
+                }
             }
         } else if self.dry_run {
             println!("Scanning for unreferenced layers...");
@@ -2375,7 +3545,13 @@ impl MonitorCmd {
 
         if !manager.is_process_alive() {
             println!("Machine '{}' is not running, starting...", name);
-            vm_common::start_vm_named(&name)?;
+            vm_common::start_vm_named(
+                &name,
+                None,
+                None,
+                /* from_snapshot */ false,
+                vm_common::ForkLaunch::default(),
+            )?;
         }
 
         println!(
@@ -2461,7 +3637,13 @@ impl MonitorCmd {
                 if let Some(ref cmd) = health_cmd {
                     match AgentClient::connect_with_short_timeout(manager.vsock_socket()) {
                         Ok(mut client) => {
-                            match client.vm_exec(cmd.clone(), vec![], None, Some(health_timeout)) {
+                            match client.vm_exec(
+                                cmd.clone(),
+                                vec![],
+                                None,
+                                Some(health_timeout),
+                                None,
+                            ) {
                                 Ok((0, _, _)) => {
                                     if consecutive_health_failures > 0 {
                                         println!("  health check passed (recovered)");
@@ -2546,7 +3728,13 @@ impl MonitorCmd {
                         break;
                     }
 
-                    match vm_common::start_vm_named(&name) {
+                    match vm_common::start_vm_named(
+                        &name,
+                        None,
+                        None,
+                        /* from_snapshot */ false,
+                        vm_common::ForkLaunch::default(),
+                    ) {
                         Ok(()) => {
                             println!("  machine restarted");
                             last_start = std::time::Instant::now();

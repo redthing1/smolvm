@@ -13,6 +13,24 @@ type PipeDrain = Option<std::thread::JoinHandle<Vec<u8>>>;
 /// Exit code used when a command is killed due to timeout.
 pub const TIMEOUT_EXIT_CODE: i32 = 124;
 
+/// Map a process exit status to a numeric exit code.
+///
+/// Normal exit → the process's exit code. Terminated by a signal (where
+/// `ExitStatus::code()` is `None`) → `128 + signal`, matching shell
+/// convention (SIGINT → 130, SIGTERM → 143), so callers and scripts can
+/// distinguish a signal kill from a normal exit instead of seeing an
+/// opaque 255.
+pub fn exit_code_from_status(status: &std::process::ExitStatus) -> i32 {
+    use std::os::unix::process::ExitStatusExt;
+    if let Some(code) = status.code() {
+        code
+    } else if let Some(sig) = status.signal() {
+        128 + sig
+    } else {
+        -1
+    }
+}
+
 /// Per-stream output cap for non-interactive exec. Vec<u8> is base64-encoded
 /// in JSON frames (4/3 expansion). Two streams at this cap must fit within the
 /// 32 MB frame limit with room for JSON overhead:
@@ -76,9 +94,10 @@ pub fn is_peer_closed(fd: std::os::unix::io::RawFd) -> bool {
     }
     if rc < 0 {
         let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-        // EAGAIN/EWOULDBLOCK = no data but connection alive → peer still there.
-        // Any other error (ECONNRESET, ENOTCONN, EBADF, etc.) → peer gone.
-        return errno != libc::EAGAIN && errno != libc::EWOULDBLOCK;
+        // EAGAIN = no data but connection alive → peer still there. (EWOULDBLOCK
+        // is the same value as EAGAIN on Linux.) Any other error (ECONNRESET,
+        // ENOTCONN, EBADF, etc.) → peer gone.
+        return !matches!(errno, libc::EAGAIN);
     }
     // rc > 0: there's data in the buffer — connection is alive.
     false
@@ -182,7 +201,7 @@ fn wait_with_timeout(
             Ok(Some(status)) => {
                 // Process completed — join drains to get full output.
                 let output = join_pipe_drains(stdout_drain, stderr_drain);
-                let exit_code = status.code().unwrap_or(-1);
+                let exit_code = exit_code_from_status(&status);
                 return Ok(WaitResult::Completed { exit_code, output });
             }
             Ok(None) => {
@@ -376,7 +395,7 @@ where
                 }
                 // Final drain after threads are done (or timed out).
                 drain_channels(&stdout_rx, &stderr_rx, &mut stdout_buf, &mut stderr_buf);
-                let exit_code = status.code().unwrap_or(-1);
+                let exit_code = exit_code_from_status(&status);
                 return Ok(WaitResult::Completed {
                     exit_code,
                     output: ChildOutput {

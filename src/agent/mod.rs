@@ -5,6 +5,7 @@
 
 pub mod boot_config;
 mod client;
+pub mod fork;
 mod krun;
 mod launcher;
 pub mod launcher_dynamic;
@@ -15,12 +16,18 @@ pub mod terminal;
 pub use crate::data::network::PortMapping;
 pub use crate::data::resources::VmResources;
 pub use crate::data::storage::HostMount;
-pub use client::{AgentClient, ExecEvent, PullOptions, RunConfig};
+pub use client::{
+    AgentClient, ExecEvent, InteractiveInput, InteractiveOutput, PullOptions, RunConfig,
+};
 pub use krun::KrunFunctions;
-pub use launcher::{find_lib_dir, launch_agent_vm, LaunchConfig, LaunchFeatures, VmDisks};
+pub use launcher::{
+    create_disk_overlays, find_lib_dir, launch_agent_vm, DiskOverlaySpec, LaunchConfig,
+    LaunchFeatures, VmDisks,
+};
 pub use manager::{
-    docker_config_dir, docker_config_mount, ensure_vm_dir, vm_cache_root, vm_data_dir, vm_dir_hash,
-    AgentManager, AgentState,
+    disk_used_mb, docker_config_dir, docker_config_mount, ensure_vm_dir, machine_layers_cache_dir,
+    read_egress_telemetry, resolve_disk_image, vm_cache_root, vm_data_dir, vm_dir_hash,
+    vm_uid_registry_dir, AgentManager, AgentState,
 };
 
 /// Agent VM name.

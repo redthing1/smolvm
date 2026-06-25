@@ -1,5 +1,6 @@
 //! CLI command implementations.
 
+pub mod cleanup_ephemeral;
 pub mod config;
 pub mod image;
 pub mod internal_boot;
@@ -8,7 +9,9 @@ pub mod openapi;
 pub mod pack;
 pub mod pack_run;
 pub mod parsers;
+pub mod proxy_opts;
 pub mod serve;
+pub mod serve_tls;
 pub mod smolfile;
 pub mod vm_common;
 
@@ -110,6 +113,15 @@ impl ProgressBar {
     /// callers can invoke this on every chunk without flooding
     /// stderr.
     pub fn update(&mut self, bytes_so_far: u64) {
+        // Defer the terminal (100%) line to finish() so it is printed exactly
+        // once. Otherwise a small/single-chunk transfer prints "100%" here and
+        // again on completion — visible as two lines on non-TTY output where
+        // the overwriting `\r` has no effect.
+        if let Some(total) = self.total {
+            if total > 0 && bytes_so_far >= total {
+                return;
+            }
+        }
         let now = std::time::Instant::now();
         if now.duration_since(self.last_print).as_millis() < Self::THROTTLE_MS {
             return;
@@ -167,47 +179,51 @@ pub fn pull_with_progress(
     client: &mut smolvm::agent::AgentClient,
     image: &str,
     oci_platform: Option<&str>,
+    proxy: Option<&str>,
+    no_proxy: Option<&str>,
 ) -> smolvm::Result<smolvm_protocol::ImageInfo> {
-    print!("Pulling image {}...", image);
-    let _ = std::io::stdout().flush();
+    eprint!("Pulling image {}...", image);
+    let _ = std::io::stderr().flush();
 
     let mut last_percent = 0u8;
     let mut syncing = false;
     let result = client.pull_with_registry_config_and_progress(
         image,
         oci_platform,
+        proxy,
+        no_proxy,
         |percent, _total, layer| {
             if layer == "syncing" {
                 if !syncing {
-                    print!(
+                    eprint!(
                         "\rPulling image {}... [====================] 100% — syncing...",
                         image
                     );
-                    let _ = std::io::stdout().flush();
+                    let _ = std::io::stderr().flush();
                     syncing = true;
                 }
                 return;
             }
             let percent = percent as u8;
             if percent != last_percent && percent <= 100 {
-                print!("\rPulling image {}... [", image);
+                eprint!("\rPulling image {}... [", image);
                 let filled = (percent as usize) / 5;
                 for i in 0..20 {
                     if i < filled {
-                        print!("=");
+                        eprint!("=");
                     } else if i == filled {
-                        print!(">");
+                        eprint!(">");
                     } else {
-                        print!(" ");
+                        eprint!(" ");
                     }
                 }
-                print!("] {}%", percent);
-                let _ = std::io::stdout().flush();
+                eprint!("] {}%", percent);
+                let _ = std::io::stderr().flush();
                 last_percent = percent;
             }
         },
     );
-    println!(
+    eprintln!(
         "\rPulling image {}... done.                              ",
         image
     );

@@ -49,9 +49,28 @@ enum Commands {
         /// Path to boot config JSON file
         config: std::path::PathBuf,
     },
+
+    /// Internal: clean up an ephemeral VM after its command exits (not for direct use)
+    #[command(name = "_cleanup-ephemeral", hide = true)]
+    CleanupEphemeral {
+        /// Ephemeral VM name (used to compute data directory path)
+        vm_name: String,
+        /// VM process PID
+        pid: i32,
+        /// Process start time for PID-reuse verification (0 = unknown, skips strict check)
+        start_time: u64,
+        /// Ephemeral DB record name (may differ from vm_name)
+        ephemeral_name: String,
+    },
 }
 
 fn main() {
+    // Honor an explicit SMOLVM_DATA_DIR for EVERY command (so the CLI and serve
+    // agree on where smolvm state lives) before anything computes a path. The
+    // auto /var/lib/smolvm default is serve-only (applied in its run()). Done
+    // first, single-threaded, so the set_var is safe.
+    smolvm::process::apply_system_data_root(/* allow_auto */ false);
+
     // Auto-detect packed binary mode BEFORE parsing the normal CLI.
     // If this executable has a `.smolmachine` sidecar, appended assets,
     // or a Mach-O section with packed data, run as a packed binary instead.
@@ -75,6 +94,15 @@ fn main() {
         Commands::Image(cmd) => cmd.run(),
         Commands::Config(cmd) => cmd.run(),
         Commands::BootVm { config } => cli::internal_boot::run(config),
+        Commands::CleanupEphemeral {
+            vm_name,
+            pid,
+            start_time,
+            ephemeral_name,
+        } => {
+            cli::cleanup_ephemeral::run(&vm_name, pid, start_time, &ephemeral_name);
+            Ok(())
+        }
     };
 
     // Handle errors
@@ -106,11 +134,13 @@ fn init_logging() {
     if json {
         tracing_subscriber::fmt()
             .json()
+            .with_writer(std::io::stderr)
             .with_env_filter(filter)
             .with_current_span(true)
             .init();
     } else {
         tracing_subscriber::fmt()
+            .with_writer(std::io::stderr)
             .with_env_filter(filter)
             .with_target(false)
             .init();

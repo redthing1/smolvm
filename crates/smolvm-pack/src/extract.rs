@@ -5,7 +5,7 @@
 
 use crate::format::{PackFooter, SIDECAR_EXTENSION};
 use std::fs::{self, File};
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 #[cfg(unix)]
@@ -13,208 +13,289 @@ use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
 
-/// Safely unpack a tar archive, rejecting entries that resolve outside `dest`.
+/// Files larger than this threshold are extracted with a sparse write
+/// (ftruncate skeleton + pwrite only non-zero 64 KiB chunks) rather than a
+/// dense sequential write.  Chosen to match typical overlay disk sizes while
+/// staying well above any regular asset file.
+const SPARSE_WRITE_THRESHOLD: u64 = 256 * 1024 * 1024; // 256 MiB
+
+/// Extract a single tar entry as a sparse file.
+///
+/// Creates the destination with `ftruncate(entry_size)` so the OS allocates
+/// no disk blocks for the zero regions, then streams `entry` in 64 KiB
+/// chunks and `pwrite`s only the non-zero ones at their correct offsets.
+///
+/// This keeps a 10 GiB overlay disk (with ~50 MB of real data) from
+/// materialising as a dense file during sidecar extraction.
+fn unpack_sparse<R: Read>(
+    entry: &mut tar::Entry<R>,
+    path: &Path,
+    entry_size: u64,
+    mode: u32,
+) -> std::io::Result<()> {
+    // Ensure the parent directory exists (mirrors what entry.unpack_in does).
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    // Reject symlinks and unexpected directories at the destination.
+    // A prior tar entry may have placed an intra-dest relative symlink at this
+    // path; File::create would follow it, redirecting writes to the symlink
+    // target instead of the intended path.
+    match path.symlink_metadata() {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("unpack_sparse: symlink at destination: {}", path.display()),
+            ));
+        }
+        Ok(meta) if meta.file_type().is_dir() => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "unpack_sparse: directory at destination: {}",
+                    path.display()
+                ),
+            ));
+        }
+        Ok(_) => {
+            // Regular file: remove it so create_new (O_CREAT|O_EXCL) succeeds.
+            // This handles idempotent re-extraction without silently overwriting.
+            fs::remove_file(path)?;
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+
+    // Open with O_CREAT|O_EXCL|O_NOFOLLOW: rejects any symlink placed in the
+    // TOCTOU window between the check above and the open (defense in depth).
+    #[cfg(unix)]
+    let mut file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)?
+    };
+    #[cfg(not(unix))]
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+
+    // ftruncate: on APFS and ext4 this allocates zero disk blocks for the
+    // hole regions — only written bytes consume real space.
+    file.set_len(entry_size)?;
+
+    let mut offset: u64 = 0;
+    let mut buf = vec![0u8; 64 * 1024];
+
+    loop {
+        let n = entry.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        let chunk = &buf[..n];
+        if chunk.iter().any(|&b| b != 0) {
+            file.seek(SeekFrom::Start(offset))?;
+            file.write_all(chunk)?;
+        }
+        offset += n as u64;
+    }
+
+    // Only file mode is restored, not timestamps, uid/gid, or xattrs.
+    // unpack_sparse applies to large cache assets (overlay disks, storage
+    // images) extracted to a host-local cache directory; the extra metadata
+    // does not affect functionality for those assets.
+    #[cfg(unix)]
+    fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
+    #[cfg(not(unix))]
+    let _ = mode;
+
+    Ok(())
+}
+
+/// Safely unpack a tar archive, rejecting symlinks, hardlinks, and entries
+/// that resolve outside `dest`.
 ///
 /// The standard `tar::Archive::unpack()` strips `..` components but does
 /// **not** reject symlinks. A crafted archive could create
 /// `lib/libkrun.dylib → /tmp/evil.so`, and subsequent `dlopen()` would
-/// load the attacker's library. Links are allowed only after their resolved
-/// targets are validated to remain under `dest`.
+/// load the attacker's library. This function rejects any entry that is
+/// not a regular file or directory.
 fn safe_unpack<R: Read>(archive: &mut tar::Archive<R>, dest: &Path) -> std::io::Result<()> {
     let canonical_dest = dest.canonicalize().unwrap_or_else(|_| dest.to_path_buf());
-    let mut directory_permissions = DirectoryPermissions::default();
 
-    let result = (|| {
-        for entry_result in archive.entries()? {
-            let mut entry = entry_result?;
-            let entry_type = entry.header().entry_type();
-            let entry_path = entry.path()?.to_path_buf();
+    // Track directories with restrictive permissions. We extract all entries
+    // with directories temporarily set to 0o755, then apply final permissions
+    // after all children are written. This matches GNU tar / bsdtar behavior
+    // and prevents extraction failures when a read-only directory appears
+    // before its children in the tar stream (e.g., Fedora's mode-555
+    // /usr/lib64/pm-utils/*.d directories).
+    let mut deferred_dir_modes: Vec<(PathBuf, u32)> = Vec::new();
 
-            match entry_type {
-                tar::EntryType::Regular | tar::EntryType::GNUSparse | tar::EntryType::Directory => {
-                }
-                tar::EntryType::Symlink => {
-                    // Allow symlinks but validate the target stays within dest.
-                    if let Some(link_target) = entry.link_name()? {
-                        let link_target = link_target.to_path_buf();
-                        // Resolve relative symlinks against the entry's parent dir
-                        let resolved = if link_target.is_absolute() {
-                            // Absolute symlinks: jail to dest (e.g., /lib/foo -> dest/lib/foo)
-                            dest.join(link_target.strip_prefix("/").unwrap_or(&link_target))
-                        } else {
-                            let parent = entry_path.parent().unwrap_or(Path::new(""));
-                            dest.join(parent).join(&link_target)
-                        };
-                        // Normalize the path by resolving .. components
-                        let normalized = normalize_path(&resolved);
-                        if !normalized.starts_with(&canonical_dest) {
-                            return Err(std::io::Error::new(
-                                std::io::ErrorKind::InvalidData,
-                                format!(
-                                    "tar symlink '{}' -> '{}' escapes destination directory",
-                                    entry_path.display(),
-                                    link_target.display()
-                                ),
-                            ));
-                        }
+    for entry_result in archive.entries()? {
+        let mut entry = entry_result?;
+        let entry_type = entry.header().entry_type();
+        let entry_path = entry.path()?.to_path_buf();
+
+        match entry_type {
+            tar::EntryType::Regular
+            | tar::EntryType::GNUSparse
+            | tar::EntryType::Directory
+            | tar::EntryType::Continuous => {}
+            // GNU/PAX extension headers are metadata for the next entry.
+            // The tar crate normally consumes them internally, but some
+            // archives surface them as explicit entries. Skip them.
+            tar::EntryType::GNULongName
+            | tar::EntryType::GNULongLink
+            | tar::EntryType::XGlobalHeader
+            | tar::EntryType::XHeader => {
+                continue;
+            }
+            tar::EntryType::Symlink => {
+                // Allow symlinks but validate the target stays within dest.
+                if let Some(link_target) = entry.link_name()? {
+                    let link_target = link_target.to_path_buf();
+                    // Resolve relative symlinks against the entry's parent dir
+                    let resolved = if link_target.is_absolute() {
+                        // Absolute symlinks: jail to dest (e.g., /lib/foo → dest/lib/foo)
+                        dest.join(link_target.strip_prefix("/").unwrap_or(&link_target))
+                    } else {
+                        let parent = entry_path.parent().unwrap_or(Path::new(""));
+                        dest.join(parent).join(&link_target)
+                    };
+                    // Normalize the path by resolving .. components
+                    let normalized = normalize_path(&resolved);
+                    if !normalized.starts_with(&canonical_dest) {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!(
+                                "tar symlink '{}' -> '{}' escapes destination directory",
+                                entry_path.display(),
+                                link_target.display()
+                            ),
+                        ));
                     }
-                }
-                tar::EntryType::Link => {
-                    // Allow hardlinks but validate the target stays within dest.
-                    if let Some(link_target) = entry.link_name()? {
-                        let full_target = dest.join(link_target.as_ref());
-                        let normalized = normalize_path(&full_target);
-                        if !normalized.starts_with(&canonical_dest) {
-                            return Err(std::io::Error::new(
-                                std::io::ErrorKind::InvalidData,
-                                format!(
-                                    "tar hardlink '{}' escapes destination directory",
-                                    entry_path.display()
-                                ),
-                            ));
-                        }
-                        // Skip hardlinks whose target was skipped (e.g.,
-                        // overlayfs whiteout char devices). The target does
-                        // not exist on disk, so creating the hardlink would
-                        // fail and abort the rest of extraction.
-                        if !normalized.exists() {
-                            continue;
-                        }
-                    }
-                }
-                tar::EntryType::Char | tar::EntryType::Block => {
-                    // Device nodes appear in overlayfs upper-layer exports from
-                    // Debian-based images. They cannot be created without root
-                    // and are not needed in the host-side extracted cache.
-                    continue;
-                }
-                other => {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!(
-                            "tar entry '{}' has disallowed type {:?}",
-                            entry_path.display(),
-                            other
-                        ),
-                    ));
                 }
             }
+            tar::EntryType::Link => {
+                // Allow hardlinks but validate the target stays within dest.
+                if let Some(link_target) = entry.link_name()? {
+                    let full_target = dest.join(link_target.as_ref());
+                    let normalized = normalize_path(&full_target);
+                    if !normalized.starts_with(&canonical_dest) {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!(
+                                "tar hardlink '{}' escapes destination directory",
+                                entry_path.display()
+                            ),
+                        ));
+                    }
+                    // Skip hardlinks whose target was skipped (e.g., overlayfs
+                    // whiteout char devices). The target doesn't exist on disk
+                    // so creating the hardlink would fail.
+                    if !normalized.exists() {
+                        continue;
+                    }
+                }
+            }
+            tar::EntryType::Char | tar::EntryType::Block | tar::EntryType::Fifo => {
+                // Device nodes and FIFOs appear in overlayfs upper-layer
+                // exports (e.g., whiteout char devices from package upgrades,
+                // named pipes from certain RPM scriptlets). These cannot be
+                // created without root on macOS and aren't needed on the
+                // host — skip them.
+                continue;
+            }
+            _other => {
+                // Unknown or unsupported entry types (sockets, vendor
+                // extensions, future tar formats). Skip rather than fail —
+                // the packed image runs inside a Linux VM where the agent
+                // rootfs provides these files; missing non-regular entries
+                // on the host extraction side don't affect functionality.
+                continue;
+            }
+        }
 
-            // Validate that the unpacked path stays within dest.
-            let full_path = dest.join(&entry_path);
-            let normalized = normalize_path(&full_path);
-            if !normalized.starts_with(&canonical_dest) {
+        // Validate that the unpacked path stays within dest.
+        let full_path = dest.join(&entry_path);
+        let normalized = normalize_path(&full_path);
+        if !normalized.starts_with(&canonical_dest) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "tar entry '{}' escapes destination directory",
+                    entry_path.display()
+                ),
+            ));
+        }
+
+        // Ensure parent directories are writable before extracting any entry.
+        // OCI layer tars may set restrictive directory modes (e.g., dr-xr-xr-x)
+        // before child entries, which prevents creating files or subdirectories.
+        if let Some(parent) = full_path.parent() {
+            if parent.is_dir() {
+                let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o755));
+            }
+        }
+
+        // Save the tar's intended directory mode for deferred application.
+        if entry_type == tar::EntryType::Directory {
+            let mode = entry.header().mode().unwrap_or(0o755);
+            if mode & 0o200 == 0 {
+                deferred_dir_modes.push((full_path.clone(), mode));
+            }
+        }
+
+        let is_regular =
+            entry_type == tar::EntryType::Regular || entry_type == tar::EntryType::GNUSparse;
+
+        // For large regular files use a sparse write: ftruncate creates the
+        // hole skeleton, then we only pwrite non-zero 64 KiB chunks.  This
+        // prevents 10 GiB overlay disks from materialising as dense files on
+        // disk and causing ENOSPC or slow extraction.
+        if is_regular && entry.header().size().unwrap_or(0) >= SPARSE_WRITE_THRESHOLD {
+            let entry_size = entry.header().size()?;
+            let mode = entry.header().mode().unwrap_or(0o644);
+            if let Err(e) = unpack_sparse(&mut entry, &full_path, entry_size, mode) {
                 return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!(
-                        "tar entry '{}' escapes destination directory",
-                        entry_path.display()
-                    ),
+                    e.kind(),
+                    format!("failed to unpack '{}': {}", entry_path.display(), e),
+                ));
+            }
+        } else {
+            if let Err(e) = entry.unpack_in(dest) {
+                // On macOS, certain entries fail to unpack due to platform
+                // limitations (xattr encoding, uid/gid mapping, resource forks).
+                // For non-Regular entries (symlinks, hardlinks, dirs), skip and
+                // continue rather than aborting the entire extraction.
+                if !is_regular {
+                    continue;
+                }
+                return Err(std::io::Error::new(
+                    e.kind(),
+                    format!("failed to unpack '{}': {}", entry_path.display(), e),
                 ));
             }
 
-            if let Some(parent) = full_path.parent() {
-                directory_permissions.make_writable(parent)?;
-            }
-            entry.unpack_in(dest)?;
-            if entry_type == tar::EntryType::Directory {
-                directory_permissions.make_writable(&full_path)?;
-            }
-        }
-        Ok(())
-    })();
-
-    let restore_result = directory_permissions.restore();
-    result?;
-    restore_result
-}
-
-#[derive(Default)]
-struct DirectoryPermissions {
-    #[cfg(unix)]
-    modes: std::collections::BTreeMap<PathBuf, u32>,
-}
-
-impl DirectoryPermissions {
-    fn make_writable(&mut self, path: &Path) -> std::io::Result<()> {
-        #[cfg(unix)]
-        {
-            let Ok(metadata) = fs::symlink_metadata(path) else {
-                return Ok(());
-            };
-            if !metadata.is_dir() || metadata.file_type().is_symlink() {
-                return Ok(());
-            }
-
-            let mode = metadata.permissions().mode();
-            if mode & 0o700 == 0o700 {
-                return Ok(());
-            }
-
-            self.modes.entry(path.to_path_buf()).or_insert(mode);
-            fs::set_permissions(path, fs::Permissions::from_mode(mode | 0o700))?;
-        }
-
-        #[cfg(not(unix))]
-        {
-            let _ = path;
-        }
-
-        Ok(())
-    }
-
-    fn restore(self) -> std::io::Result<()> {
-        #[cfg(unix)]
-        {
-            for (path, mode) in self.modes.into_iter().rev() {
-                match fs::symlink_metadata(&path) {
-                    Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
-                        fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
-                    }
-                    Ok(_) => {}
-                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(err) => return Err(err),
-                }
-            }
-        }
-
-        Ok(())
-    }
-}
-
-fn remove_dir_all_writable(path: &Path) -> std::io::Result<()> {
-    if !path.exists() {
-        return Ok(());
-    }
-    make_tree_writable(path)?;
-    fs::remove_dir_all(path)
-}
-
-fn make_tree_writable(path: &Path) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        let metadata = fs::symlink_metadata(path)?;
-        if !metadata.is_dir() || metadata.file_type().is_symlink() {
-            return Ok(());
-        }
-
-        let mode = metadata.permissions().mode();
-        if mode & 0o700 != 0o700 {
-            fs::set_permissions(path, fs::Permissions::from_mode(mode | 0o700))?;
-        }
-
-        for entry in fs::read_dir(path)? {
-            let child = entry?.path();
-            let child_metadata = fs::symlink_metadata(&child)?;
-            if child_metadata.is_dir() && !child_metadata.file_type().is_symlink() {
-                make_tree_writable(&child)?;
+            // After extracting a directory, force it writable so subsequent
+            // entries (children) can be created inside it. Final permissions
+            // are applied after the loop.
+            if entry_type == tar::EntryType::Directory && full_path.is_dir() {
+                let _ =
+                    std::fs::set_permissions(&full_path, std::fs::Permissions::from_mode(0o755));
             }
         }
     }
 
-    #[cfg(not(unix))]
-    {
-        let _ = path;
+    // Apply deferred directory permissions now that all children are written.
+    for (path, mode) in deferred_dir_modes {
+        if path.is_dir() {
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode));
+        }
     }
 
     Ok(())
@@ -279,7 +360,16 @@ fn resolve_cache_asset_path(
     let resolved = if candidate.exists() {
         candidate.canonicalize()?
     } else {
-        normalize_path(&candidate)
+        // Candidate doesn't exist yet. Canonicalize its parent (which must
+        // exist — it's the cache dir) and join the filename. This avoids
+        // the macOS /tmp → /private/tmp symlink mismatch that would cause
+        // the starts_with check below to fail when cache_root is canonical
+        // but normalize_path is not.
+        let parent = candidate.parent().unwrap_or(&candidate);
+        let canonical_parent = parent
+            .canonicalize()
+            .unwrap_or_else(|_| normalize_path(parent));
+        canonical_parent.join(candidate.file_name().unwrap_or_default())
     };
 
     if !resolved.starts_with(&cache_root) {
@@ -308,6 +398,109 @@ pub fn get_cache_dir(checksum: u32) -> std::io::Result<PathBuf> {
 /// Check if assets have already been extracted.
 pub fn is_extracted(cache_dir: &Path) -> bool {
     cache_dir.join(EXTRACTION_MARKER).exists()
+}
+
+/// Maximum total size of the pack extraction cache before LRU eviction kicks in.
+/// Override with `SMOLVM_PACK_CACHE_MAX_BYTES` (in bytes); default 5 GiB.
+pub fn pack_cache_max_bytes() -> u64 {
+    const DEFAULT: u64 = 5 * 1024 * 1024 * 1024;
+    std::env::var("SMOLVM_PACK_CACHE_MAX_BYTES")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT)
+}
+
+/// Real (sparse-aware) disk usage of a single file. Extraction dirs contain
+/// large *sparse* overlay disks (e.g. a 10 GiB disk holding ~50 MB), so we must
+/// count allocated blocks, not the apparent length — otherwise the cap would
+/// over-count by orders of magnitude and evict far too aggressively.
+#[cfg(unix)]
+fn file_disk_usage(meta: &fs::Metadata) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    meta.blocks().saturating_mul(512)
+}
+#[cfg(not(unix))]
+fn file_disk_usage(meta: &fs::Metadata) -> u64 {
+    meta.len()
+}
+
+/// Recursive real disk usage of a directory tree (best-effort; unreadable
+/// entries count as zero). Does not follow symlinks.
+fn dir_disk_usage(path: &Path) -> u64 {
+    let mut total = 0u64;
+    let entries = match fs::read_dir(path) {
+        Ok(e) => e,
+        Err(_) => return 0,
+    };
+    for entry in entries.flatten() {
+        let meta = match entry.metadata() {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if meta.is_dir() {
+            total = total.saturating_add(dir_disk_usage(&entry.path()));
+        } else if meta.is_file() {
+            total = total.saturating_add(file_disk_usage(&meta));
+        }
+    }
+    total
+}
+
+/// Evict least-recently-modified extraction directories under `cache_root` until
+/// the cache's total real disk usage is at or below `max_bytes`. Skips
+/// directories with active leases (a running pack/VM) — they are never evicted,
+/// even if that leaves the cache over the cap. Best-effort: per-entry errors are
+/// skipped. Returns the number of bytes freed.
+///
+/// This is what bounds the otherwise-unbounded extraction cache; it runs
+/// automatically after a new (cache-miss) extraction, and keeps the newest
+/// entries (including the one just written) by evicting oldest-first.
+pub fn evict_cache_to_size(cache_root: &Path, max_bytes: u64) -> u64 {
+    let mut entries: Vec<(PathBuf, std::time::SystemTime, u64)> = Vec::new();
+    let read_dir = match fs::read_dir(cache_root) {
+        Ok(rd) => rd,
+        Err(_) => return 0,
+    };
+    for entry in read_dir.flatten() {
+        let path = entry.path();
+        let meta = match fs::metadata(&path) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if !meta.is_dir() {
+            continue; // skip *.lock files and other non-extraction entries
+        }
+        let modified = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        entries.push((path, modified, dir_disk_usage(&entry.path())));
+    }
+
+    let total: u64 = entries.iter().map(|(_, _, s)| *s).sum();
+    if total <= max_bytes {
+        return 0;
+    }
+
+    // Oldest first — evict least-recently-used.
+    entries.sort_by_key(|(_, modified, _)| *modified);
+
+    let mut over = total - max_bytes;
+    let mut freed = 0u64;
+    for (path, _, size) in entries {
+        if over == 0 {
+            break;
+        }
+        if has_active_leases(&path) {
+            continue; // never evict a running pack/VM
+        }
+        force_detach_layers_volume(&path);
+        if fs::remove_dir_all(&path).is_ok() {
+            // Also drop the adjacent <checksum>.lock file, if any.
+            let _ = fs::remove_file(path.with_extension("lock"));
+            freed = freed.saturating_add(size);
+            over = over.saturating_sub(size);
+        }
+    }
+    freed
 }
 
 /// Check if footer indicates sidecar mode.
@@ -380,11 +573,11 @@ pub fn extract_sidecar(
         return Ok(());
     }
 
-    // Rebuild the cache when forcing or when the marker is absent, so
-    // post-processing never reuses a half-extracted layer directory.
-    if cache_dir.exists() {
+    // If force-extracting over an existing cache, detach any mounted
+    // case-sensitive volume first, then remove for a clean slate.
+    if force && cache_dir.exists() {
         force_detach_layers_volume(cache_dir);
-        remove_dir_all_writable(cache_dir)?;
+        let _ = fs::remove_dir_all(cache_dir);
     }
 
     let result = extract_sidecar_inner(sidecar_path, cache_dir, footer, debug);
@@ -395,6 +588,19 @@ pub fn extract_sidecar(
     // directory so the next attempt starts fresh.
     if result.is_err() && cache_dir.exists() && !is_extracted(cache_dir) {
         let _ = fs::remove_dir_all(cache_dir);
+    }
+
+    // After a successful new extraction (cache miss — the early-return above
+    // handles cache hits), cap the cache so old, unused extractions don't grow
+    // without bound. LRU + lease-aware: keeps the newest (incl. what we just
+    // wrote) and never evicts a running pack.
+    if result.is_ok() {
+        if let Some(root) = cache_dir.parent() {
+            let freed = evict_cache_to_size(root, pack_cache_max_bytes());
+            if freed > 0 && debug {
+                eprintln!("debug: pack cache evicted {freed} bytes to stay under cap");
+            }
+        }
     }
 
     result
@@ -431,7 +637,20 @@ fn extract_sidecar_inner(
         eprintln!("debug: extracted assets to {}", cache_dir.display());
     }
 
-    post_process_extraction(cache_dir, debug)?;
+    // Layer order from the sidecar manifest (bottom→top). Best-effort: if the
+    // manifest can't be read the agent falls back to a name sort.
+    let layer_order = crate::packer::read_manifest_from_sidecar(sidecar_path)
+        .ok()
+        .map(|m| {
+            m.assets
+                .layers
+                .iter()
+                .filter_map(|l| short_layer_id(&l.digest))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    post_process_extraction(cache_dir, &layer_order, debug)?;
     Ok(())
 }
 
@@ -474,7 +693,9 @@ pub fn extract_from_binary(
             eprintln!("debug: extracted assets to {}", cache_dir.display());
         }
 
-        post_process_extraction(cache_dir, debug)?;
+        // Embedded self-exec stub: no separate sidecar manifest to source layer
+        // order from here, so let the agent fall back to a name sort.
+        post_process_extraction(cache_dir, &[], debug)?;
         Ok(())
     }
 }
@@ -514,12 +735,35 @@ pub unsafe fn extract_from_section(
         eprintln!("debug: extracted assets to {}", cache_dir.display());
     }
 
-    post_process_extraction(cache_dir, debug)?;
+    // Mach-O section self-exec stub: same as embedded mode — name-sort fallback.
+    post_process_extraction(cache_dir, &[], debug)?;
     Ok(())
 }
 
-/// Post-process extracted assets: unpack agent rootfs, OCI layers, fix permissions.
-fn post_process_extraction(cache_dir: &Path, debug: bool) -> std::io::Result<()> {
+/// Name of the index file written into the extracted-layers dir recording the
+/// layers in OCI order (bottom-most first), one short layer id per line. The
+/// guest agent honors it when stacking overlayfs lowerdirs; without it, layers
+/// (which are named by content digest) sort arbitrarily and a multi-layer pack
+/// can be mis-stacked. Must match the agent's `LAYER_ORDER_FILE`.
+const LAYER_ORDER_FILE: &str = "layer-order";
+
+/// Short layer id (first 12 hex of the digest) used as the on-disk layer dir
+/// name — mirrors `assets::digest_to_filename` minus the `.tar`. Returns `None`
+/// for a digest too short to form a valid id.
+fn short_layer_id(digest: &str) -> Option<String> {
+    let hex = digest.strip_prefix("sha256:").unwrap_or(digest);
+    (hex.len() >= 12).then(|| hex[..12].to_string())
+}
+
+/// Post-process extracted assets: unpack agent rootfs, OCI layers, fix
+/// permissions, and (when `layer_order` is non-empty) write the layer-order
+/// index so the guest stacks the layers in true OCI order rather than by their
+/// content-addressed names. `layer_order` is the short layer ids bottom→top.
+fn post_process_extraction(
+    cache_dir: &Path,
+    layer_order: &[String],
+    debug: bool,
+) -> std::io::Result<()> {
     // Extract agent-rootfs.tar to agent-rootfs directory
     let rootfs_tar = cache_dir.join("agent-rootfs.tar");
     let rootfs_dir = cache_dir.join("agent-rootfs");
@@ -571,6 +815,20 @@ fn post_process_extraction(cache_dir: &Path, debug: bool) -> std::io::Result<()>
                     let mut archive = tar::Archive::new(tar_file);
                     safe_unpack(&mut archive, &layer_dir)?;
                 }
+            }
+        }
+
+        // Record the manifest's layer order so the guest stacks overlayfs
+        // lowerdirs correctly (layer dirs are named by digest and don't sort
+        // into stack order). Only ids backed by an extracted dir are written.
+        if !layer_order.is_empty() {
+            let lines: Vec<&str> = layer_order
+                .iter()
+                .filter(|id| extract_dir.join(id).is_dir())
+                .map(String::as_str)
+                .collect();
+            if !lines.is_empty() {
+                fs::write(extract_dir.join(LAYER_ORDER_FILE), lines.join("\n"))?;
             }
         }
     }
@@ -1187,8 +1445,10 @@ pub fn create_storage_disk(path: &Path, size: u64) -> std::io::Result<()> {
 
 /// Copy overlay disk template from cache to a runtime directory.
 ///
-/// Copies the overlay template to `dest`, optionally extending the sparse
-/// file if `size_gb_override` is larger than the template.
+/// Copies the overlay template to `dest`, then restores the full sparse
+/// skeleton if `overlay_logical_size` is set (new packs store a truncated
+/// copy with the trailing hole stripped), and optionally extends further
+/// when `size_gb_override` is larger still.
 ///
 /// Returns an error if the template path is `None` or the template file
 /// does not exist in the cache.
@@ -1197,6 +1457,7 @@ pub fn copy_overlay_template(
     template_path: Option<&str>,
     dest: &Path,
     size_gb_override: Option<u64>,
+    overlay_logical_size: Option<u64>,
 ) -> std::io::Result<()> {
     let template = template_path.ok_or_else(|| {
         std::io::Error::new(
@@ -1215,14 +1476,25 @@ pub fn copy_overlay_template(
 
     fs::copy(&src, dest)?;
 
-    // Extend if requested size is larger than template
-    if let Some(gb) = size_gb_override {
-        let desired = gb * 1024 * 1024 * 1024;
-        let current = fs::metadata(dest)?.len();
-        if desired > current {
-            let file = fs::OpenOptions::new().write(true).open(dest)?;
-            file.set_len(desired)?;
-        }
+    // Determine target size: max of the copied size, overlay_logical_size
+    // (original sparse extent before trailing-hole truncation), and
+    // size_gb_override (user-requested larger disk).  A single ftruncate
+    // handles all three cases; ftruncate is instant and allocates no disk
+    // blocks for the extended region.
+    let copied_size = fs::metadata(dest)?.len();
+    let target = [
+        Some(copied_size),
+        overlay_logical_size,
+        size_gb_override.map(|gb| gb * 1024 * 1024 * 1024),
+    ]
+    .into_iter()
+    .flatten()
+    .max()
+    .unwrap_or(copied_size);
+
+    if target > copied_size {
+        let file = fs::OpenOptions::new().write(true).open(dest)?;
+        file.set_len(target)?;
     }
 
     Ok(())
@@ -1270,6 +1542,65 @@ pub fn create_or_copy_storage_disk(
 mod tests {
     use super::*;
 
+    /// Build a single-file tar archive in memory with the given name and data.
+    fn make_tar(name: &str, data: &[u8]) -> Vec<u8> {
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_size(data.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder.append_data(&mut header, name, data).unwrap();
+        builder.into_inner().unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_unpack_sparse_rejects_symlink_at_destination() {
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let outside = temp_dir.path().join("outside.bin");
+        let dest = temp_dir.path().join("overlay.raw");
+
+        fs::write(&outside, b"untouched").unwrap();
+        symlink(&outside, &dest).unwrap(); // dest is now a symlink → outside
+
+        let data = vec![0xFFu8; 512];
+        let tar_bytes = make_tar("overlay.raw", &data);
+        let mut archive = tar::Archive::new(tar_bytes.as_slice());
+        let mut entry = archive.entries().unwrap().next().unwrap().unwrap();
+
+        let result = unpack_sparse(&mut entry, &dest, data.len() as u64, 0o644);
+
+        assert!(result.is_err(), "should reject symlink at destination");
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidData);
+        // The symlink target must not be modified
+        assert_eq!(fs::read(&outside).unwrap(), b"untouched");
+    }
+
+    #[test]
+    fn test_unpack_sparse_preserves_data_integrity() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let dest = temp_dir.path().join("data.raw");
+
+        // Alternating 64 KiB zero and non-zero blocks: covers the skip-zero
+        // path, the write-nonzero path, correct seek offsets, and the
+        // ftruncate skeleton giving the right final size.
+        let block = 64 * 1024;
+        let mut data = vec![0u8; 8 * block];
+        for i in (0..8).step_by(2) {
+            data[i * block..(i + 1) * block].fill(0xFF);
+        }
+
+        let tar_bytes = make_tar("data.raw", &data);
+        let mut archive = tar::Archive::new(tar_bytes.as_slice());
+        let mut entry = archive.entries().unwrap().next().unwrap().unwrap();
+
+        unpack_sparse(&mut entry, &dest, data.len() as u64, 0o644).unwrap();
+
+        assert_eq!(fs::read(&dest).unwrap(), data);
+    }
+
     #[test]
     fn test_cache_dir_format() {
         let dir = get_cache_dir(0xDEADBEEF).unwrap();
@@ -1295,23 +1626,6 @@ mod tests {
         fs::write(temp_dir.path().join("lib/libkrun.dylib"), "partial").unwrap();
 
         assert!(!is_extracted(temp_dir.path()));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn test_remove_dir_all_writable_removes_restrictive_tree() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let temp_dir = tempfile::tempdir().unwrap();
-        let cache_dir = temp_dir.path().join("cache");
-        let locked_dir = cache_dir.join("layer/usr/lib");
-        fs::create_dir_all(&locked_dir).unwrap();
-        fs::write(locked_dir.join("file"), "data").unwrap();
-        fs::set_permissions(&locked_dir, fs::Permissions::from_mode(0o555)).unwrap();
-
-        remove_dir_all_writable(&cache_dir).unwrap();
-
-        assert!(!cache_dir.exists());
     }
 
     #[test]
@@ -1360,7 +1674,7 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let dest = temp_dir.path().join("overlay.raw");
 
-        let result = copy_overlay_template(temp_dir.path(), None, &dest, None);
+        let result = copy_overlay_template(temp_dir.path(), None, &dest, None, None);
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::NotFound);
     }
@@ -1370,7 +1684,8 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let dest = temp_dir.path().join("overlay.raw");
 
-        let result = copy_overlay_template(temp_dir.path(), Some("nonexistent.raw"), &dest, None);
+        let result =
+            copy_overlay_template(temp_dir.path(), Some("nonexistent.raw"), &dest, None, None);
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::NotFound);
     }
@@ -1385,15 +1700,52 @@ mod tests {
         let template_data = vec![0u8; 1024];
         fs::write(&template, &template_data).unwrap();
 
-        // Copy without size override
-        copy_overlay_template(temp_dir.path(), Some("overlay.raw"), &dest, None).unwrap();
+        // Copy without any size override or logical size
+        copy_overlay_template(temp_dir.path(), Some("overlay.raw"), &dest, None, None).unwrap();
         assert_eq!(fs::metadata(&dest).unwrap().len(), 1024);
 
-        // Copy with size override that extends (use small value for test)
+        // Copy with overlay_logical_size set — dest should be extended
         let dest2 = temp_dir.path().join("output2.raw");
-        // We can't test GiB-sized files, but we can verify the copy works
-        copy_overlay_template(temp_dir.path(), Some("overlay.raw"), &dest2, None).unwrap();
-        assert!(dest2.exists());
+        copy_overlay_template(
+            temp_dir.path(),
+            Some("overlay.raw"),
+            &dest2,
+            None,
+            Some(4096),
+        )
+        .unwrap();
+        assert_eq!(fs::metadata(&dest2).unwrap().len(), 4096);
+    }
+
+    #[test]
+    fn test_copy_overlay_template_size_gb_takes_max() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let template = temp_dir.path().join("overlay.raw");
+        fs::write(&template, vec![0u8; 1024]).unwrap();
+
+        // size_gb_override wins when larger than overlay_logical_size
+        let dest = temp_dir.path().join("out_a.raw");
+        copy_overlay_template(
+            temp_dir.path(),
+            Some("overlay.raw"),
+            &dest,
+            Some(1), // 1 GiB
+            Some(4096),
+        )
+        .unwrap();
+        assert_eq!(fs::metadata(&dest).unwrap().len(), 1024 * 1024 * 1024);
+
+        // overlay_logical_size wins when larger than size_gb_override
+        let dest2 = temp_dir.path().join("out_b.raw");
+        copy_overlay_template(
+            temp_dir.path(),
+            Some("overlay.raw"),
+            &dest2,
+            None,
+            Some(8192), // overlay_logical_size bigger than template but smaller than size_gb_override test above
+        )
+        .unwrap();
+        assert_eq!(fs::metadata(&dest2).unwrap().len(), 8192);
     }
 
     #[test]
@@ -1403,7 +1755,8 @@ mod tests {
         let dest = temp_dir.path().join("overlay.raw");
         fs::write(&outside, b"x").unwrap();
 
-        let result = copy_overlay_template(temp_dir.path(), Some("../outside.raw"), &dest, None);
+        let result =
+            copy_overlay_template(temp_dir.path(), Some("../outside.raw"), &dest, None, None);
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
     }
@@ -1638,34 +1991,6 @@ mod tests {
     }
 
     #[test]
-    fn test_safe_unpack_rejects_disallowed_entry_type() {
-        // Build a tar with a FIFO entry (disallowed type)
-        let temp_dir = tempfile::tempdir().unwrap();
-        let dest_raw = temp_dir.path().join("out");
-        fs::create_dir_all(&dest_raw).unwrap();
-        let dest = dest_raw.canonicalize().unwrap();
-
-        let mut builder = tar::Builder::new(Vec::new());
-        let mut header = tar::Header::new_gnu();
-        header.set_entry_type(tar::EntryType::Fifo);
-        header.set_size(0);
-        header.set_mode(0o644);
-        header.set_cksum();
-        builder
-            .append_data(&mut header, "fifo-entry", &b""[..])
-            .unwrap();
-        let tar_data = builder.into_inner().unwrap();
-
-        let mut archive = tar::Archive::new(tar_data.as_slice());
-        let result = safe_unpack(&mut archive, &dest);
-        assert!(result.is_err(), "FIFO entry type should be rejected");
-        assert!(
-            result.unwrap_err().to_string().contains("disallowed type"),
-            "error should mention disallowed type"
-        );
-    }
-
-    #[test]
     fn test_safe_unpack_skips_char_and_block_devices() {
         // Char/Block entries appear in overlayfs exports from Debian images
         // (e.g., update-alternatives). They should be skipped, not rejected.
@@ -1885,5 +2210,262 @@ mod tests {
                 & 0o777;
             assert_eq!(mode, 0o555, "deferred directory mode should be 555");
         }
+    }
+
+    #[test]
+    fn test_safe_unpack_mixed_fedora_overlay_layer() {
+        // Realistic Fedora overlay layer: regular files interspersed with
+        // whiteout char devices and hardlinks to those whiteouts.
+        // All good files should extract; bad entries should be skipped.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let dest_raw = temp_dir.path().join("out");
+        fs::create_dir_all(&dest_raw).unwrap();
+        let dest = dest_raw.canonicalize().unwrap();
+
+        let mut builder = tar::Builder::new(Vec::new());
+
+        // Directory
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Directory);
+        header.set_size(0);
+        header.set_mode(0o755);
+        header.set_path("usr/").unwrap();
+        header.set_cksum();
+        builder.append_data(&mut header, "usr/", &b""[..]).unwrap();
+
+        // Good file 1
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_size(11);
+        header.set_mode(0o644);
+        header.set_path("usr/good1.txt").unwrap();
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "usr/good1.txt", &b"good file 1"[..])
+            .unwrap();
+
+        // Char device whiteout
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Char);
+        header.set_size(0);
+        header.set_mode(0o000);
+        header.set_device_major(0).unwrap();
+        header.set_device_minor(0).unwrap();
+        header.set_path("usr/.wh.removed-pkg").unwrap();
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "usr/.wh.removed-pkg", &b""[..])
+            .unwrap();
+
+        // Good file 2
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_size(11);
+        header.set_mode(0o644);
+        header.set_path("usr/good2.txt").unwrap();
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "usr/good2.txt", &b"good file 2"[..])
+            .unwrap();
+
+        // Hardlink to the whiteout (should be skipped)
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Link);
+        header.set_size(0);
+        header.set_mode(0o000);
+        header.set_path("usr/link-to-removed").unwrap();
+        header.set_link_name("usr/.wh.removed-pkg").unwrap();
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "usr/link-to-removed", &b""[..])
+            .unwrap();
+
+        // Good file 3
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_size(11);
+        header.set_mode(0o755);
+        header.set_path("usr/good3.sh").unwrap();
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "usr/good3.sh", &b"#!/bin/bash"[..])
+            .unwrap();
+
+        // Another char device whiteout
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Char);
+        header.set_size(0);
+        header.set_mode(0o000);
+        header.set_device_major(0).unwrap();
+        header.set_device_minor(0).unwrap();
+        header.set_path("usr/.wh.another-removed").unwrap();
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "usr/.wh.another-removed", &b""[..])
+            .unwrap();
+
+        // Good file 4 (final entry)
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_size(5);
+        header.set_mode(0o644);
+        header.set_path("usr/good4.dat").unwrap();
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "usr/good4.dat", &b"final"[..])
+            .unwrap();
+
+        let tar_data = builder.into_inner().unwrap();
+
+        let mut archive = tar::Archive::new(tar_data.as_slice());
+        let result = safe_unpack(&mut archive, &dest);
+        assert!(
+            result.is_ok(),
+            "mixed Fedora overlay should extract cleanly: {:?}",
+            result.err()
+        );
+
+        // Good files are all extracted
+        assert_eq!(
+            fs::read_to_string(dest.join("usr/good1.txt")).unwrap(),
+            "good file 1"
+        );
+        assert_eq!(
+            fs::read_to_string(dest.join("usr/good2.txt")).unwrap(),
+            "good file 2"
+        );
+        assert_eq!(
+            fs::read_to_string(dest.join("usr/good3.sh")).unwrap(),
+            "#!/bin/bash"
+        );
+        assert_eq!(
+            fs::read_to_string(dest.join("usr/good4.dat")).unwrap(),
+            "final"
+        );
+
+        // Bad entries are not created
+        assert!(!dest.join("usr/.wh.removed-pkg").exists());
+        assert!(!dest.join("usr/link-to-removed").exists());
+        assert!(!dest.join("usr/.wh.another-removed").exists());
+    }
+
+    #[test]
+    fn test_safe_unpack_unknown_tar_type_byte() {
+        // Entry with unknown tar type byte (0x41 = 'A') — a vendor extension
+        // not recognized by the tar crate (maps to __Nonexhaustive).
+        // Should be skipped gracefully by safe_unpack's catch-all arm.
+        // Note: byte '7' maps to EntryType::Continuous which is allowed.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let dest_raw = temp_dir.path().join("out");
+        fs::create_dir_all(&dest_raw).unwrap();
+        let dest = dest_raw.canonicalize().unwrap();
+
+        let mut builder = tar::Builder::new(Vec::new());
+
+        // Regular file before the unknown entry
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_size(6);
+        header.set_mode(0o644);
+        header.set_path("before.txt").unwrap();
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "before.txt", &b"before"[..])
+            .unwrap();
+
+        // Unknown type byte entry ('A' = 0x41, truly unrecognized)
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::new(b'A'));
+        header.set_size(0);
+        header.set_mode(0o644);
+        header.set_path("unknown-type-entry").unwrap();
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "unknown-type-entry", &b""[..])
+            .unwrap();
+
+        // Regular file after
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_size(5);
+        header.set_mode(0o644);
+        header.set_path("after.txt").unwrap();
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "after.txt", &b"after"[..])
+            .unwrap();
+
+        let tar_data = builder.into_inner().unwrap();
+
+        let mut archive = tar::Archive::new(tar_data.as_slice());
+        let result = safe_unpack(&mut archive, &dest);
+        assert!(
+            result.is_ok(),
+            "unknown tar type should be skipped: {:?}",
+            result.err()
+        );
+
+        assert_eq!(
+            fs::read_to_string(dest.join("before.txt")).unwrap(),
+            "before"
+        );
+        assert_eq!(fs::read_to_string(dest.join("after.txt")).unwrap(), "after");
+        assert!(!dest.join("unknown-type-entry").exists());
+    }
+
+    #[test]
+    fn test_evict_cache_to_size_lru() {
+        use std::ffi::CString;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let mk = |name: &str, mtime_secs: i64| {
+            let d = root.join(name);
+            fs::create_dir_all(&d).unwrap();
+            fs::write(d.join("data"), vec![0u8; 1024 * 1024]).unwrap(); // ~1 MiB real
+            let c = CString::new(d.to_string_lossy().as_bytes()).unwrap();
+            let tv = libc::timeval {
+                tv_sec: mtime_secs,
+                tv_usec: 0,
+            };
+            let times = [tv, tv];
+            unsafe {
+                libc::utimes(c.as_ptr(), times.as_ptr());
+            }
+            d
+        };
+        let old = mk("aaaa", 1_000_000);
+        let mid = mk("bbbb", 2_000_000);
+        let new = mk("cccc", 3_000_000);
+
+        // Total (~3 MiB) is under the cap → nothing evicted.
+        assert_eq!(evict_cache_to_size(root, 100 * 1024 * 1024), 0);
+        assert!(old.exists() && mid.exists() && new.exists());
+
+        // Cap (~2.5 MiB) forces evicting the single oldest entry, LRU-first.
+        let freed = evict_cache_to_size(root, 5 * 1024 * 1024 / 2);
+        assert!(freed > 0, "expected some bytes freed");
+        assert!(!old.exists(), "oldest extraction should be evicted");
+        assert!(mid.exists() && new.exists(), "newer extractions kept");
+    }
+
+    // Lease tracking is a macOS case-sensitive-volume concept; on Linux
+    // `has_active_leases` is always false (layers live at cache_dir/layers).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_evict_cache_skips_active_lease() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let d = root.join("aaaa");
+        fs::create_dir_all(&d).unwrap();
+        fs::write(d.join("data"), vec![0u8; 2 * 1024 * 1024]).unwrap();
+        // Simulate a running pack: a live daemon lease file (current PID).
+        let leases = d.join(LEASES_DIR);
+        fs::create_dir_all(&leases).unwrap();
+        fs::write(leases.join("daemon"), format!("{}", std::process::id())).unwrap();
+        assert!(has_active_leases(&d), "live lease should be detected");
+        // Cap of 0 would evict everything — but the active lease must be spared.
+        let freed = evict_cache_to_size(root, 0);
+        assert_eq!(freed, 0, "leased extraction must not be evicted");
+        assert!(d.exists());
     }
 }

@@ -180,8 +180,8 @@ impl ImageStore {
             source_id,
             digest: imported.digest,
             size: imported.size,
-            created_at: crate::util::current_timestamp(),
-            last_used_at: crate::util::current_timestamp(),
+            created_at: crate::util::current_timestamp().to_string(),
+            last_used_at: crate::util::current_timestamp().to_string(),
             architecture: imported.architecture,
             os: imported.os,
             layers,
@@ -224,7 +224,7 @@ impl ImageStore {
         if !self.image_data_dir(&record.key).is_dir() {
             return Ok(None);
         }
-        record.last_used_at = crate::util::current_timestamp();
+        record.last_used_at = crate::util::current_timestamp().to_string();
         self.write_ref(&record)?;
         Ok(Some(record))
     }

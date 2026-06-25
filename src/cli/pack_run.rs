@@ -17,6 +17,7 @@ use smolvm::agent::{AgentClient, RunConfig, VmResources};
 use smolvm::data::network::PortMapping;
 use smolvm::data::storage::HostMount;
 use smolvm::network::{validate_requested_network_backend, NetworkBackend};
+use smolvm::platform::Platform;
 use smolvm::Error;
 use smolvm::DEFAULT_SHELL_CMD;
 use smolvm_pack::detect::PackedMode;
@@ -165,12 +166,7 @@ pub struct PackRunCmd {
     pub net: bool,
 
     /// Select the networking backend.
-    #[arg(
-        long = "net-backend",
-        value_enum,
-        hide = true,
-        help_heading = "Network"
-    )]
+    #[arg(long = "net-backend", value_enum, help_heading = "Network")]
     pub net_backend: Option<NetworkBackend>,
 
     /// Number of virtual CPUs (overrides manifest default)
@@ -250,7 +246,27 @@ impl PackRunCmd {
             return Ok(());
         }
 
-        // 5. Extract assets to cache (locked to prevent concurrent extraction races)
+        // 5. Platform compatibility check — fail before extraction so the error
+        //    is immediate and actionable rather than a cryptic dlopen failure.
+        {
+            let current = Platform::current().host_oci_platform();
+            if manifest.host_platform != current {
+                return Err(Error::agent(
+                    "platform mismatch",
+                    format!(
+                        "this artifact was built for {} but the current platform is {}\
+                         \n\nTo run on {}, create a new pack:\
+                         \n\n  smolvm pack create --image <image> -o <output>\
+                         \n\nOr push platform-specific artifacts under separate tags:\
+                         \n\n  smolvm pack push myrepo:v1-darwin-arm64 -f myapp-darwin.smolmachine\
+                         \n  smolvm pack push myrepo:v1-linux-amd64  -f myapp-linux.smolmachine",
+                        manifest.host_platform, current, current,
+                    ),
+                ));
+            }
+        }
+
+        // 6. Extract assets to cache (locked to prevent concurrent extraction races)
         let cache_dir = extract::get_cache_dir(footer.checksum)
             .map_err(|e| Error::agent("get cache dir", e.to_string()))?;
 
@@ -263,7 +279,7 @@ impl PackRunCmd {
         )
         .map_err(|e| Error::agent("extract assets", e.to_string()))?;
 
-        // 6. Set up paths — use a unique runtime directory per invocation so
+        // 7. Set up paths — use a unique runtime directory per invocation so
         //    concurrent runs of the same checksum don't conflict on
         //    storage.ext4 / agent.sock.  tempdir_in gives us a truly unique
         //    directory that survives PID reuse and abrupt termination.
@@ -301,7 +317,7 @@ impl PackRunCmd {
             self.overlay,
         )?;
 
-        // 7. Parse CLI args
+        // 8. Parse CLI args
         let mounts = HostMount::parse(&self.volume)?;
         let port_mappings = PortMapping::to_tuples(&self.port);
 
@@ -310,6 +326,7 @@ impl PackRunCmd {
             memory_mib: self.mem.unwrap_or(manifest.mem),
             network: self.net || manifest.network || !self.port.is_empty(),
             network_backend: self.net_backend,
+            dns: None,
             gpu: manifest.gpu,
             storage_gib,
             overlay_gib: self.overlay,
@@ -332,7 +349,7 @@ impl PackRunCmd {
             );
         }
 
-        // 8. Fork child → launch VM with dynamically loaded libkrun
+        // 9. Fork child → launch VM with dynamically loaded libkrun
         smolvm::process::install_sigchld_handler();
 
         let console_log_path = runtime_dir.path().join("console.log");
@@ -365,7 +382,8 @@ impl PackRunCmd {
             smolvm::process::detach_stdio();
 
             if let Err(e) = launch_agent_vm_dynamic(&krun, &config) {
-                let _ = e;
+                let msg = format!("launch_agent_vm_dynamic failed: {}\n", e);
+                let _ = std::fs::write(&config.console_log, &msg);
             }
 
             smolvm::process::exit_child(1);
@@ -422,7 +440,7 @@ impl PackRunCmd {
             runtime_dir,
         };
 
-        // 9. Parent: wait for agent, connect, execute command
+        // 10. Parent: wait for agent, connect, execute command
         let mut client = wait_for_agent(&vsock_path, self.debug)?;
 
         let exit_code = execute_command(&mut client, &manifest, &self, &mounts)?;
@@ -532,18 +550,23 @@ fn setup_vm_overlay(
             .as_ref()
             .map(|t| t.path.as_str());
 
-        extract::copy_overlay_template(cache_dir, overlay_template, dest, overlay_gb).map_err(
-            |e| {
-                Error::agent(
-                    "setup overlay",
-                    format!(
-                        "VM mode overlay template is missing or corrupt: {}. \
+        extract::copy_overlay_template(
+            cache_dir,
+            overlay_template,
+            dest,
+            overlay_gb,
+            manifest.assets.overlay_logical_size,
+        )
+        .map_err(|e| {
+            Error::agent(
+                "setup overlay",
+                format!(
+                    "VM mode overlay template is missing or corrupt: {}. \
                          Try re-packing with `smolvm pack --from-vm`.",
-                        e
-                    ),
-                )
-            },
-        )?;
+                    e
+                ),
+            )
+        })?;
 
         return Ok(Some(dest.to_path_buf()));
     }
@@ -650,14 +673,41 @@ fn build_command(manifest: &smolvm_pack::PackManifest, cli_command: &[String]) -
 }
 
 /// Build environment variables from manifest defaults and CLI overrides.
-fn build_env(manifest: &smolvm_pack::PackManifest, cli_env: &[String]) -> Vec<(String, String)> {
+fn build_env(
+    manifest: &smolvm_pack::PackManifest,
+    cli_env: &[String],
+) -> smolvm::Result<Vec<(String, String)>> {
     let mut env: Vec<(String, String)> = manifest
         .env
         .iter()
         .filter_map(|e| parse_env_spec(e))
         .collect();
 
-    // CLI env overrides manifest env
+    // A .smolmachine is a portable artifact that may have been authored on
+    // another host or by another party. Validate every packed ref under the
+    // Untrusted scope FIRST — which now rejects every source kind — so a packed
+    // `from_env`/`from_file` ref cannot be resolved against the running host's
+    // env or files (an exfil primitive). Resolution does not enforce scope on
+    // its own, so this gate is what makes the path fail closed. In practice a
+    // pack carries no resolvable secret; configure secrets locally instead.
+    for (key, r) in &manifest.secret_refs {
+        smolvm::secrets::validate_ref(r, smolvm::secrets::ResolutionScope::Untrusted).map_err(
+            |e| {
+                smolvm::Error::config(
+                    "run packed machine",
+                    format!("secret '{}': {} (packs may not carry secret refs)", key, e),
+                )
+            },
+        )?;
+    }
+    env.extend(smolvm::secrets::expose_into_env(
+        smolvm::secrets::resolve_refs_to_env(
+            &manifest.secret_refs,
+            smolvm::secrets::ResolutionScope::Untrusted,
+        )?,
+    ));
+
+    // CLI env overrides manifest env and resolved secrets
     for spec in cli_env {
         if let Some((key, value)) = parse_env_spec(spec) {
             // Remove existing key if present
@@ -666,7 +716,7 @@ fn build_env(manifest: &smolvm_pack::PackManifest, cli_env: &[String]) -> Vec<(S
         }
     }
 
-    env
+    Ok(env)
 }
 
 /// Execute the command in the VM using the existing AgentClient.
@@ -680,7 +730,7 @@ fn execute_command(
     mounts: &[smolvm::data::storage::HostMount],
 ) -> smolvm::Result<i32> {
     let command = build_command(manifest, &args.command);
-    let env = build_env(manifest, &args.env);
+    let env = build_env(manifest, &args.env)?;
     let workdir = args.workdir.clone().or_else(|| manifest.workdir.clone());
 
     let params = ExecParams {
@@ -727,7 +777,8 @@ fn execute_packed_command(
             if interactive || tty {
                 client.vm_exec_interactive(command, env, workdir, timeout, tty)
             } else {
-                let (exit_code, stdout, stderr) = client.vm_exec(command, env, workdir, timeout)?;
+                let (exit_code, stdout, stderr) =
+                    client.vm_exec(command, env, workdir, timeout, None)?;
 
                 if !stdout.is_empty() {
                     let _ = std::io::stdout().write_all(&stdout);
@@ -862,7 +913,7 @@ struct PackedRunArgs {
     net: bool,
 
     /// Select the networking backend.
-    #[arg(long = "net-backend", value_enum, hide = true)]
+    #[arg(long = "net-backend", value_enum)]
     net_backend: Option<NetworkBackend>,
 
     /// Number of vCPUs (overrides default)
@@ -914,7 +965,7 @@ struct PackedStartArgs {
     net: bool,
 
     /// Select the networking backend.
-    #[arg(long = "net-backend", value_enum, hide = true)]
+    #[arg(long = "net-backend", value_enum)]
     net_backend: Option<NetworkBackend>,
 }
 
@@ -1187,6 +1238,7 @@ fn run_from_cache(
         memory_mib: args.mem.unwrap_or(manifest.mem),
         network: args.net || manifest.network || !args.port.is_empty(),
         network_backend: args.net_backend,
+        dns: None,
         gpu: manifest.gpu,
         storage_gib,
         overlay_gib: args.overlay,
@@ -1228,7 +1280,8 @@ fn run_from_cache(
         smolvm::process::detach_stdio();
 
         if let Err(e) = launch_agent_vm_dynamic(&krun, &config) {
-            let _ = e;
+            let msg = format!("launch_agent_vm_dynamic failed: {}\n", e);
+            let _ = std::fs::write(&config.console_log, &msg);
         }
         smolvm::process::exit_child(1);
     })
@@ -1268,7 +1321,7 @@ fn run_from_cache(
 
     let params = ExecParams {
         command: build_command(manifest, &args.command),
-        env: build_env(manifest, &args.env),
+        env: build_env(manifest, &args.env)?,
         workdir: args.workdir.or_else(|| manifest.workdir.clone()),
         interactive: args.interactive,
         tty: args.tty,
@@ -1512,6 +1565,7 @@ fn daemon_start(
         memory_mib: args.mem.unwrap_or(manifest.mem),
         network: args.net || manifest.network || !args.port.is_empty(),
         network_backend: args.net_backend,
+        dns: None,
         gpu: manifest.gpu,
         storage_gib,
         overlay_gib: args.overlay,
@@ -1578,9 +1632,8 @@ fn daemon_start(
         smolvm::process::detach_stdio();
 
         if let Err(e) = launch_agent_vm_dynamic(&krun, &config) {
-            // stderr is /dev/null here, but the error is also logged
-            // to console.log via set_console_output
-            let _ = e;
+            let msg = format!("launch_agent_vm_dynamic failed: {}\n", e);
+            let _ = std::fs::write(&config.console_log, &msg);
         }
 
         smolvm::process::exit_child(1);
@@ -1660,7 +1713,7 @@ fn daemon_exec(
     let mounts: Vec<smolvm::data::storage::HostMount> = Vec::new();
     let params = ExecParams {
         command: build_command(manifest, &args.command),
-        env: build_env(manifest, &args.env),
+        env: build_env(manifest, &args.env)?,
         workdir: args.workdir.or_else(|| manifest.workdir.clone()),
         interactive: args.interactive,
         tty: args.tty,

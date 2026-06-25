@@ -1,18 +1,17 @@
 [package]
 name = "smolvm-agent"
-version = "0.7.0"
+version = "1.2.4"
 edition = "2021"
 description = "Guest agent for smolvm VMs (handles OCI operations and command execution)"
 license = "Apache-2.0"
+repository = "https://github.com/smol-machines/smolvm"
 
 [[bin]]
 name = "smolvm-agent"
 path = "src/main.rs"
 
 [dependencies]
-smolvm-network = { path = "../smolvm-network" }
-smolvm-pack = { path = "../smolvm-pack", default-features = false }
-smolvm-protocol = { path = "../smolvm-protocol" }
+smolvm-protocol = { path = "../smolvm-protocol", version = "1.2.4" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
@@ -21,6 +20,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 libc = "0.2"
 parking_lot = "0.12"
 tempfile = "3"
+# Read OCI layer tars in-process so extraction can apply overlayfs whiteouts
+# (gzip stays external via busybox `gunzip`, so no decompressor crate is added).
+tar = "0.4"
 
 # Linux-specific dependencies for vsock
 [target.'cfg(target_os = "linux")'.dependencies]

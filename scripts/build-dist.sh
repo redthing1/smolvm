@@ -1,0 +1,650 @@
+#!/bin/bash
+# Build a distributable smolvm package
+#
+# Usage:
+#   ./scripts/build-dist.sh
+#   ./scripts/build-dist.sh --with-local-libkrun
+#
+# Output: dist/smolvm-<version>-<platform>.tar.gz
+
+set -e
+
+# Options
+WITH_LOCAL_LIBKRUN=0
+SKIP_AGENT_BUILD=0
+LOCAL_LIBKRUN_DIR=""
+LIBKRUN_MAKE_FLAGS="${LIBKRUN_MAKE_FLAGS:-BLK=1 NET=1 GPU=1}"
+
+print_help() {
+    cat <<'EOF'
+Build a distributable smolvm package.
+
+Usage:
+  ./scripts/build-dist.sh [options]
+
+Options:
+  --with-local-libkrun       Build libkrun from local checkout and refresh bundled lib/
+  --local-libkrun-dir PATH   Local libkrun checkout (default: ../libkrun)
+  --skip-agent-build         Skip agent cross-compilation (use pre-built binary)
+  -h, --help                 Show this help text
+
+Environment:
+  LIBKRUN_MAKE_FLAGS   make flags for local libkrun build (default: BLK=1 NET=1 GPU=1)
+  LIBCLANG_PATH        path to libclang.dylib (auto-detected from brew llvm on macOS)
+  LIB_DIR              Override bundled library directory used by smolvm build
+  CODESIGN_IDENTITY    macOS code signing identity (default: - for ad-hoc)
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --with-local-libkrun)
+            WITH_LOCAL_LIBKRUN=1
+            shift
+            ;;
+        --skip-agent-build)
+            SKIP_AGENT_BUILD=1
+            shift
+            ;;
+        --local-libkrun-dir)
+            if [[ -z "${2:-}" ]]; then
+                echo "Error: --local-libkrun-dir requires a path"
+                exit 1
+            fi
+            LOCAL_LIBKRUN_DIR="$2"
+            shift 2
+            ;;
+        -h|--help)
+            print_help
+            exit 0
+            ;;
+        *)
+            echo "Error: unknown option: $1"
+            print_help
+            exit 1
+            ;;
+    esac
+done
+
+# Configuration
+VERSION="${VERSION:-$(grep '^version' Cargo.toml | head -1 | cut -d'"' -f2)}"
+# Normalize architecture: aarch64 -> arm64 for consistent naming across platforms
+_ARCH="$(uname -m)"
+if [[ "$_ARCH" == "aarch64" ]]; then
+    _ARCH="arm64"
+fi
+PLATFORM="$(uname -s | tr '[:upper:]' '[:lower:]')-${_ARCH}"
+DIST_NAME="smolvm-${VERSION}-${PLATFORM}"
+DIST_DIR="dist/${DIST_NAME}"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
+WORKSPACE_SRC_ROOT="$(cd "$PROJECT_ROOT/.." && pwd)"
+LOCAL_STAGE_DIR="$PROJECT_ROOT/target/local-lib-stage"
+LOCAL_INIT_KRUN=""
+
+if [[ -z "$LOCAL_LIBKRUN_DIR" ]]; then
+    LOCAL_LIBKRUN_DIR="$WORKSPACE_SRC_ROOT/libkrun"
+fi
+
+echo "Building smolvm distribution: ${DIST_NAME}"
+
+# Check for git-lfs (required for library binaries)
+if ! command -v git-lfs &> /dev/null && ! git lfs version &> /dev/null 2>&1; then
+    echo "Error: git-lfs is required to build smolvm distributions"
+    exit 1
+fi
+
+# Resolve bundled library directory
+if [[ "$(uname -s)" == "Linux" ]]; then
+    ARCH="$(uname -m)"
+    DEFAULT_LIB_DIR="./lib/linux-${ARCH}"
+    STAGED_LIB_DIR="$LOCAL_STAGE_DIR/usr/local/lib64"
+else
+    DEFAULT_LIB_DIR="./lib"
+    STAGED_LIB_DIR="$LOCAL_STAGE_DIR/usr/local/lib"
+fi
+
+BASE_LIB_DIR="${LIB_DIR:-$DEFAULT_LIB_DIR}"
+WORK_LIB_DIR="$BASE_LIB_DIR"
+LOCAL_BUNDLE_DIR="$PROJECT_ROOT/target/local-lib-bundle"
+
+run_make() {
+    local repo="$1"
+    local flags="$2"
+    shift 2
+    local -a args=()
+    if [[ -n "$flags" ]]; then
+        read -r -a args <<< "$flags"
+    fi
+    make -C "$repo" "${args[@]}" "$@"
+}
+
+copy_matching_libraries() {
+    local src_dir="$1"
+    local pattern="$2"
+    local dst_dir="$3"
+
+    if compgen -G "$src_dir/$pattern" > /dev/null; then
+        cp -a "$src_dir"/$pattern "$dst_dir"/
+    fi
+}
+
+setup_macos_libkrun_env() {
+    if [[ "$(uname -s)" != "Darwin" ]]; then
+        return
+    fi
+    if [[ ! -f "$LOCAL_LIBKRUN_DIR/Makefile" ]]; then
+        return
+    fi
+
+    # libkrun build scripts use bindgen and require libclang.dylib at runtime.
+    if [[ -z "${LIBCLANG_PATH:-}" ]] && command -v brew &> /dev/null; then
+        local llvm_prefix
+        llvm_prefix="$(brew --prefix llvm 2>/dev/null || true)"
+        if [[ -n "$llvm_prefix" ]] && [[ -f "$llvm_prefix/lib/libclang.dylib" ]]; then
+            export LIBCLANG_PATH="$llvm_prefix/lib"
+            echo "Using libclang from $LIBCLANG_PATH"
+        fi
+    fi
+
+    if [[ -n "${LIBCLANG_PATH:-}" ]]; then
+        export DYLD_FALLBACK_LIBRARY_PATH="$LIBCLANG_PATH:${DYLD_FALLBACK_LIBRARY_PATH:-}"
+    else
+        echo "Warning: LIBCLANG_PATH is not set."
+        echo "         If libkrun build fails with 'Library not loaded: @rpath/libclang.dylib',"
+        echo "         install llvm via brew and set LIBCLANG_PATH to its lib directory."
+    fi
+
+    if [[ "$LIBKRUN_MAKE_FLAGS" == *"BUILD_INIT=0"* ]] && [[ ! -f "$LOCAL_LIBKRUN_DIR/init/init" ]]; then
+        echo "Error: LIBKRUN_MAKE_FLAGS includes BUILD_INIT=0 but init binary is missing:"
+        echo "       $LOCAL_LIBKRUN_DIR/init/init"
+        echo "Build init first (for example: make -C \"$LOCAL_LIBKRUN_DIR\" BLK=1),"
+        echo "or remove BUILD_INIT=0 from LIBKRUN_MAKE_FLAGS."
+        exit 1
+    fi
+}
+
+refresh_bundled_libs_from_local() {
+    local repo="$1"
+    local flags="$2"
+    local prefix="$3"
+
+    if [[ ! -f "$repo/Makefile" ]]; then
+        echo "Error: local repo not found: $repo"
+        exit 1
+    fi
+
+    mkdir -p "$WORK_LIB_DIR"
+    rm -rf "$LOCAL_STAGE_DIR"
+    mkdir -p "$LOCAL_STAGE_DIR"
+
+    # On Linux, link with partial RELRO so libkrun's symbols bind lazily. Full
+    # RELRO forces BIND_NOW, which would defeat the lazy virglrenderer loading
+    # (RTLD_LAZY in src/agent/krun.rs + the patchelf --remove-needed below) that
+    # lets one GPU-enabled libkrun load on non-GPU hosts. Harmless for the
+    # install step and non-cargo builds; not applicable to macOS dylibs.
+    if [[ "$(uname -s)" == "Linux" ]]; then
+        RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-C relro-level=partial" run_make "$repo" "$flags"
+    else
+        run_make "$repo" "$flags"
+    fi
+    run_make "$repo" "$flags" install "DESTDIR=$LOCAL_STAGE_DIR" "PREFIX=/usr/local"
+
+    if [[ ! -d "$STAGED_LIB_DIR" ]]; then
+        echo "Error: no staged libraries found in $STAGED_LIB_DIR"
+        exit 1
+    fi
+
+    if ! compgen -G "$STAGED_LIB_DIR/${prefix}*" > /dev/null; then
+        echo "Error: no staged ${prefix} artifacts found in $STAGED_LIB_DIR"
+        exit 1
+    fi
+
+    cp -a "$STAGED_LIB_DIR"/${prefix}* "$WORK_LIB_DIR"/
+}
+
+if [[ "$WITH_LOCAL_LIBKRUN" == "1" ]]; then
+    if [[ ! -d "$BASE_LIB_DIR" ]]; then
+        echo "Error: base library directory does not exist: $BASE_LIB_DIR"
+        echo "Set LIB_DIR to a directory containing libkrun/libkrunfw artifacts."
+        exit 1
+    fi
+
+    rm -rf "$LOCAL_BUNDLE_DIR"
+    mkdir -p "$LOCAL_BUNDLE_DIR"
+    copy_matching_libraries "$BASE_LIB_DIR" "libkrun*" "$LOCAL_BUNDLE_DIR"
+    copy_matching_libraries "$BASE_LIB_DIR" "libkrunfw*" "$LOCAL_BUNDLE_DIR"
+    # GPU rendering libraries are not rebuilt by --with-local-libkrun, but must
+    # be carried over from the base lib dir so the dist stays GPU-capable.
+    copy_matching_libraries "$BASE_LIB_DIR" "libvirglrenderer*" "$LOCAL_BUNDLE_DIR"
+    copy_matching_libraries "$BASE_LIB_DIR" "libMoltenVK*" "$LOCAL_BUNDLE_DIR"
+    copy_matching_libraries "$BASE_LIB_DIR" "libepoxy*" "$LOCAL_BUNDLE_DIR"
+    # Linux render server binary (required for Venus Vulkan).
+    [[ -f "$BASE_LIB_DIR/virgl_render_server" ]] && cp "$BASE_LIB_DIR/virgl_render_server" "$LOCAL_BUNDLE_DIR/"
+    WORK_LIB_DIR="$LOCAL_BUNDLE_DIR"
+    echo "Staging local build bundle in $WORK_LIB_DIR"
+fi
+
+if [[ "$WITH_LOCAL_LIBKRUN" == "1" ]]; then
+    echo "Building local libkrun from $LOCAL_LIBKRUN_DIR..."
+    setup_macos_libkrun_env
+    refresh_bundled_libs_from_local "$LOCAL_LIBKRUN_DIR" "$LIBKRUN_MAKE_FLAGS" "libkrun"
+    if [[ -f "$LOCAL_LIBKRUN_DIR/init/init" ]]; then
+        LOCAL_INIT_KRUN="$LOCAL_LIBKRUN_DIR/init/init"
+    fi
+fi
+
+# Check for required libraries
+if [[ ! -f "$WORK_LIB_DIR/libkrun.dylib" ]] && [[ ! -f "$WORK_LIB_DIR/libkrun.so" ]]; then
+    echo "Error: libkrun not found in $WORK_LIB_DIR"
+    echo "Set LIB_DIR to point to your libkrun library directory."
+    exit 1
+fi
+if [[ ! -f "$WORK_LIB_DIR/libkrunfw.5.dylib" ]] && [[ ! -f "$WORK_LIB_DIR/libkrunfw.so" ]]; then
+    echo "Error: libkrunfw not found in $WORK_LIB_DIR"
+    echo "Set LIB_DIR to point to your libkrunfw library directory."
+    exit 1
+fi
+
+# Build release binaries
+echo "Building release binaries..."
+LIBKRUN_BUNDLE="$WORK_LIB_DIR" cargo build --release --bin smolvm
+
+# Build the unified `smol` CLI if its source is present (it lives in a sibling
+# repo checked out at ./smol). It is a separate cargo workspace that depends on
+# the engine by path, so build it from inside ./smol with an ABSOLUTE
+# LIBKRUN_BUNDLE so its build.rs finds the same bundled libraries we ship.
+BUILD_SMOL=0
+if [[ -f "./smol/Cargo.toml" ]]; then
+    echo "Building unified smol CLI..."
+    _ABS_LIB_BUNDLE="$(cd "$WORK_LIB_DIR" && pwd)"
+    ( cd ./smol && LIBKRUN_BUNDLE="$_ABS_LIB_BUNDLE" cargo build --release --bin smol )
+    BUILD_SMOL=1
+else
+    echo "smol CLI source (./smol) not found — building engine-only distribution"
+fi
+
+# Build smolvm-agent for Linux (size-optimized)
+if [[ "$SKIP_AGENT_BUILD" == "1" ]]; then
+    echo "Skipping agent build (--skip-agent-build)"
+    if [[ ! -f "./target/release-small/smolvm-agent" ]]; then
+        echo "Error: --skip-agent-build requires a pre-built agent at target/release-small/smolvm-agent"
+        exit 1
+    fi
+else
+    echo "Building smolvm-agent for Linux (optimized for size)..."
+    if [[ "$(uname -s)" == "Linux" ]]; then
+        # On Linux, build natively with musl for static linking
+        MUSL_TARGET="$(uname -m)-unknown-linux-musl"
+        if command -v cargo &> /dev/null; then
+            if rustup target list --installed 2>/dev/null | grep -q "$MUSL_TARGET"; then
+                cargo build --profile release-small -p smolvm-agent --target "$MUSL_TARGET"
+                # Copy to the non-target-triple path that the rest of the script expects
+                mkdir -p ./target/release-small
+                cp "./target/${MUSL_TARGET}/release-small/smolvm-agent" \
+                   "./target/release-small/smolvm-agent"
+            fi
+        fi
+    fi
+
+    # If native build didn't produce the binary, use smolvm
+    if [[ ! -f "./target/release-small/smolvm-agent" ]]; then
+        if command -v smolvm &> /dev/null; then
+            echo "Building via smolvm (rust:alpine)..."
+            smolvm machine run --net --mem 2048 -v "$PROJECT_ROOT:/work" --image rust:alpine \
+                -- sh -c ". /usr/local/cargo/env && apk add musl-dev && cd /work && cargo build --profile release-small -p smolvm-agent"
+        else
+            echo "Error: Cannot build smolvm-agent."
+            echo "  Install smolvm or the musl target (rustup target add x86_64-unknown-linux-musl)"
+            exit 1
+        fi
+    fi
+fi
+
+# Sign binary (macOS only)
+# Set CODESIGN_IDENTITY to a Developer ID for distribution signing.
+# Defaults to ad-hoc signing (-) for local development.
+if [[ "$(uname -s)" == "Darwin" ]]; then
+    IDENTITY="${CODESIGN_IDENTITY:--}"
+    CODESIGN_ARGS=(--force --sign "$IDENTITY" --entitlements smolvm.entitlements)
+    if [[ "$IDENTITY" != "-" ]]; then
+        # Developer ID signing requires hardened runtime for notarization
+        CODESIGN_ARGS+=(--options runtime)
+    fi
+    echo "Signing binary (identity: $IDENTITY)..."
+    codesign "${CODESIGN_ARGS[@]}" ./target/release/smolvm
+    # The smol binary also calls the macOS hypervisor, so it needs the same
+    # entitlements + signature (otherwise it cannot start a VM).
+    if [[ "$BUILD_SMOL" == "1" ]]; then
+        codesign "${CODESIGN_ARGS[@]}" ./smol/target/release/smol
+    fi
+fi
+
+# Create distribution directory
+echo "Creating distribution package..."
+rm -rf "$DIST_DIR"
+mkdir -p "$DIST_DIR/lib"
+
+# Copy binary (renamed to smolvm-bin)
+cp ./target/release/smolvm "$DIST_DIR/smolvm-bin"
+
+# Copy wrapper script
+cp ./scripts/smolvm-wrapper.sh "$DIST_DIR/smolvm"
+chmod +x "$DIST_DIR/smolvm"
+
+# Copy the unified smol CLI (binary renamed to smol-bin + its own wrapper).
+# The wrapper points at the same lib/ and agent-rootfs, so one tarball serves
+# both `smol` (the user-facing CLI) and `smolvm` (the lower-level engine).
+if [[ "$BUILD_SMOL" == "1" ]]; then
+    cp ./smol/target/release/smol "$DIST_DIR/smol-bin"
+    cp ./scripts/smol-wrapper.sh "$DIST_DIR/smol"
+    chmod +x "$DIST_DIR/smol"
+fi
+
+# Copy libraries
+if [[ "$(uname -s)" == "Darwin" ]]; then
+    cp "$WORK_LIB_DIR/libkrun.dylib" "$DIST_DIR/lib/"
+    cp "$WORK_LIB_DIR/libkrunfw.5.dylib" "$DIST_DIR/lib/"
+    # Create symlink for compatibility
+    ln -sf libkrunfw.5.dylib "$DIST_DIR/lib/libkrunfw.dylib"
+    # Bundle GPU rendering libraries if present (virglrenderer → MoltenVK + epoxy).
+    # All three dylibs use @loader_path refs so they resolve correctly regardless
+    # of where the lib/ directory is placed after installation.
+    for gpu_lib in libvirglrenderer.1.dylib libMoltenVK.dylib libepoxy.0.dylib; do
+        if [[ -f "$WORK_LIB_DIR/$gpu_lib" ]]; then
+            cp "$WORK_LIB_DIR/$gpu_lib" "$DIST_DIR/lib/"
+            echo "Bundled GPU library: $gpu_lib ($(du -h "$DIST_DIR/lib/$gpu_lib" | cut -f1))"
+        fi
+    done
+else
+    copy_so_with_symlinks() {
+        local lib_prefix="$1"
+        local required="$2"
+        local local_so="$WORK_LIB_DIR/${lib_prefix}.so"
+        if [[ ! -e "$local_so" ]]; then
+            if [[ "$required" == "required" ]]; then
+                echo "Error: ${lib_prefix}.so not found in $WORK_LIB_DIR"
+                exit 1
+            fi
+            return 0
+        fi
+
+        # Copy each library's real file plus all symlinks that reference it.
+        # Only copies files in the active symlink chain — stale old versions
+        # (e.g. libkrunfw.so.5.2.0 when current is 5.3.0) are excluded.
+        real_file="$(readlink -f "$local_so")"
+        real_name="$(basename "$real_file")"
+        cp "$real_file" "$DIST_DIR/lib/$real_name"
+
+        # Copy every symlink in the directory that ultimately points to
+        # the same real file. This catches both directions:
+        #   libkrun.so.1 → libkrun.so  (SONAME → real)
+        #   libkrunfw.so → libkrunfw.so.5 → libkrunfw.so.5.3.0
+        for candidate in "$WORK_LIB_DIR"/${lib_prefix}.so*; do
+            [[ -L "$candidate" ]] || continue
+            candidate_real="$(readlink -f "$candidate")"
+            if [[ "$candidate_real" == "$real_file" ]]; then
+                cp -a "$candidate" "$DIST_DIR/lib/"
+            fi
+        done
+        echo "Bundled library: ${lib_prefix} ($(du -h "$DIST_DIR/lib/$real_name" | cut -f1))"
+    }
+
+    copy_so_with_symlinks libkrun required
+    copy_so_with_symlinks libkrunfw required
+
+    # Strip the hard NEEDED on virglrenderer from the GPU-enabled libkrun so a
+    # host without it can still dlopen libkrun (paired with the RTLD_LAZY load in
+    # src/agent/krun.rs). virglrenderer is loaded by soname at runtime only when
+    # the GPU path actually runs — so one build serves both GPU and non-GPU hosts.
+    if command -v patchelf >/dev/null 2>&1; then
+        for lk in "$DIST_DIR"/lib/libkrun.so*; do
+            [[ -f "$lk" && ! -L "$lk" ]] || continue
+            if patchelf --print-needed "$lk" 2>/dev/null | grep -q libvirglrenderer; then
+                patchelf --remove-needed libvirglrenderer.so.1 "$lk"
+                echo "Stripped libvirglrenderer NEEDED from $(basename "$lk") — GPU stays optional at runtime"
+            fi
+        done
+    else
+        echo "Warning: patchelf not found — libkrun keeps its hard virglrenderer NEEDED;"
+        echo "         non-GPU Linux hosts will fail to load it. Install patchelf in the build env."
+    fi
+
+    # Bundle GPU rendering libraries if present (virglrenderer chain for Venus/Vulkan).
+    # libMoltenVK is macOS-only — not included here.
+    for gpu_lib_prefix in libvirglrenderer libepoxy; do
+        copy_so_with_symlinks "$gpu_lib_prefix" optional
+    done
+    # Bundle render server binary (required for Venus Vulkan on Linux).
+    if [[ -f "$WORK_LIB_DIR/virgl_render_server" ]]; then
+        cp "$WORK_LIB_DIR/virgl_render_server" "$DIST_DIR/lib/"
+        chmod +x "$DIST_DIR/lib/virgl_render_server"
+        echo "Bundled: virgl_render_server ($(du -h "$DIST_DIR/lib/virgl_render_server" | cut -f1))"
+    fi
+fi
+
+# Copy init.krun for Linux (required by libkrunfw kernel)
+if [[ "$(uname -s)" == "Linux" ]]; then
+    # Look for init.krun in libkrun submodule or system locations
+    INIT_KRUN=""
+    if [[ -n "$LOCAL_INIT_KRUN" ]] && [[ -f "$LOCAL_INIT_KRUN" ]]; then
+        INIT_KRUN="$LOCAL_INIT_KRUN"
+    elif [[ -f "$PROJECT_ROOT/libkrun/init/init" ]]; then
+        INIT_KRUN="$PROJECT_ROOT/libkrun/init/init"
+    elif [[ -f "/usr/local/share/smolvm/init.krun" ]]; then
+        INIT_KRUN="/usr/local/share/smolvm/init.krun"
+    fi
+
+    if [[ -n "$INIT_KRUN" ]]; then
+        echo "Copying init.krun from $INIT_KRUN..."
+        cp "$INIT_KRUN" "$DIST_DIR/init.krun"
+        chmod +x "$DIST_DIR/init.krun"
+
+        # init.krun runs as the guest PID 1, so it must match the target arch.
+        # libkrun/init/init is a committed binary that does NOT track the build
+        # host's arch, so a native dist build can silently ship a wrong-arch init
+        # (the x86_64 release once shipped the aarch64 init). Linux dist builds
+        # run natively, so the correct arch is `uname -m`; fail loudly otherwise.
+        host_arch="$(uname -m)"
+        case "$host_arch" in
+            x86_64)  want="x86-64" ;;
+            aarch64|arm64) want="aarch64" ;;
+            *)       want="" ;;
+        esac
+        init_desc="$(file -b "$DIST_DIR/init.krun")"
+        if [[ -n "$want" ]] && [[ "$init_desc" != *"$want"* ]]; then
+            echo "ERROR: init.krun is the wrong architecture for a $host_arch build." >&2
+            echo "       expected '$want', got: $init_desc" >&2
+            echo "       source: $INIT_KRUN — rebuild it for $host_arch (see scripts/build-libkrun-linux.sh)." >&2
+            exit 1
+        fi
+        echo "init.krun arch OK ($init_desc)"
+    else
+        echo "Warning: init.krun not found - users may need to build libkrun init"
+    fi
+fi
+
+# Build agent-rootfs
+echo "Building agent-rootfs..."
+ROOTFS_SRC="$PROJECT_ROOT/target/agent-rootfs"
+if [[ ! -d "$ROOTFS_SRC" ]]; then
+    echo "Error: target/agent-rootfs not found"
+    echo "Run ./scripts/build-agent-rootfs.sh first to create the base rootfs."
+    exit 1
+fi
+
+# Copy rootfs and update agent binary
+# Use cp -a to preserve symlinks (busybox creates many symlinks in /bin)
+mkdir -p "$DIST_DIR/agent-rootfs"
+cp -a "$ROOTFS_SRC"/* "$DIST_DIR/agent-rootfs/"
+
+# Copy freshly built agent binary (from release-small profile)
+# Remove existing symlinks first (busybox creates init as symlink)
+rm -f "$DIST_DIR/agent-rootfs/usr/local/bin/smolvm-agent"
+rm -f "$DIST_DIR/agent-rootfs/sbin/init"
+cp ./target/release-small/smolvm-agent "$DIST_DIR/agent-rootfs/usr/local/bin/smolvm-agent"
+chmod +x "$DIST_DIR/agent-rootfs/usr/local/bin/smolvm-agent"
+# Symlink /sbin/init → agent (saves ~1.8MB in initramfs vs a copy).
+# The agent handles overlayfs setup + pivot_root internally.
+ln -sf /usr/local/bin/smolvm-agent "$DIST_DIR/agent-rootfs/sbin/init"
+
+echo "Agent rootfs size: $(du -sh "$DIST_DIR/agent-rootfs" | cut -f1)"
+
+# Create pre-formatted storage template
+# This eliminates the e2fsprogs dependency for end users
+echo "Creating storage template..."
+TEMPLATE_SIZE=$((512 * 1024 * 1024))  # 512MB
+TEMPLATE_PATH="$DIST_DIR/storage-template.ext4"
+
+# Find mkfs.ext4
+MKFS_PATHS=(
+    "/opt/homebrew/opt/e2fsprogs/sbin/mkfs.ext4"
+    "/usr/local/opt/e2fsprogs/sbin/mkfs.ext4"
+    "/opt/homebrew/sbin/mkfs.ext4"
+    "/usr/local/sbin/mkfs.ext4"
+    "/sbin/mkfs.ext4"
+    "/usr/sbin/mkfs.ext4"
+)
+
+MKFS_BIN=""
+for path in "${MKFS_PATHS[@]}"; do
+    if [[ -x "$path" ]]; then
+        MKFS_BIN="$path"
+        break
+    fi
+done
+
+if [[ -z "$MKFS_BIN" ]] && command -v mkfs.ext4 &> /dev/null; then
+    MKFS_BIN="mkfs.ext4"
+fi
+
+if [[ -z "$MKFS_BIN" ]]; then
+    echo "Warning: mkfs.ext4 not found, skipping storage template creation"
+    echo "         Users will need e2fsprogs installed"
+else
+    # Set a file's virtual size (sparse), portably (macOS lacks GNU truncate).
+    extend_sparse() { # $1=path $2=bytes
+        if command -v truncate >/dev/null 2>&1; then
+            truncate -s "$2" "$1"
+        else
+            perl -e 'truncate($ARGV[0], $ARGV[1]) or die "truncate: $!"' "$1" "$2"
+        fi
+    }
+
+    # Create sparse file
+    dd if=/dev/zero of="$TEMPLATE_PATH" bs=1 count=0 seek=$TEMPLATE_SIZE 2>/dev/null
+
+    # Format with ext4
+    "$MKFS_BIN" -F -q -m 0 -L smolvm "$TEMPLATE_PATH"
+
+    # Size to the default storage virtual size (DEFAULT_STORAGE_SIZE_GIB=20) so a
+    # fresh VM boots from an instant qcow2 overlay (the guest grows the 512 MiB
+    # ext4 with resize2fs); the runtime treats the template as immutable. Sparse.
+    extend_sparse "$TEMPLATE_PATH" $((20 * 1024 * 1024 * 1024))
+    echo "Storage template created: $(du -h "$TEMPLATE_PATH" | cut -f1) physical (20 GiB virtual)"
+
+    # Create overlay template (same format, different label)
+    OVERLAY_TEMPLATE_PATH="$DIST_DIR/overlay-template.ext4"
+    dd if=/dev/zero of="$OVERLAY_TEMPLATE_PATH" bs=1 count=0 seek=$TEMPLATE_SIZE 2>/dev/null
+    "$MKFS_BIN" -F -q -m 0 -L smolvm-overlay "$OVERLAY_TEMPLATE_PATH"
+    # Size to the default overlay virtual size (DEFAULT_OVERLAY_SIZE_GIB=10).
+    extend_sparse "$OVERLAY_TEMPLATE_PATH" $((10 * 1024 * 1024 * 1024))
+    echo "Overlay template created: $(du -h "$OVERLAY_TEMPLATE_PATH" | cut -f1) physical (10 GiB virtual)"
+fi
+
+# Copy README
+cat > "$DIST_DIR/README.txt" << 'EOF'
+smolvm - OCI-native microVM runtime
+
+INSTALLATION
+============
+
+1. Extract this archive to a location of your choice:
+   tar -xzf smolvm-*.tar.gz
+   cd smolvm-*
+
+2. Run the smolvm wrapper script. It automatically uses the bundled
+   agent-rootfs/ directory when present.
+
+3. (Optional) Add to PATH:
+   # Add to ~/.bashrc or ~/.zshrc:
+   export PATH="/path/to/smolvm-directory:$PATH"
+
+4. (Optional) Create a symlink:
+   sudo ln -s /path/to/smolvm-directory/smolvm /usr/local/bin/smolvm
+
+PREREQUISITES
+=============
+
+macOS:
+  - macOS 11.0 (Big Sur) or later
+  - Apple Silicon or Intel Mac
+
+Linux:
+  - KVM support (/dev/kvm must exist)
+  - User must have access to /dev/kvm (typically via 'kvm' group)
+
+USAGE
+=====
+
+Run the 'smolvm' script (not smolvm-bin directly):
+
+  ./smolvm machine run --net --image alpine -- echo "Hello World"
+  ./smolvm machine create --net --name myvm
+  ./smolvm machine start --name myvm
+  ./smolvm machine exec --name myvm -- /bin/sh
+  ./smolvm machine ls
+  ./smolvm machine stop --name myvm
+  ./smolvm machine delete --name myvm
+
+TROUBLESHOOTING
+===============
+
+"library not found" errors:
+  Make sure you're running the 'smolvm' wrapper script, not 'smolvm-bin'
+  directly. The wrapper sets up the library path automatically.
+
+"agent did not become ready within 30 seconds":
+  This usually means the storage disk couldn't be formatted.
+  Check that the storage-template.ext4 file exists in ~/.smolvm/
+  If not, you may need to reinstall smolvm or install e2fsprogs:
+    macOS: brew install e2fsprogs
+    Linux: apt install e2fsprogs
+
+For more information: https://github.com/smolvm/smolvm
+EOF
+
+# Generate checksums
+echo "Generating checksums..."
+(cd "$DIST_DIR" && shasum -a 256 smolvm smolvm-bin lib/* > checksums.txt)
+
+# Delete existing tarball. This is because when a new release is created, there could be
+# tarball of the old release left in dist/, and ./install-local.sh may pick up the wrong tarball
+echo "Cleaning up existing tarball..."
+rm -f "smolvm-*.tar.gz"
+
+# Create tarball. Preserve sparseness so the 20/10 GiB-virtual disk templates
+# (a few hundred KiB physical) don't balloon to full size on extraction. GNU tar
+# needs --sparse; bsdtar (macOS) detects holes automatically.
+echo "Creating tarball..."
+cd dist
+if tar --version 2>/dev/null | grep -qi gnu; then
+    tar --sparse -czf "${DIST_NAME}.tar.gz" "${DIST_NAME}"
+else
+    tar -czf "${DIST_NAME}.tar.gz" "${DIST_NAME}"
+fi
+cd ..
+
+# Summary
+echo ""
+echo "Distribution package created:"
+echo "  dist/${DIST_NAME}.tar.gz"
+echo ""
+echo "Contents:"
+ls -la "$DIST_DIR"
+echo ""
+echo "To test locally:"
+echo "  cd $DIST_DIR && ./smolvm --help"
+echo ""
+echo "To install locally:"
+echo "  ./scripts/install-local.sh"

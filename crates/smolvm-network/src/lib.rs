@@ -58,16 +58,21 @@
 //!   connections
 
 pub mod device;
+pub mod dns;
+pub mod egress;
 pub mod frame_stream;
-pub mod guest_env;
+pub mod icmp_relay;
 pub mod queues;
 pub mod stack;
 pub mod tcp_listeners;
 pub mod tcp_relay;
+pub mod udp_relay;
+
+pub use egress::EgressPolicy;
 
 use std::fmt;
 use std::io;
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::os::fd::RawFd;
 use std::thread::JoinHandle;
 use std::time::SystemTime;
@@ -105,6 +110,9 @@ impl PortMapping {
 /// This struct describes the two endpoints of the single virtual Ethernet link:
 /// - the guest NIC (`guest_*`)
 /// - the host-side gateway implemented by smolvm (`gateway_*`)
+///
+/// The link is dual-stack: a /30 IPv4 point-to-point pair and a /64 ULA IPv6
+/// pair (`fd53:4d00::/64` — `53:4d` = "SM", matching the MAC OUI scheme).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GuestNetworkConfig {
     /// Guest IPv4 address.
@@ -113,12 +121,28 @@ pub struct GuestNetworkConfig {
     pub gateway_ip: Ipv4Addr,
     /// Prefix length.
     pub prefix_len: u8,
+    /// Guest IPv6 (ULA) address.
+    pub guest_ip6: Ipv6Addr,
+    /// Gateway IPv6 (ULA) address.
+    pub gateway_ip6: Ipv6Addr,
+    /// IPv6 prefix length.
+    pub prefix_len6: u8,
     /// Guest MAC address.
     pub guest_mac: [u8; 6],
     /// Gateway MAC address.
     pub gateway_mac: [u8; 6],
     /// DNS server address presented to the guest.
+    ///
+    /// For virtio-net this is the gateway's own address (`gateway_ip`): the
+    /// guest sends DNS to the gateway, which forwards upstream to
+    /// [`Self::upstream_dns`].
     pub dns_server: Ipv4Addr,
+    /// Upstream resolver the gateway forwards guest DNS queries to.
+    ///
+    /// Defaults to [`DEFAULT_DNS_ADDR`]; the launcher overrides it when the
+    /// caller passes `--dns <ip>` so a VM on a network that blocks the default
+    /// resolver can still resolve names.
+    pub upstream_dns: Ipv4Addr,
 }
 
 impl GuestNetworkConfig {
@@ -128,9 +152,16 @@ impl GuestNetworkConfig {
             guest_ip: Ipv4Addr::new(100, 96, 0, 2),
             gateway_ip: Ipv4Addr::new(100, 96, 0, 1),
             prefix_len: 30,
+            guest_ip6: Ipv6Addr::new(0xfd53, 0x4d00, 0, 0, 0, 0, 0, 2),
+            gateway_ip6: Ipv6Addr::new(0xfd53, 0x4d00, 0, 0, 0, 0, 0, 1),
+            prefix_len6: 64,
             guest_mac: [0x02, 0x53, 0x4d, 0x00, 0x00, 0x02],
             gateway_mac: [0x02, 0x53, 0x4d, 0x00, 0x00, 0x01],
             dns_server: Ipv4Addr::new(100, 96, 0, 1),
+            upstream_dns: match DEFAULT_DNS_ADDR {
+                IpAddr::V4(ip) => ip,
+                IpAddr::V6(_) => Ipv4Addr::new(1, 1, 1, 1),
+            },
         }
     }
 }
@@ -223,6 +254,7 @@ pub fn start_virtio_network(
     host_fd: RawFd,
     guest_network: GuestNetworkConfig,
     published_ports: &[PortMapping],
+    egress: EgressPolicy,
 ) -> io::Result<VirtioNetworkRuntime> {
     virtio_net_log!(
         "virtio-net: starting runtime host_fd={} guest_ip={} gateway_ip={} dns_server={}",
@@ -252,9 +284,14 @@ pub fn start_virtio_network(
             guest_mac: guest_network.guest_mac,
             gateway_ipv4: guest_network.gateway_ip,
             guest_ipv4: guest_network.guest_ip,
+            gateway_ipv6: guest_network.gateway_ip6,
+            guest_ipv6: guest_network.guest_ip6,
+            prefix_len6: guest_network.prefix_len6,
+            upstream_dns: guest_network.upstream_dns,
             mtu: 1500,
         },
         tcp_listeners.as_ref().map(|_| tcp_receiver),
+        egress,
     )?;
 
     Ok(VirtioNetworkRuntime {
@@ -263,6 +300,23 @@ pub fn start_virtio_network(
         published_ports: tcp_listeners,
         poll_handle: Some(poll_handle),
     })
+}
+
+impl VirtioNetworkRuntime {
+    /// Cumulative guest-outbound (egress) bytes on this NIC since boot, at the
+    /// ethernet-frame level. The launcher polls this to surface per-machine
+    /// egress to the node API for billing. TSI VMs have no virtio runtime, so
+    /// egress is unavailable for them (a documented metering gap).
+    pub fn egress_bytes(&self) -> u64 {
+        self.queues.egress_bytes()
+    }
+
+    /// A cheap, cloneable read handle to this NIC's egress counter, so the
+    /// launcher can spawn a thread that periodically flushes the value to the
+    /// VM's runtime dir for the node API to read (the runtime is not `Clone`).
+    pub fn egress_counter(&self) -> std::sync::Arc<std::sync::atomic::AtomicU64> {
+        self.queues.egress_counter()
+    }
 }
 
 impl Drop for VirtioNetworkRuntime {
