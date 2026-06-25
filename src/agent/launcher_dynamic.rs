@@ -7,7 +7,7 @@
 //! The static FFI path in `launcher.rs` remains untouched for normal operations.
 
 use crate::network::backend::{COMPAT_NET_FEATURES, TSI_FEATURE_HIJACK_INET};
-use crate::network::{plan_launch_network, EffectiveNetworkBackend, PreparedNetwork};
+use crate::network::{plan_launch_network, EffectiveNetworkBackend};
 use smolvm_network::{
     guest_env, start_virtio_network, GuestNetworkConfig, PortMapping as VirtioPortMapping,
     VirtioNetworkRuntime,
@@ -25,7 +25,7 @@ use super::VmResources;
 pub struct PackedMount {
     /// Virtiofs tag (e.g., "smolvm0").
     pub tag: String,
-    /// Host source path exposed through libkrun virtio-fs setup.
+    /// Host source path (passed to `krun_add_virtiofs`).
     pub host_path: String,
     /// Guest mount path (passed to agent via `SMOLVM_MOUNT_*` env).
     pub guest_path: String,
@@ -70,20 +70,15 @@ pub fn launch_agent_vm_dynamic(
     krun: &KrunFunctions,
     config: &PackedLaunchConfig,
 ) -> Result<(), String> {
-    let prepared_network =
-        PreparedNetwork::from_resources(&config.resources, None, config.port_mappings.len());
-    crate::network::validate_requested_network_backend(&prepared_network)
-        .map_err(|e| e.to_string())?;
+    crate::network::validate_requested_network_backend(
+        &config.resources,
+        None,
+        config.port_mappings.len(),
+    )
+    .map_err(|e| e.to_string())?;
 
     // Raise file descriptor limits
     raise_fd_limits();
-
-    let hardening_report = crate::security::hardening::apply_runner_baseline()
-        .map_err(|e| format!("failed to apply runner hardening: {e}"))?;
-    tracing::debug!(
-        hardening = %hardening_report.render_text(),
-        "applied runner hardening baseline"
-    );
 
     // Set library path so libkrun can find libkrunfw
     let lib_dir = config
@@ -183,7 +178,7 @@ pub fn launch_agent_vm_dynamic(
         free_ctx_on_err!("krun_set_root failed");
     }
 
-    let network_plan = plan_launch_network(&prepared_network);
+    let network_plan = plan_launch_network(&config.resources, None, config.port_mappings.len());
     if let Some(reason) = network_plan.fallback_reason {
         tracing::warn!(reason = %reason.user_message(), "network backend fell back to TSI");
     }
@@ -224,28 +219,28 @@ pub fn launch_agent_vm_dynamic(
                 free_ctx_on_err!("krun_set_port_map failed");
             }
 
-            if let Some(cidrs) = prepared_network.initial_cidrs() {
-                let set_egress = krun.set_egress_policy.ok_or_else(|| {
-                    "libkrun does not support egress policy (krun_set_egress_policy not found). \
-                     Update libkrun or remove --allow-cidr flags."
-                        .to_string()
-                })?;
+            if let Some(ref cidrs) = config.resources.allowed_cidrs {
+                if !cidrs.is_empty() {
+                    let set_egress = krun.set_egress_policy.ok_or_else(|| {
+                        "libkrun does not support egress policy (krun_set_egress_policy not found). \
+                         Update libkrun or remove --allow-cidr flags."
+                            .to_string()
+                    })?;
 
-                let mut all_cidrs = cidrs.to_vec();
-                if prepared_network.should_allow_dns_for_egress_policy() {
+                    let mut all_cidrs = cidrs.clone();
                     crate::data::network::ensure_dns_in_cidrs(&mut all_cidrs);
-                }
 
-                let cidr_cstrings: Vec<CString> = all_cidrs
-                    .iter()
-                    .map(|c| CString::new(c.as_str()).expect("CIDR cannot contain null bytes"))
-                    .collect();
-                let mut cidr_ptrs: Vec<*const libc::c_char> =
-                    cidr_cstrings.iter().map(|s| s.as_ptr()).collect();
-                cidr_ptrs.push(std::ptr::null());
+                    let cidr_cstrings: Vec<CString> = all_cidrs
+                        .iter()
+                        .map(|c| CString::new(c.as_str()).expect("CIDR cannot contain null bytes"))
+                        .collect();
+                    let mut cidr_ptrs: Vec<*const libc::c_char> =
+                        cidr_cstrings.iter().map(|s| s.as_ptr()).collect();
+                    cidr_ptrs.push(std::ptr::null());
 
-                if unsafe { (set_egress)(ctx, cidr_ptrs.as_ptr()) } < 0 {
-                    free_ctx_on_err!("krun_set_egress_policy failed");
+                    if unsafe { (set_egress)(ctx, cidr_ptrs.as_ptr()) } < 0 {
+                        free_ctx_on_err!("krun_set_egress_policy failed");
+                    }
                 }
             }
 
@@ -425,31 +420,36 @@ pub fn launch_agent_vm_dynamic(
 
     // Add preloaded image data mount (AFTER set_exec)
     if config.layers_dir.exists() {
-        if let Err(e) = add_virtiofs_path(krun, ctx, "smolvm_image", config.layers_dir, true) {
-            free_ctx_on_err!(e);
+        let layers_tag = cstr("smolvm_image");
+        let layers_path = try_or_free_ctx!(
+            path_to_cstring(config.layers_dir),
+            "layers dir path contains null byte"
+        );
+        // SAFETY: ctx is valid, tag and path are valid C strings
+        if unsafe { (krun.add_virtiofs)(ctx, layers_tag.as_ptr(), layers_path.as_ptr()) } < 0 {
+            free_ctx_on_err!("krun_add_virtiofs failed for preloaded image data");
         }
     }
 
     // Add user-specified virtiofs mounts
     for mount in config.mounts.iter() {
-        let host_path = Path::new(&mount.host_path);
-        if let Err(e) = add_virtiofs_path(krun, ctx, &mount.tag, host_path, mount.read_only) {
-            free_ctx_on_err!(e);
+        let tag = try_or_free_ctx!(
+            CString::new(mount.tag.as_str()),
+            "mount tag contains null byte"
+        );
+        let host_path = try_or_free_ctx!(
+            CString::new(mount.host_path.as_str()),
+            "mount path contains null byte"
+        );
+
+        // SAFETY: ctx is valid, tag and host_path are valid C strings
+        if unsafe { (krun.add_virtiofs)(ctx, tag.as_ptr(), host_path.as_ptr()) } < 0 {
+            free_ctx_on_err!(format!(
+                "krun_add_virtiofs failed for '{}' - requested mount cannot be attached",
+                mount.tag
+            ));
         }
     }
-
-    let syscall_policy = crate::security::hardening::RunnerSyscallPolicy::from_network(
-        prepared_network.wants_network(),
-    );
-    let syscall_report =
-        match crate::security::hardening::apply_runner_syscall_confinement(syscall_policy) {
-            Ok(report) => report,
-            Err(e) => free_ctx_on_err!(e),
-        };
-    tracing::debug!(
-        hardening = %syscall_report.render_text(),
-        "applied runner syscall confinement"
-    );
 
     // Start VM (never returns on success)
     // SAFETY: ctx is valid, all configuration has been set
@@ -460,16 +460,6 @@ pub fn launch_agent_vm_dynamic(
     unsafe { (krun.free_ctx)(ctx) };
     drop(virtio_network_runtime);
     Err(format!("krun_start_enter returned: {}", ret))
-}
-
-fn add_virtiofs_path(
-    krun: &KrunFunctions,
-    ctx: u32,
-    tag: &str,
-    path: &Path,
-    read_only: bool,
-) -> Result<(), String> {
-    unsafe { krun.add_virtiofs_path(ctx, tag, path, read_only) }.map_err(|err| err.to_string())
 }
 
 /// Create a CString from a static string that is known not to contain NUL bytes.

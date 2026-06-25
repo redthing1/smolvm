@@ -16,7 +16,7 @@ use smolvm::agent::launcher_dynamic::{
 use smolvm::agent::{AgentClient, RunConfig, VmResources};
 use smolvm::data::network::PortMapping;
 use smolvm::data::storage::HostMount;
-use smolvm::network::{validate_requested_network_backend, NetworkBackend, PreparedNetwork};
+use smolvm::network::{validate_requested_network_backend, NetworkBackend};
 use smolvm::Error;
 use smolvm::DEFAULT_SHELL_CMD;
 use smolvm_pack::detect::PackedMode;
@@ -316,8 +316,7 @@ impl PackRunCmd {
             gpu_vram_mib: None,
             allowed_cidrs: None,
         };
-        let prepared_network = PreparedNetwork::from_resources(&resources, None, self.port.len());
-        validate_requested_network_backend(&prepared_network)?;
+        validate_requested_network_backend(&resources, None, self.port.len())?;
 
         // Build packed mounts for the launcher
         let packed_mounts = mounts_to_packed(&mounts);
@@ -1194,8 +1193,7 @@ fn run_from_cache(
         gpu_vram_mib: None,
         allowed_cidrs: None,
     };
-    let prepared_network = PreparedNetwork::from_resources(&resources, None, args.port.len());
-    validate_requested_network_backend(&prepared_network)?;
+    validate_requested_network_backend(&resources, None, args.port.len())?;
 
     let packed_mounts = mounts_to_packed(&mounts);
 
@@ -1520,8 +1518,7 @@ fn daemon_start(
         gpu_vram_mib: None,
         allowed_cidrs: None,
     };
-    let prepared_network = PreparedNetwork::from_resources(&resources, None, args.port.len());
-    validate_requested_network_backend(&prepared_network)?;
+    validate_requested_network_backend(&resources, None, args.port.len())?;
 
     let packed_mounts = mounts_to_packed(&mounts);
 

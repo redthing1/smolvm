@@ -7,10 +7,10 @@
 use crate::data::consts::{
     ENV_SMOLVM_GPU, ENV_SMOLVM_KRUN_LOG_LEVEL, ENV_SMOLVM_LIB_DIR, ENV_VALUE_ON,
 };
+use crate::data::storage::HostMount;
 use crate::error::{Error, Result};
 use crate::network::backend::{COMPAT_NET_FEATURES, TSI_FEATURE_HIJACK_INET};
 use crate::network::{plan_launch_network, EffectiveNetworkBackend};
-use crate::security::prepare::{PreparedLaunch, PreparedMount};
 use crate::storage::{OverlayDisk, StorageDisk};
 use crate::util::{libkrun_filename, libkrunfw_filename};
 
@@ -23,7 +23,7 @@ use std::ffi::CString;
 use std::os::fd::RawFd;
 use std::path::{Path, PathBuf};
 
-use super::KrunFunctions;
+use super::{KrunFunctions, PortMapping, VmResources};
 
 /// Maximum number of CIDR entries held in the live egress allow-list.
 /// Protects the muxer's per-packet O(n) scan from unbounded growth when
@@ -110,46 +110,66 @@ pub struct LaunchFeatures {
 
 /// Configuration for launching an agent VM.
 pub struct LaunchConfig<'a> {
-    /// Prepared launch policy and VMM-facing resources.
-    pub prepared: &'a PreparedLaunch,
+    /// Path to the agent rootfs directory.
+    pub rootfs_path: &'a Path,
     /// Storage and overlay disk handles.
     pub disks: &'a VmDisks<'a>,
+    /// Path to the vsock Unix socket for the control channel.
+    pub vsock_socket: &'a Path,
+    /// Optional path to write console output.
+    pub console_log: Option<&'a Path>,
+    /// Host directory mounts to expose to the guest.
+    pub mounts: &'a [HostMount],
+    /// Port mappings (host:guest).
+    pub port_mappings: &'a [PortMapping],
+    /// VM resources (CPU, memory, network, disk sizes).
+    pub resources: VmResources,
+    /// Host SSH agent socket path for forwarding into the guest.
+    pub ssh_agent_socket: Option<&'a Path>,
+    /// Host directory containing image data mounted for the guest agent.
+    pub preloaded_image_dir: Option<&'a Path>,
+    /// Additional disk images (path, read_only). Appear as /dev/vdc, /dev/vdd, ...
+    pub extra_disks: &'a [(std::path::PathBuf, bool)],
+    /// Hostnames to periodically re-resolve for the live egress policy.
+    /// When set, a background thread re-resolves these every 5 minutes and
+    /// atomically replaces the CIDR list via the Arc handle obtained from
+    /// libkrun. This keeps the egress allow-list accurate for long-running VMs
+    /// hitting CDN-backed hosts whose IPs rotate.
+    pub egress_refresh_hosts: Option<Vec<String>>,
 }
 
 /// Launch the agent VM using libkrun.
 ///
 /// This function never returns on success.
 pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
-    let prepared = config.prepared;
-    let policy = &prepared.policy;
-    let disks = config.disks;
-    let rootfs_path = &policy.rootfs_path;
-    let vsock_socket = &policy.vsock_socket;
-    let console_log = policy.console_log.as_deref();
-    let mounts = &prepared.mounts;
-    let port_mappings = &policy.ports;
-    let resources = &policy.resources;
-    let gpu_requested = policy.devices.gpu;
-    let ssh_agent_socket = policy.secrets.ssh_agent_socket.as_deref();
-    let preloaded_image_mount = prepared.preloaded_image_mount.as_ref();
-    let extra_disks = &prepared.extra_disks;
-    let prepared_network = &prepared.network;
+    let LaunchConfig {
+        rootfs_path,
+        disks,
+        vsock_socket,
+        console_log,
+        mounts,
+        port_mappings,
+        resources,
+        ssh_agent_socket,
+        preloaded_image_dir,
+        extra_disks,
+        egress_refresh_hosts,
+    } = config;
 
-    crate::network::validate_requested_network_backend(prepared_network)?;
+    let hostname_policy_hosts = egress_refresh_hosts.as_deref();
+    crate::network::validate_requested_network_backend(
+        resources,
+        hostname_policy_hosts,
+        port_mappings.len(),
+    )?;
 
     // Raise file descriptor limits
     raise_fd_limits();
 
-    let resource_guard = crate::security::hardening::apply_runner_resource_confinement(prepared)?;
-    tracing::debug!(
-        hardening = %resource_guard.report().render_text(),
-        "applied runner resource confinement"
-    );
-
     let lib_dir = find_lib_dir().ok_or_else(|| {
         Error::agent(
             "find libraries",
-            "libkrun/libkrunfw not found. Build runtime libraries or set SMOLVM_LIB_DIR.",
+            "libkrun/libkrunfw not found. Install smolvm with bundled libraries or set SMOLVM_LIB_DIR.",
         )
     })?;
     let krun =
@@ -167,6 +187,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         let krun_add_vsock_port2 = krun.add_vsock_port2;
         let krun_set_console_output = krun.set_console_output;
         let krun_set_port_map = krun.set_port_map;
+        let krun_add_virtiofs = krun.add_virtiofs;
         let krun_start_enter = krun.start_enter;
         let krun_disable_implicit_vsock = krun.disable_implicit_vsock;
         let krun_add_vsock = krun.add_vsock;
@@ -195,7 +216,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         // Enable GPU if requested (virgl for OpenGL + Venus for Vulkan via virtio-gpu).
         // Requires libkrun built with `gpu` feature and host virglrenderer.
         // On macOS, also requires MoltenVK (Vulkan → Metal translation).
-        if gpu_requested {
+        if resources.gpu {
             let virgl_flags = super::gpu_virgl_flags();
             // Size the GPU shared-memory region. Caller may override
             // via `--gpu-vram <MiB>` (CLI) or `gpu_vram = N` (Smolfile);
@@ -242,19 +263,6 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             };
         }
 
-        let filesystem_report =
-            match crate::security::hardening::apply_runner_filesystem_confinement(prepared) {
-                Ok(report) => report,
-                Err(e) => {
-                    krun_free_ctx(ctx);
-                    return Err(e);
-                }
-            };
-        tracing::debug!(
-            hardening = %filesystem_report.render_text(),
-            "applied runner filesystem confinement"
-        );
-
         // Set root filesystem
         let root = try_or_free_ctx!(
             path_to_cstring(rootfs_path),
@@ -266,7 +274,8 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             return Err(Error::agent("set rootfs", "krun_set_root failed"));
         }
 
-        let network_plan = plan_launch_network(prepared_network);
+        let network_plan =
+            plan_launch_network(resources, hostname_policy_hosts, port_mappings.len());
         if let Some(reason) = network_plan.fallback_reason {
             tracing::warn!(reason = %reason.user_message(), "network backend fell back to TSI");
         }
@@ -321,7 +330,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                     return Err(Error::agent("set port mapping", "krun_set_port_map failed"));
                 }
 
-                if let Some(cidrs) = prepared_network.initial_cidrs() {
+                if let Some(ref cidrs) = resources.allowed_cidrs {
                     let Some(set_egress) = krun.set_egress_policy else {
                         krun_free_ctx(ctx);
                         return Err(Error::agent(
@@ -331,10 +340,8 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                         ));
                     };
 
-                    let mut all_cidrs = cidrs.to_vec();
-                    if prepared_network.should_allow_dns_for_egress_policy() {
-                        crate::data::network::ensure_dns_in_cidrs(&mut all_cidrs);
-                    }
+                    let mut all_cidrs = cidrs.clone();
+                    crate::data::network::ensure_dns_in_cidrs(&mut all_cidrs);
 
                     let cidr_cstrings: Vec<CString> = all_cidrs
                         .iter()
@@ -446,7 +453,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
 
         // Add extra disks (e.g., source VM storage for --from-vm export)
         // These appear as /dev/vdc, /dev/vdd, ... after storage and overlay
-        for (i, disk) in extra_disks.iter().enumerate() {
+        for (i, (disk_path, read_only)) in extra_disks.iter().enumerate() {
             let block_id_str = format!("extra{}", i);
             let block_id = try_or_free_ctx!(
                 CString::new(block_id_str.as_str()),
@@ -454,23 +461,18 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                 "block id contains null byte"
             );
             let path = try_or_free_ctx!(
-                path_to_cstring(&disk.path_for_vmm),
+                path_to_cstring(disk_path),
                 "add extra disk",
                 "path contains null byte"
             );
-            if krun_add_disk2(ctx, block_id.as_ptr(), path.as_ptr(), 0, disk.read_only) < 0 {
+            if krun_add_disk2(ctx, block_id.as_ptr(), path.as_ptr(), 0, *read_only) < 0 {
                 krun_free_ctx(ctx);
                 return Err(Error::agent(
                     "add extra disk",
                     format!("krun_add_disk2 failed for extra disk {}", i),
                 ));
             }
-            tracing::debug!(
-                disk = i,
-                path = %disk.path_for_vmm.display(),
-                read_only = disk.read_only,
-                "added extra disk"
-            );
+            tracing::debug!(disk = i, path = %disk_path.display(), read_only, "added extra disk");
         }
 
         // Add vsock port for control channel (critical - host-guest communication)
@@ -496,11 +498,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             );
             // listen=false: guest connects out to this port, host receives via Unix socket
             if krun_add_vsock_port2(ctx, ports::SSH_AGENT, ssh_path.as_ptr(), false) < 0 {
-                krun_free_ctx(ctx);
-                return Err(Error::agent(
-                    "add ssh agent vsock port",
-                    "krun_add_vsock_port2 failed for SSH agent forwarding",
-                ));
+                tracing::warn!("failed to add SSH agent vsock port — SSH forwarding disabled");
             } else {
                 tracing::info!(
                     "SSH agent forwarding enabled on vsock port {}",
@@ -521,30 +519,52 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             }
         }
 
-        // Add prepared virtiofs mounts. Tags and VMM-facing paths are assigned
-        // before the launcher so future jail-path rewriting stays out of this
-        // libkrun setup code.
-        for mount in mounts.iter() {
+        // Add virtiofs mounts
+        // Each mount gets a tag like "smolvm0", "smolvm1", etc.
+        // The guest must mount these manually (or via the agent)
+        for (i, mount) in mounts.iter().enumerate() {
+            let mount_tag = HostMount::mount_tag(i);
+            let tag = try_or_free_ctx!(
+                CString::new(mount_tag.clone()),
+                "configure mount",
+                "mount tag contains null byte"
+            );
+            let host_path = try_or_free_ctx!(
+                path_to_cstring(&mount.source),
+                "configure mount",
+                "mount path contains null byte"
+            );
+
             tracing::debug!(
-                tag = %mount.tag,
-                host = %mount.host_source.display(),
-                vmm_path = %mount.source_for_vmm.display(),
-                guest = %mount.guest_target.display(),
-                read_only = mount.access.is_read_only(),
+                tag = %mount_tag,
+                host = %mount.source.display(),
+                guest = %mount.target.display(),
+                read_only = mount.read_only,
                 "adding virtiofs mount"
             );
 
-            if let Err(e) = add_virtiofs_prepared(&krun, ctx, mount) {
+            if krun_add_virtiofs(ctx, tag.as_ptr(), host_path.as_ptr()) < 0 {
                 krun_free_ctx(ctx);
-                return Err(e);
+                return Err(Error::agent(
+                    "add virtiofs mount",
+                    format!(
+                        "krun_add_virtiofs failed for '{}' - requested mount cannot be attached",
+                        mount.source.display()
+                    ),
+                ));
             }
         }
 
-        if let Some(image_mount) = preloaded_image_mount {
-            if image_mount.source_for_vmm.exists() {
-                if let Err(e) = add_virtiofs_prepared(&krun, ctx, image_mount) {
+        if let Some(image_dir) = preloaded_image_dir {
+            if image_dir.exists() {
+                let tag = cstr("smolvm_image");
+                let host_path = path_to_cstring(image_dir)?;
+                if krun_add_virtiofs(ctx, tag.as_ptr(), host_path.as_ptr()) < 0 {
                     krun_free_ctx(ctx);
-                    return Err(e);
+                    return Err(Error::agent(
+                        "add image data virtiofs",
+                        "krun_add_virtiofs failed for preloaded image data",
+                    ));
                 }
             }
         }
@@ -563,12 +583,14 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         // Pass mount info to the agent via environment
         // Format: SMOLVM_MOUNT_0=tag:guest_path:ro
         for (i, mount) in mounts.iter().enumerate() {
+            let mount_tag = HostMount::mount_tag(i);
+            let ro_flag = if mount.read_only { "ro" } else { "rw" };
             let env_val = format!(
                 "SMOLVM_MOUNT_{}={}:{}:{}",
                 i,
-                mount.tag,
-                mount.guest_target.display(),
-                mount.access.agent_flag()
+                mount_tag,
+                mount.target.display(),
+                ro_flag
             );
             if let Ok(cstr) = CString::new(env_val) {
                 env_strings.push(cstr);
@@ -593,7 +615,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         // kernel lacks the driver; without this check the user sees
         // "VM started" and discovers missing GPU only when their
         // workload hits a rendering call.
-        if gpu_requested {
+        if resources.gpu {
             let gpu_env = format!("{}={}", ENV_SMOLVM_GPU, ENV_VALUE_ON);
             if let Ok(cs) = CString::new(gpu_env) {
                 env_strings.push(cs);
@@ -629,7 +651,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             env_strings.push(cstr(&format!("{}={}", guest_env::DNS, network.dns_server)));
         }
 
-        if preloaded_image_mount.is_some_and(|mount| mount.source_for_vmm.exists()) {
+        if preloaded_image_dir.is_some_and(|d| d.exists()) {
             env_strings.push(cstr("SMOLVM_PRELOADED_IMAGE=smolvm_image:/preloaded_image"));
         }
 
@@ -656,13 +678,13 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         //
         // Each cycle: resolve all hosts → build fresh list → single write-lock
         // swap. If all hosts fail to resolve, the previous list is kept intact.
-        if let Some(hosts) = prepared_network.refresh_hosts() {
+        if let Some(hosts) = egress_refresh_hosts.as_ref().filter(|h| !h.is_empty()) {
             if let Some(krun_get_egress_handle) = krun.get_egress_handle {
                 let raw_handle = krun_get_egress_handle(ctx);
 
                 if !raw_handle.is_null() {
                     let arc: EgressArc = *Box::from_raw(raw_handle as *mut EgressArc);
-                    let hosts_copy = hosts.to_vec();
+                    let hosts_copy = hosts.clone();
                     if let Err(e) = std::thread::Builder::new()
                         .name("egress-refresh".into())
                         .spawn(move || {
@@ -722,46 +744,17 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             }
         }
 
-        let syscall_policy =
-            crate::security::hardening::RunnerSyscallPolicy::from_prepared(prepared);
-        let syscall_report =
-            match crate::security::hardening::apply_runner_syscall_confinement(syscall_policy) {
-                Ok(report) => report,
-                Err(e) => {
-                    krun_free_ctx(ctx);
-                    return Err(e);
-                }
-            };
-        tracing::debug!(
-            hardening = %syscall_report.render_text(),
-            "applied runner syscall confinement"
-        );
-
-        // Start VM (this replaces the process on success). Keep resource
-        // confinement alive until libkrun returns on failure or VM exit.
+        // Start VM (this replaces the process on success)
         let ret = krun_start_enter(ctx);
 
         // If we get here, something went wrong — free the context before returning
         krun_free_ctx(ctx);
         drop(virtio_network_runtime);
-        drop(resource_guard);
         Err(Error::agent(
             "start vm",
             format!("krun_start_enter returned: {}", ret),
         ))
     }
-}
-
-fn add_virtiofs_prepared(krun: &KrunFunctions, ctx: u32, mount: &PreparedMount) -> Result<()> {
-    unsafe {
-        krun.add_virtiofs_path(
-            ctx,
-            &mount.tag,
-            &mount.source_for_vmm,
-            mount.access.is_read_only(),
-        )
-    }
-    .map_err(|err| Error::agent("add virtiofs mount", err.to_string()))
 }
 
 /// Create a CString from a static string that is known not to contain NUL bytes.

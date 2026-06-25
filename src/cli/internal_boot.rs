@@ -8,7 +8,6 @@
 
 use smolvm::agent::boot_config::BootConfig;
 use smolvm::agent::{launch_agent_vm, LaunchConfig, VmDisks};
-use smolvm::security::prepare::PreparedLaunch;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
@@ -22,11 +21,11 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
         libc::setsid();
     }
 
-    let prepared = prepare_launch(&config_path)?;
+    let config = read_boot_config_and_remove(&config_path)?;
 
-    if let Err(e) = redirect_stdio(&prepared) {
+    if let Err(e) = redirect_stdio(&config) {
         exit_with_startup_error(
-            &prepared.policy.startup_error_log,
+            &config.startup_error_log,
             format_args!("failed to redirect stdio: {e}"),
         );
     }
@@ -37,70 +36,33 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
     // which now point to /dev/null.
     if let Err(e) = smolvm::process::close_inherited_fds_from(3) {
         exit_with_startup_error(
-            &prepared.policy.startup_error_log,
+            &config.startup_error_log,
             format_args!("failed to close inherited file descriptors: {e}"),
         );
     }
 
-    let hardening_report = match smolvm::security::hardening::apply_runner_baseline() {
-        Ok(report) => report,
-        Err(e) => {
-            exit_with_startup_error(
-                &prepared.policy.startup_error_log,
-                format_args!("failed to apply runner hardening: {e}"),
-            );
-        }
-    };
-    tracing::debug!(
-        hardening = %hardening_report.render_text(),
-        "applied runner hardening baseline"
-    );
-
-    if let Err(e) = smolvm::security::secrets::validate_secret_grants(&prepared) {
-        exit_with_startup_error(
-            &prepared.policy.startup_error_log,
-            format_args!("failed to validate secret grants: {e}"),
-        );
-    }
-
-    let startup_error_log = prepared.policy.startup_error_log.clone();
-    let materialized = match smolvm::security::materialize::materialize_launch(prepared) {
-        Ok(materialized) => materialized,
-        Err(e) => {
-            exit_with_startup_error(
-                &startup_error_log,
-                format_args!("failed to materialize launch paths: {e}"),
-            );
-        }
-    };
-    tracing::debug!(
-        materialization = %materialized.filesystem_report().render_text(),
-        "materialized launch paths"
-    );
-    let prepared = materialized.prepared();
-
     // Open storage and overlay disks
     let storage_disk = match smolvm::storage::StorageDisk::open_or_create_at(
-        &prepared.policy.storage_disk_path,
-        prepared.policy.storage_size_gb,
+        &config.storage_disk_path,
+        config.storage_size_gb,
     ) {
         Ok(d) => d,
         Err(e) => {
             exit_with_startup_error(
-                &prepared.policy.startup_error_log,
+                &config.startup_error_log,
                 format_args!("failed to open storage disk: {e}"),
             );
         }
     };
 
     let overlay_disk = match smolvm::storage::OverlayDisk::open_or_create_at(
-        &prepared.policy.overlay_disk_path,
-        prepared.policy.overlay_size_gb,
+        &config.overlay_disk_path,
+        config.overlay_size_gb,
     ) {
         Ok(d) => d,
         Err(e) => {
             exit_with_startup_error(
-                &prepared.policy.startup_error_log,
+                &config.startup_error_log,
                 format_args!("failed to open overlay disk: {e}"),
             );
         }
@@ -113,13 +75,22 @@ pub fn run(config_path: PathBuf) -> smolvm::Result<()> {
     };
 
     let result = launch_agent_vm(&LaunchConfig {
-        prepared,
+        rootfs_path: &config.rootfs_path,
         disks: &disks,
+        vsock_socket: &config.vsock_socket,
+        console_log: config.console_log.as_deref(),
+        mounts: &config.mounts,
+        port_mappings: &config.ports,
+        resources: config.resources,
+        ssh_agent_socket: config.ssh_agent_socket.as_deref(),
+        preloaded_image_dir: config.preloaded_image_dir.as_deref(),
+        extra_disks: &config.extra_disks,
+        egress_refresh_hosts: config.egress_policy_hosts.clone(),
     });
 
     // If we get here, launch_agent_vm returned (should only happen on error)
     if let Err(ref e) = result {
-        append_startup_error(&prepared.policy.startup_error_log, e);
+        append_startup_error(&config.startup_error_log, e);
     }
 
     smolvm::process::exit_child(1);
@@ -145,17 +116,11 @@ fn append_startup_error(path: &Path, message: impl std::fmt::Display) {
         });
 }
 
-fn prepare_launch(config_path: &Path) -> smolvm::Result<PreparedLaunch> {
-    let config = read_boot_config_and_remove(config_path)?;
-    let policy = smolvm::security::policy::LaunchPolicy::from_boot_config(config)?;
-    smolvm::security::prepare::PreparedLaunch::prepare(policy)
-}
-
-fn redirect_stdio(prepared: &PreparedLaunch) -> smolvm::Result<()> {
+fn redirect_stdio(config: &BootConfig) -> smolvm::Result<()> {
     // Redirect stdio. When SMOLVM_GPU_DEBUG=1, keep stderr pointed at a
     // debug log file so virglrenderer/MoltenVK errors are captured.
     if std::env::var_os("SMOLVM_GPU_DEBUG").is_some() {
-        if let Some(ref log) = prepared.policy.console_log {
+        if let Some(ref log) = config.console_log {
             let debug_path = log.with_file_name("gpu-debug.log");
             if let Ok(cpath) = std::ffi::CString::new(debug_path.to_string_lossy().as_bytes()) {
                 unsafe {
@@ -186,7 +151,7 @@ fn redirect_stdio(prepared: &PreparedLaunch) -> smolvm::Result<()> {
         }
         Ok(())
     } else {
-        smolvm::process::detach_stdio_to_stderr_file(&prepared.policy.startup_error_log)
+        smolvm::process::detach_stdio_to_stderr_file(&config.startup_error_log)
             .map_err(|e| smolvm::Error::agent("redirect stdio", e.to_string()))
     }
 }
