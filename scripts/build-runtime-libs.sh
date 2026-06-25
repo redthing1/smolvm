@@ -153,9 +153,21 @@ build_libkrun() {
   require_cmd cargo
   require_cmd clang
   require_cmd pkg-config
-  require_pkg_config epoxy
-  require_pkg_config libdrm
-  require_pkg_config virglrenderer
+
+  local make_features=(BLK=1 NET=1)
+  case "${SMOLVM_BUILD_GPU:-0}" in
+    0|"")
+      ;;
+    1)
+      require_pkg_config epoxy
+      require_pkg_config libdrm
+      require_pkg_config virglrenderer
+      make_features+=(GPU=1)
+      ;;
+    *)
+      die "SMOLVM_BUILD_GPU must be 0 or 1"
+      ;;
+  esac
 
   echo "building libkrun from submodule..."
   local make_jobs=()
@@ -163,7 +175,8 @@ build_libkrun() {
     [[ "$SMOLVM_BUILD_JOBS" =~ ^[1-9][0-9]*$ ]] || die "SMOLVM_BUILD_JOBS must be a positive integer"
     make_jobs=(-j "$SMOLVM_BUILD_JOBS")
   fi
-  make -C "$ROOT/libkrun" "${make_jobs[@]}" BLK=1 NET=1 GPU=1
+  rm -f "$ROOT"/libkrun/target/release/libkrun.so "$ROOT"/libkrun/target/release/libkrun.so.*
+  make -C "$ROOT/libkrun" "${make_jobs[@]}" "${make_features[@]}"
 
   local lib_dir
   lib_dir="$(host_lib_dir)"
@@ -208,6 +221,8 @@ submodules into the source-tree lib directory.
 
 Environment:
   SMOLVM_BUILD_JOBS  Optional make parallelism, for example 8.
+  SMOLVM_BUILD_GPU   Set to 1 to build libkrun with GPU support. Defaults to 0
+                     so non-GPU hosts do not need virglrenderer at runtime.
 EOF
 }
 

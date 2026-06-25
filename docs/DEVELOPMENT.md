@@ -2,11 +2,9 @@
 
 ## Prerequisites
 
-- Rust toolchain
-- Linux musl Rust target for the guest agent (for example: `rustup target add x86_64-unknown-linux-musl`)
-- C compiler, `make`, `curl`, `tar`, Python 3, `flex`, `bison`, and `bc` for building `libkrunfw`
-- `clang`/libclang, `pkg-config`, plus `epoxy`, `libdrm`, and `virglrenderer` development files for the `GPU=1` libkrun build
-- e2fsprogs (for storage template creation; `mkfs.ext4`; on macOS: `brew install e2fsprogs`)
+- Linux: rootless Podman and KVM access to run VMs
+- macOS: Rust toolchain, C compiler, `make`, `curl`, `tar`, Python 3,
+  `flex`, `bison`, `bc`, and e2fsprogs (`brew install e2fsprogs`)
 - LLVM (macOS only, for building libkrun: `brew install llvm`)
 - [cargo-make](https://github.com/sagiegurari/cargo-make) is optional
 
@@ -23,6 +21,10 @@ For normal local source builds:
 
 The wrappers build the local CLI and guest agent rootfs, then run `smolvm` with
 the source-tree `libkrun`/`libkrunfw` and `target/agent-rootfs` paths.
+
+On Linux, `./scripts/build.sh` uses the repository's rootless Podman builder
+(`Containerfile.builder`); build-only toolchains and headers stay out of the
+host environment.
 
 You can also use [`cargo-make`](https://github.com/sagiegurari/cargo-make) if
 you prefer task aliases. The tasks delegate to the repository scripts:
@@ -130,21 +132,14 @@ Other scripts:
 current host. The generated libraries are local build artifacts under `lib/`,
 not source-controlled inputs.
 
-```bash
-# Build both runtime libraries
-./scripts/build-runtime-libs.sh
+`./scripts/build.sh` builds these automatically before building the CLI and
+agent rootfs. On Linux this happens inside the rootless Podman builder. Set
+`SMOLVM_BUILD_JOBS=8` if you want explicit make parallelism.
 
-# Or build one side
-./scripts/build-runtime-libs.sh libkrunfw
-./scripts/build-runtime-libs.sh libkrun
-```
-
-`./scripts/build.sh` runs this automatically before building the CLI and agent
-rootfs. Set `SMOLVM_BUILD_JOBS=8` if you want explicit make parallelism.
-
-GPU-enabled `libkrun` links against host GPU libraries such as virglrenderer and
-libepoxy. Those are host build/runtime dependencies, not binaries fetched or
-tracked by this repository.
+The default Linux source build leaves GPU support out of `libkrun` so non-GPU
+hosts do not need virglrenderer at runtime. To build the GPU-enabled variant,
+use `SMOLVM_BUILD_GPU=1 ./scripts/build.sh`; GPU runtime support remains a host
+system dependency.
 
 ## Troubleshooting
 

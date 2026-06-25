@@ -407,8 +407,10 @@ else
 
     if [[ -z "$AGENT_BINARY" ]] || [[ ! -f "$AGENT_BINARY" ]]; then
         echo "Error: Cannot build smolvm-agent"
-        echo "Install the target with: rustup target add $RUST_TARGET"
-        echo "Or set AGENT_BINARY=/path/to/smolvm-agent"
+        echo "Linux source builds are run through the rootless Podman builder:"
+        echo "  ./scripts/build.sh"
+        echo "For this internal script, set AGENT_BINARY=/path/to/smolvm-agent or use"
+        echo "a builder environment with the $RUST_TARGET Rust target installed."
         exit 1
     fi
 fi

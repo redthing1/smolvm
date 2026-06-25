@@ -24,15 +24,15 @@ host_lib_dir() {
 [[ -d "$ROOTFS" ]] || die "$ROOTFS not found; run ./scripts/build.sh"
 
 LIB_DIR="$(host_lib_dir)"
-[[ -d "$LIB_DIR" ]] || die "$LIB_DIR not found; run ./scripts/build-runtime-libs.sh"
+[[ -d "$LIB_DIR" ]] || die "$LIB_DIR not found; run ./scripts/build.sh"
 case "$(uname -s)" in
   Linux)
-    [[ -e "$LIB_DIR/libkrun.so" ]] || die "$LIB_DIR/libkrun.so not found; run ./scripts/build-runtime-libs.sh"
-    [[ -e "$LIB_DIR/libkrunfw.so" ]] || die "$LIB_DIR/libkrunfw.so not found; run ./scripts/build-runtime-libs.sh"
+    [[ -e "$LIB_DIR/libkrun.so" ]] || die "$LIB_DIR/libkrun.so not found; run ./scripts/build.sh"
+    [[ -e "$LIB_DIR/libkrunfw.so" ]] || die "$LIB_DIR/libkrunfw.so not found; run ./scripts/build.sh"
     ;;
   Darwin)
-    [[ -e "$LIB_DIR/libkrun.dylib" ]] || die "$LIB_DIR/libkrun.dylib not found; run ./scripts/build-runtime-libs.sh"
-    [[ -e "$LIB_DIR/libkrunfw.5.dylib" || -e "$LIB_DIR/libkrunfw.dylib" ]] || die "$LIB_DIR/libkrunfw.dylib not found; run ./scripts/build-runtime-libs.sh"
+    [[ -e "$LIB_DIR/libkrun.dylib" ]] || die "$LIB_DIR/libkrun.dylib not found; run ./scripts/build.sh"
+    [[ -e "$LIB_DIR/libkrunfw.5.dylib" || -e "$LIB_DIR/libkrunfw.dylib" ]] || die "$LIB_DIR/libkrunfw.dylib not found; run ./scripts/build.sh"
     ;;
 esac
 

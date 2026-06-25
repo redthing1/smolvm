@@ -211,9 +211,9 @@ Development
 
 ### Build from source
 
-Source builds need Rust, the matching Linux musl Rust target for the guest
-agent, `mkfs.ext4`, basic Unix build tools, and KVM/HVF access to run
-VMs.
+Linux source builds need rootless Podman and KVM access to run VMs. Build
+toolchains run inside the repository builder image. macOS source builds use the
+local toolchain. Set `SMOLVM_BUILD_GPU=1` for GPU-enabled Linux `libkrun`.
 
 ```bash
 ./scripts/build.sh
