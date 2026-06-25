@@ -109,7 +109,10 @@ build_libkrunfw() {
     [[ "$SMOLVM_BUILD_JOBS" =~ ^[1-9][0-9]*$ ]] || die "SMOLVM_BUILD_JOBS must be a positive integer"
     make_jobs=(-j "$SMOLVM_BUILD_JOBS")
   fi
-  make -C "$ROOT/libkrunfw" "${make_jobs[@]}"
+  (
+    cd "$ROOT/libkrunfw"
+    make "${make_jobs[@]}"
+  )
 
   local lib_dir
   lib_dir="$(host_lib_dir)"

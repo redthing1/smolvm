@@ -48,8 +48,8 @@ Provision an arm64 Linux bare-metal host (see `smolfleet/deploy/terraform/gcp`
 `arm_worker_*` or `.../aws`). Then, on the host:
 
 1. **Build the arm64 libkrun/libkrunfw libs** from the patched submodules:
-   `scripts/build-libkrun-linux.sh` → `lib/linux-aarch64/`. (Already committed;
-   rebuild only on a libkrun/libkrunfw bump.)
+   `scripts/build-runtime-libs.sh` → `lib/linux-aarch64/`. These are local
+   build outputs, not source-controlled inputs.
 2. **Build the smolvm host binary:** `cargo build --release --bin smolvm`.
    (Needs `AGENTS.md` present — it's `include_str!`'d by `main.rs`.)
 3. **Build + install the agent-rootfs:**
@@ -70,7 +70,7 @@ Discovered building on the real host; folded back into the scripts where applica
 - **`make -C libkrunfw` fails `No rule to make target 'w'`** — `-C` auto-enables
   `-w` (print-directory), which lands in `MAKEFLAGS` as a bare `w` and the
   kernel's `$(MAKE) $(MAKEFLAGS)` recipe treats it as a target. Fix: build from
-  *inside* the dir, not with `-C`. (Fixed in `build-libkrun-linux.sh`.)
+  *inside* the dir, not with `-C`. (Fixed in `build-runtime-libs.sh`.)
 - **libkrunfw needs `python3-pyelftools`** (for `bin2cbundle.py`).
 - **libkrun GPU feature needs** `libepoxy-dev` + `libvirglrenderer-dev` +
   `libdrm-dev` + `libgbm-dev` (build) and `libvirglrenderer1` + `libepoxy0`
