@@ -76,6 +76,13 @@ pub fn launch_agent_vm_dynamic(
         config.port_mappings.len(),
     )
     .map_err(|e| e.to_string())?;
+    let network_plan = plan_launch_network(&config.resources, None, config.port_mappings.len());
+    super::device_budget::validate_mmio_device_budget(super::device_budget::MmioDevicePlan {
+        block_disks: 1 + usize::from(config.overlay_path.is_some()),
+        virtiofs_devices: config.mounts.len() + usize::from(config.layers_dir.exists()),
+        network_backend: network_plan.backend,
+        gpu: config.resources.gpu,
+    })?;
 
     // Raise file descriptor limits
     raise_fd_limits();
@@ -177,8 +184,6 @@ pub fn launch_agent_vm_dynamic(
     if unsafe { (krun.set_root)(ctx, root.as_ptr()) } < 0 {
         free_ctx_on_err!("krun_set_root failed");
     }
-
-    let network_plan = plan_launch_network(&config.resources, None, config.port_mappings.len());
 
     let mut virtio_network_runtime: Option<VirtioNetworkRuntime> = None;
     let guest_network = match network_plan.backend {

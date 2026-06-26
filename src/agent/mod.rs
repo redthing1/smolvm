@@ -5,6 +5,7 @@
 
 pub mod boot_config;
 mod client;
+mod device_budget;
 pub mod fork;
 mod krun;
 mod launcher;

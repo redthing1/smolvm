@@ -360,6 +360,16 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
     } = config;
 
     crate::network::validate_requested_network_backend(resources, None, port_mappings.len())?;
+    let network_plan = select_network_plan(resources, *dns_filter_enabled, port_mappings.len());
+    super::device_budget::validate_mmio_device_budget(super::device_budget::MmioDevicePlan {
+        block_disks: 1 + usize::from(disks.overlay.is_some()) + extra_disks.len(),
+        virtiofs_devices: mounts.len()
+            + usize::from(packed_layers_dir.is_some())
+            + usize::from(preloaded_image_dir.is_some()),
+        network_backend: network_plan.backend,
+        gpu: resources.gpu,
+    })
+    .map_err(|reason| Error::agent("validate device budget", reason))?;
 
     // Raise file descriptor limits
     raise_fd_limits();
@@ -512,8 +522,6 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             krun_free_ctx(ctx);
             return Err(Error::agent("set rootfs", "krun_set_root failed"));
         }
-
-        let network_plan = select_network_plan(resources, *dns_filter_enabled, port_mappings.len());
 
         let mut virtio_network_runtime: Option<VirtioNetworkRuntime> = None;
         let guest_network = match network_plan.backend {
