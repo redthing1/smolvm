@@ -33,7 +33,7 @@ pub struct ApiState {
     /// packed-layers volume while a concurrent start acquires+mounts+launches
     /// against it. Without exclusion a detach can pull the volume out from under
     /// a freshly-launched VM serving it over virtiofs, or a guest launched in the
-    /// detach window hits the launcher's missing-dir error (review finding #3).
+    /// detach window hits the launcher's missing-dir error.
     /// Each lifecycle handler `.lock().await`s this per-name async mutex as its
     /// outermost lock — before any DB read or `MachineEntry` mutex — and holds it
     /// for the whole operation, so mount and detach can never interleave for one
@@ -79,6 +79,9 @@ pub struct MachineEntry {
     /// virtiofs instead of having the guest pull from a registry. `None` for
     /// image/registry-sourced machines. Mirrors `VmRecord::source_smolmachine`.
     pub source_smolmachine: Option<String>,
+    /// Imported-image key from smolvm's local image store, if this machine was
+    /// created from an imported image reference.
+    pub source_imported_image: Option<String>,
 }
 
 /// Parameters for registering a new machine.
@@ -101,6 +104,8 @@ pub struct MachineRegistration {
     pub image_user: Option<String>,
     /// Path to .smolmachine sidecar this machine was created from.
     pub source_smolmachine: Option<String>,
+    /// Imported-image key from smolvm's local image store.
+    pub source_imported_image: Option<String>,
     /// Container entrypoint (from manifest).
     pub entrypoint: Vec<String>,
     /// Container cmd (from manifest).
@@ -299,6 +304,7 @@ impl ApiState {
                             network: record.network,
                             secret_refs: record.secret_refs.clone(),
                             source_smolmachine: record.source_smolmachine.clone(),
+                            source_imported_image: record.source_imported_image.clone(),
                         })),
                     );
                     loaded.push(name.clone());
@@ -686,7 +692,9 @@ impl ApiState {
         record.allowed_cidrs = reg.resources.allowed_cidrs.clone();
         record.network_backend = reg.resources.network_backend;
         record.image = reg.image;
+        record.image_user = reg.image_user;
         record.source_smolmachine = reg.source_smolmachine.clone();
+        record.source_imported_image = reg.source_imported_image.clone();
         record.entrypoint = reg.entrypoint;
         record.cmd = reg.cmd;
         record.env = reg.env;
@@ -717,6 +725,7 @@ impl ApiState {
                         network: reg.network,
                         secret_refs: reg.secret_refs,
                         source_smolmachine: reg.source_smolmachine,
+                        source_imported_image: reg.source_imported_image,
                     })),
                 );
                 Ok(())
@@ -875,29 +884,29 @@ where
 
 /// Build `LaunchFeatures` for an API-driven machine start.
 ///
-/// Thin wrapper over [`crate::agent::LaunchFeatures::with_packed_layers`]
-/// — the single source of truth shared with the CLI and embedded start paths.
-/// When the machine was created from a `.smolmachine` artifact
-/// (`source_smolmachine` is set), its pre-extracted OCI layers — extracted into
-/// the machine's own data dir at create time, keyed by `machine_name` — are
-/// mounted via virtiofs so the guest uses them instead of pulling from a
-/// registry; otherwise default features are returned. Without it the three API
-/// start entrypoints (`start_machine`, `ensure_machine_running`, supervisor
-/// restart) would pass `packed_layers_dir = None` and the guest would fall back
-/// to a network pull. Performs blocking filesystem work — call from within a
+/// This wires host-local image sources into the shared launcher contract:
+/// `.smolmachine` packed layers via `with_packed_layers`, and imported images
+/// via smolvm's preloaded-image mount. Without it the API start entrypoints
+/// would pass no host image data and the guest could fall back to a registry
+/// pull. Performs blocking filesystem work — call from within a
 /// `spawn_blocking` context.
 pub fn build_launch_features(
     machine_name: Option<&str>,
     source_smolmachine: Option<&str>,
+    source_imported_image: Option<&str>,
 ) -> crate::Result<crate::agent::LaunchFeatures> {
     let features = crate::agent::LaunchFeatures::default();
-    match machine_name {
+    let mut features = match machine_name {
         Some(name) => features.with_packed_layers(
             &crate::agent::machine_layers_cache_dir(name),
             source_smolmachine,
         ),
         None => Ok(features),
+    }?;
+    if features.packed_layers_dir.is_none() {
+        features.set_imported_image_source(source_imported_image)?;
     }
+    Ok(features)
 }
 
 /// Ensure a machine is running, starting it if needed.
@@ -909,7 +918,7 @@ pub fn build_launch_features(
 /// On the not-already-up path this mounts the machine's macOS layers volume, so
 /// callers MUST hold the per-machine lifecycle lock (see `ensure_running_and_persist`,
 /// the only caller) for the duration, or the mount can race a concurrent
-/// stop/delete detach (review finding #3).
+/// stop/delete detach.
 pub async fn ensure_machine_running(
     entry: &Arc<parking_lot::Mutex<MachineEntry>>,
 ) -> crate::Result<()> {
@@ -942,7 +951,11 @@ pub async fn ensure_machine_running(
         let features = if entry.manager.try_connect_existing().is_some() {
             crate::agent::LaunchFeatures::default()
         } else {
-            build_launch_features(entry.manager.name(), entry.source_smolmachine.as_deref())?
+            build_launch_features(
+                entry.manager.name(),
+                entry.source_smolmachine.as_deref(),
+                entry.source_imported_image.as_deref(),
+            )?
         };
         entry
             .manager
@@ -1258,6 +1271,7 @@ mod tests {
                 network: false,
                 secret_refs: Default::default(),
                 source_smolmachine: None,
+                source_imported_image: None,
             },
         );
 

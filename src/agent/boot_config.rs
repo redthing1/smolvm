@@ -53,6 +53,9 @@ pub struct BootConfig {
     /// Pre-extracted OCI layers directory for .smolmachine-sourced machines.
     #[serde(default)]
     pub packed_layers_dir: Option<PathBuf>,
+    /// Imported-image data directory from smolvm's local image store.
+    #[serde(default)]
+    pub preloaded_image_dir: Option<PathBuf>,
     /// Additional disk images to attach (path, read_only, format). The format
     /// lets the `pack --from-vm` exporter attach a source qcow2 disk read-only.
     #[serde(default)]

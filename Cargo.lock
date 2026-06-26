@@ -2202,6 +2202,7 @@ dependencies = [
  "parking_lot",
  "serde",
  "serde_json",
+ "smolvm-pack",
  "smolvm-protocol",
  "tar",
  "tempfile",

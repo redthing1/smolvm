@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 smolvm-protocol = { path = "../smolvm-protocol", version = "1.2.4" }
+smolvm-pack = { path = "../smolvm-pack", version = "1.2.4", default-features = false }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }

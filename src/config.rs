@@ -695,6 +695,16 @@ impl VmRecord {
             dns: self.dns,
         }
     }
+
+    /// Effective container user for image workloads.
+    ///
+    /// `user` is an explicit machine override. `image_user` is the OCI image's
+    /// default user captured at create/first-pull time. Workload start and exec
+    /// must use the same precedence so a persistent image machine does not start
+    /// its main container as root while later execs use the image identity.
+    pub fn effective_container_user(&self) -> Option<String> {
+        self.user.clone().or_else(|| self.image_user.clone())
+    }
 }
 
 #[cfg(test)]
@@ -1054,6 +1064,24 @@ mod tests {
         let default_record = VmRecord::new("default".to_string(), 1, 512, vec![], vec![], false);
         assert_eq!(default_record.gpu, None);
         assert!(!default_record.vm_resources().gpu);
+    }
+
+    #[test]
+    fn effective_container_user_prefers_explicit_user_then_image_user() {
+        let mut record = VmRecord::new("user-test".to_string(), 1, 512, vec![], vec![], false);
+        assert_eq!(record.effective_container_user(), None);
+
+        record.image_user = Some("image-user".to_string());
+        assert_eq!(
+            record.effective_container_user().as_deref(),
+            Some("image-user")
+        );
+
+        record.user = Some("explicit-user".to_string());
+        assert_eq!(
+            record.effective_container_user().as_deref(),
+            Some("explicit-user")
+        );
     }
 
     #[test]

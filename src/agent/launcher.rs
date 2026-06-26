@@ -161,6 +161,10 @@ pub struct LaunchFeatures {
     /// When set, the launcher mounts this directory via virtiofs so the agent
     /// can use pre-extracted layers instead of pulling from a registry.
     pub packed_layers_dir: Option<std::path::PathBuf>,
+    /// Imported-image data directory from smolvm's host-local image store.
+    /// Mounted via virtiofs so the agent can materialize the imported OCI archive
+    /// without pulling from a registry.
+    pub preloaded_image_dir: Option<std::path::PathBuf>,
     /// Additional disk images to attach to the VM (path, read_only, format).
     /// Appear as /dev/vdc, /dev/vdd, ... after the storage and overlay disks.
     pub extra_disks: Vec<(std::path::PathBuf, bool, DiskFormat)>,
@@ -248,6 +252,30 @@ impl LaunchFeatures {
 
         Ok(self)
     }
+
+    /// Wire imported image data from smolvm's host-local image store.
+    pub fn set_preloaded_image_data(&mut self, image_data_dir: &Path) -> Result<()> {
+        if !image_data_dir.is_dir() {
+            return Err(Error::agent(
+                "prepare imported image",
+                format!(
+                    "imported image data directory not found at {}. Re-import the image.",
+                    image_data_dir.display()
+                ),
+            ));
+        }
+        self.preloaded_image_dir = Some(image_data_dir.to_path_buf());
+        Ok(())
+    }
+
+    /// Wire a persisted imported-image key from smolvm's host-local image store.
+    pub fn set_imported_image_source(&mut self, source_imported_image: Option<&str>) -> Result<()> {
+        let Some(key) = source_imported_image else {
+            return Ok(());
+        };
+        let image_data_dir = crate::image_store::ImageStore::open()?.image_data_dir(key);
+        self.set_preloaded_image_data(&image_data_dir)
+    }
 }
 
 /// Configuration for launching an agent VM.
@@ -274,6 +302,9 @@ pub struct LaunchConfig<'a> {
     /// Pre-extracted OCI layers directory for .smolmachine-sourced machines.
     /// Mounted via virtiofs as "smolvm_layers" so the agent uses packed layers.
     pub packed_layers_dir: Option<&'a Path>,
+    /// Imported-image data directory from smolvm's local image store.
+    /// Mounted via virtiofs as "smolvm_image" so the agent uses preloaded image data.
+    pub preloaded_image_dir: Option<&'a Path>,
     /// Additional disk images (path, read_only, format). Appear as /dev/vdc, /dev/vdd, ...
     pub extra_disks: &'a [(std::path::PathBuf, bool, DiskFormat)],
     /// Whether DNS filtering was configured for this launch, even if the
@@ -321,6 +352,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         ssh_agent_socket,
         dns_filter_socket,
         packed_layers_dir,
+        preloaded_image_dir,
         extra_disks,
         dns_filter_enabled,
         egress_refresh_hosts,
@@ -933,6 +965,32 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             }
         }
 
+        // Mount imported-image data from smolvm's local image store.
+        // The agent detects this via SMOLVM_PRELOADED_IMAGE and materializes the
+        // OCI archive into guest storage instead of pulling from a registry.
+        if let Some(image_dir) = preloaded_image_dir {
+            if image_dir.is_dir() {
+                let tag = cstr("smolvm_image");
+                let host_path = path_to_cstring(image_dir)?;
+                if krun_add_virtiofs(ctx, tag.as_ptr(), host_path.as_ptr()) < 0 {
+                    krun_free_ctx(ctx);
+                    return Err(Error::agent(
+                        "add imported image virtiofs",
+                        "krun_add_virtiofs failed for imported image data",
+                    ));
+                }
+            } else {
+                krun_free_ctx(ctx);
+                return Err(Error::agent(
+                    "add imported image virtiofs",
+                    format!(
+                        "imported image data directory not found at {}. Re-import the image.",
+                        image_dir.display()
+                    ),
+                ));
+            }
+        }
+
         boot_timing!("devices configured");
 
         // Set working directory
@@ -1060,6 +1118,9 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         // Tell the agent about pre-extracted packed layers
         if packed_layers_dir.is_some_and(|d| d.exists()) {
             env_strings.push(cstr("SMOLVM_PACKED_LAYERS=smolvm_layers:/packed_layers"));
+        }
+        if preloaded_image_dir.is_some_and(|d| d.is_dir()) {
+            env_strings.push(cstr("SMOLVM_PRELOADED_IMAGE=smolvm_image:/preloaded_image"));
         }
 
         let mut envp: Vec<*const libc::c_char> = env_strings.iter().map(|s| s.as_ptr()).collect();

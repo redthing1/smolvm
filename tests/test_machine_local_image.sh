@@ -3,15 +3,17 @@
 # Local / Offline Image Tests
 #
 # Exercises booting a machine from a local image source with NO registry:
-#   - a `docker save` archive passed as a file (--image ./image.tar)
+#   - a container-engine save archive passed as a file (--image ./image.tar)
 #   - the same archive streamed on stdin (--image -)
 #   - an unpacked rootfs directory (--image ./rootfs/)
+#   - an imported OCI archive registered in smolvm's image store
 # plus persistent create/start/restart from an archive and the stdin-conflict
 # guard. None of these tests pass --net: booting without networking proves the
 # image is sourced locally and no pull happens.
 #
-# Requires docker (to produce the archive/rootfs fixtures). Skips cleanly when
-# docker is unavailable.
+# Requires docker or podman to produce the archive/rootfs fixtures. The imported
+# image-store test uses podman when available because `smolvm image import
+# --oci-archive` must receive an OCI archive, not Docker's save format.
 #
 # Part of the smolvm test suite. Run with: ./tests/test_machine_local_image.sh
 #
@@ -25,22 +27,56 @@ kill_orphan_smolvm_processes
 # Fixtures built once for the whole suite.
 FIXTURE_DIR=""
 ARCHIVE=""
+OCI_ARCHIVE=""
 ROOTFS_DIR=""
+CONTAINER_ENGINE=""
+CONTAINER_IMAGE=""
+
+find_container_engine() {
+    if command -v podman >/dev/null 2>&1; then
+        echo "podman"
+    elif command -v docker >/dev/null 2>&1; then
+        echo "docker"
+    fi
+}
 
 build_fixtures() {
+    CONTAINER_ENGINE=$(find_container_engine)
+    [[ -n "$CONTAINER_ENGINE" ]] || return 1
+    CONTAINER_IMAGE="${SMOLVM_TEST_IMAGE:-}"
+    if [[ -z "$CONTAINER_IMAGE" ]]; then
+        for candidate in alpine:latest docker.io/library/alpine:latest; do
+            if $CONTAINER_ENGINE image inspect "$candidate" >/dev/null 2>&1; then
+                CONTAINER_IMAGE="$candidate"
+                break
+            fi
+        done
+    fi
+    [[ -n "$CONTAINER_IMAGE" ]] || return 1
+
     FIXTURE_DIR=$(mktemp -d)
     ARCHIVE="$FIXTURE_DIR/alpine-save.tar"
+    OCI_ARCHIVE="$FIXTURE_DIR/alpine.oci.tar"
     ROOTFS_DIR="$FIXTURE_DIR/alpine-rootfs"
 
-    # docker-save archive (OCI image tarball, multi-layer with config).
-    docker save alpine:latest -o "$ARCHIVE" 2>/dev/null || return 1
+    # Docker-compatible save archive (multi-layer with config), accepted by the
+    # local `--image <archive>` resolver.
+    if [[ "$CONTAINER_ENGINE" == "podman" ]]; then
+        podman save --format docker-archive -o "$ARCHIVE" "$CONTAINER_IMAGE" 2>/dev/null || return 1
+        # True OCI archive for `smolvm image import --oci-archive`.
+        podman save --format oci-archive --uncompressed -o "$OCI_ARCHIVE" "$CONTAINER_IMAGE" 2>/dev/null || return 1
+    else
+        docker save "$CONTAINER_IMAGE" -o "$ARCHIVE" 2>/dev/null || return 1
+        # Docker cannot emit OCI archives; the imported-image test will skip.
+        OCI_ARCHIVE=""
+    fi
 
-    # Unpacked rootfs (flat filesystem) via docker export.
+    # Unpacked rootfs (flat filesystem) via container export.
     mkdir -p "$ROOTFS_DIR"
     local cid
-    cid=$(docker create alpine:latest 2>/dev/null) || return 1
-    docker export "$cid" 2>/dev/null | tar -x -C "$ROOTFS_DIR" 2>/dev/null
-    docker rm "$cid" >/dev/null 2>&1 || true
+    cid=$($CONTAINER_ENGINE create "$CONTAINER_IMAGE" 2>/dev/null) || return 1
+    $CONTAINER_ENGINE export "$cid" 2>/dev/null | tar -x -C "$ROOTFS_DIR" 2>/dev/null
+    $CONTAINER_ENGINE rm "$cid" >/dev/null 2>&1 || true
 
     [[ -s "$ARCHIVE" ]] && [[ -d "$ROOTFS_DIR/bin" ]]
 }
@@ -48,9 +84,14 @@ build_fixtures() {
 cleanup_local_image() {
     $SMOLVM machine stop --name "$PERSIST_VM" 2>/dev/null || true
     $SMOLVM machine delete --name "$PERSIST_VM" -f 2>/dev/null || true
-    [[ -n "$FIXTURE_DIR" ]] && rm -rf "$FIXTURE_DIR"
+    $SMOLVM machine stop --name "$IMPORTED_VM" 2>/dev/null || true
+    $SMOLVM machine delete --name "$IMPORTED_VM" -f 2>/dev/null || true
+    [[ -n "$IMPORTED_REF" ]] && $SMOLVM image rm "$IMPORTED_REF" >/dev/null 2>&1 || true
+    [[ -n "$FIXTURE_DIR" ]] && rm -rf "$FIXTURE_DIR" || true
 }
 PERSIST_VM="local-image-persist-$$"
+IMPORTED_VM="imported-image-persist-$$"
+IMPORTED_REF="imported-offline-$$:latest"
 trap cleanup_local_image EXIT
 
 echo ""
@@ -59,14 +100,14 @@ echo "  Local / Offline Image Tests"
 echo "=========================================="
 echo ""
 
-if ! command -v docker >/dev/null 2>&1; then
-    log_skip "docker not available — local-image fixtures cannot be built"
+if [[ -z "$(find_container_engine)" ]]; then
+    log_skip "docker/podman not available — local-image fixtures cannot be built"
     print_summary "Local Image Tests"
     exit 0
 fi
 
 if ! build_fixtures; then
-    log_skip "could not build docker fixtures (is the docker daemon running?)"
+    log_skip "could not build container fixtures (is the selected engine running and is alpine:latest local?)"
     print_summary "Local Image Tests"
     exit 0
 fi
@@ -187,11 +228,51 @@ test_persistent_create_start_restart() {
     $SMOLVM machine delete --name "$PERSIST_VM" -f 2>/dev/null || true
 }
 
-run_test "Ephemeral: boot from docker-save archive file (offline)" test_ephemeral_from_archive_file || true
+# Persistent lifecycle from an imported image-store reference. This proves
+# `smolvm image import` is a real offline image source for machine start, not
+# just metadata for pruning/listing.
+test_persistent_from_imported_image_offline() {
+    if [[ -z "$OCI_ARCHIVE" ]]; then
+        log_skip "podman not available — cannot produce an OCI archive for smolvm image import"
+        return 0
+    fi
+
+    $SMOLVM machine delete --name "$IMPORTED_VM" -f 2>/dev/null || true
+    $SMOLVM image rm "$IMPORTED_REF" >/dev/null 2>&1 || true
+
+    $SMOLVM image import \
+        --oci-archive "$OCI_ARCHIVE" \
+        --tag "$IMPORTED_REF" \
+        --source-id "test-imported-$$" 2>&1 || {
+        echo "FAIL: image import failed"; return 1
+    }
+
+    $SMOLVM machine create --name "$IMPORTED_VM" --image "$IMPORTED_REF" 2>&1 || {
+        echo "FAIL: create from imported image failed"; return 1
+    }
+
+    run_with_timeout 90 $SMOLVM machine start --name "$IMPORTED_VM" 2>&1 || {
+        echo "FAIL: start from imported image failed"; return 1
+    }
+
+    local output
+    output=$(run_with_timeout 30 $SMOLVM machine exec --name "$IMPORTED_VM" \
+        -- sh -c 'cat /etc/os-release | head -1' 2>&1)
+    echo "$output" | grep -q "Alpine" || {
+        echo "FAIL: expected Alpine rootfs from imported image, got: $output"; return 1
+    }
+
+    $SMOLVM machine stop --name "$IMPORTED_VM" 2>/dev/null || true
+    $SMOLVM machine delete --name "$IMPORTED_VM" -f 2>/dev/null || true
+    $SMOLVM image rm "$IMPORTED_REF" 2>/dev/null || true
+}
+
+run_test "Ephemeral: boot from saved archive file (offline)" test_ephemeral_from_archive_file || true
 run_test "Ephemeral: boot from archive on stdin (--image -)" test_ephemeral_from_stdin || true
 run_test "Ephemeral: boot from unpacked rootfs dir (#398)" test_ephemeral_from_rootfs_dir || true
 run_test "Guard: --image - with -it rejected before boot" test_stdin_guard_rejects_interactive || true
 run_test "Guard: Dockerfile rejected with build-first hint" test_dockerfile_rejected_with_hint || true
 run_test "Persistent: create/start/restart from archive" test_persistent_create_start_restart || true
+run_test "Persistent: create/start from imported image (offline)" test_persistent_from_imported_image_offline || true
 
 print_summary "Local Image Tests"

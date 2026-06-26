@@ -111,9 +111,12 @@ impl ImageStore {
             .ok_or_else(|| {
                 Error::storage("resolve image store", "could not determine data directory")
             })?;
-        Ok(Self {
-            root: data_dir.join("smolvm").join("images"),
-        })
+        Ok(Self::open_at(data_dir.join("smolvm").join("images")))
+    }
+
+    /// Open an imported-image store at an explicit root directory.
+    pub fn open_at(root: impl Into<PathBuf>) -> Self {
+        Self { root: root.into() }
     }
 
     /// Import an OCI archive into the store and bind it to `reference`.

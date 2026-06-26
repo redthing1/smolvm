@@ -216,7 +216,7 @@ impl Supervisor {
     async fn restart_machine(&self, name: &str) -> crate::Result<()> {
         // Hold the per-machine lifecycle lock across the acquire+mount+launch so a
         // concurrent user-initiated stop/delete cannot detach the macOS layers
-        // volume out from under this restart (review finding #3). Acquired before
+        // volume out from under this restart. Acquired before
         // get_machine and the entry-mutex lock taken inside the spawn_blocking
         // below, keeping the lifecycle → entry lock order that start/stop/delete
         // also follow. If a user op holds it, this restart blocks until that op
@@ -282,6 +282,7 @@ impl Supervisor {
         let ports = record.port_mappings();
         let resources = record.vm_resources();
         let source_smolmachine = record.source_smolmachine.clone();
+        let source_imported_image = record.source_imported_image.clone();
         let name_for_features = name.to_string();
 
         let entry_clone = entry.clone();
@@ -291,6 +292,7 @@ impl Supervisor {
             let features = crate::api::state::build_launch_features(
                 Some(&name_for_features),
                 source_smolmachine.as_deref(),
+                source_imported_image.as_deref(),
             )?;
             entry
                 .manager

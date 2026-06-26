@@ -2825,7 +2825,10 @@ fn materialize_preloaded_oci_archive(image_dir: &Path) -> Result<PathBuf> {
     let key = read_preloaded_image_metadata(image_dir)?
         .map(|info| info.digest)
         .and_then(|digest| {
-            let id = digest.strip_prefix("sha256:").unwrap_or(&digest).to_string();
+            let id = digest
+                .strip_prefix("sha256:")
+                .unwrap_or(&digest)
+                .to_string();
             if id.is_empty() {
                 None
             } else {
@@ -2866,12 +2869,25 @@ fn materialize_preloaded_oci_archive(image_dir: &Path) -> Result<PathBuf> {
     std::fs::create_dir_all(&image_root)?;
 
     let staging_rootfs = image_root.join("rootfs.tmp");
-    std::fs::create_dir_all(&staging_rootfs)?;
-    flatten_archive(&archive_path, &staging_rootfs)?;
+    let work_dir = image_root.join("work");
+    if let Err(e) = smolvm_pack::oci_archive::import_oci_archive_rootfs(
+        &archive_path,
+        &staging_rootfs,
+        &work_dir,
+        None,
+    ) {
+        let _ = std::fs::remove_dir_all(&image_root);
+        return Err(StorageError::new(format!(
+            "import preloaded OCI archive failed: {e}"
+        )));
+    }
     if rootfs_path.exists() {
         std::fs::remove_dir_all(&rootfs_path)?;
     }
     std::fs::rename(&staging_rootfs, &rootfs_path)?;
+    if work_dir.exists() {
+        std::fs::remove_dir_all(&work_dir)?;
+    }
     std::fs::write(&marker_path, signature)?;
 
     Ok(rootfs_path)
@@ -3085,8 +3101,7 @@ pub fn run_command(
         // If a main workload container is running for this overlay, join it
         // via crun exec instead of creating a fresh isolated container.
         if let Some(cid) = crate::resolve_main_container(persistent_overlay_id) {
-            let result =
-                run_exec_in_container(&cid, command, env, workdir, timeout_ms, client_fd);
+            let result = run_exec_in_container(&cid, command, env, workdir, timeout_ms, client_fd);
             let _ = mounted_paths;
             return result;
         }
@@ -3799,10 +3814,6 @@ fn docker_config_registry_key(registry: &str) -> &str {
     } else {
         registry
     }
-}
-
-fn blob_image_reference(image: &str) -> &str {
-    image.split_once('@').map_or(image, |(name, _)| name)
 }
 
 /// Simple base64 encoding for auth string.

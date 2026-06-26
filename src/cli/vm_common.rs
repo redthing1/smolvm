@@ -59,20 +59,42 @@ pub fn get_vm_manager(name: &Option<String>) -> smolvm::Result<AgentManager> {
 pub(crate) fn resolve_imported_image(
     image: Option<&str>,
 ) -> smolvm::Result<Option<ImportedImageRecord>> {
+    let store = ImageStore::open()?;
+    resolve_imported_image_in_store(image, &store)
+}
+
+fn resolve_imported_image_in_store(
+    image: Option<&str>,
+    store: &ImageStore,
+) -> smolvm::Result<Option<ImportedImageRecord>> {
     match image {
-        Some(image) => ImageStore::open()?.resolve(image),
+        Some(image) => store.resolve(image),
         None => Ok(None),
     }
+}
+
+#[cfg(test)]
+fn add_imported_image_launch_feature_from_store(
+    features: &mut smolvm::agent::LaunchFeatures,
+    store: &ImageStore,
+    source_imported_image: Option<&str>,
+) -> smolvm::Result<()> {
+    let Some(key) = source_imported_image else {
+        return Ok(());
+    };
+    let image_data_dir = store.image_data_dir(key);
+    features.set_preloaded_image_data(&image_data_dir)
 }
 
 fn resolve_imported_image_for_record(
     image: &Option<String>,
     source_smolmachine: &Option<String>,
+    store: &ImageStore,
 ) -> smolvm::Result<Option<ImportedImageRecord>> {
     if source_smolmachine.is_some() {
         return Ok(None);
     }
-    resolve_imported_image(image.as_deref())
+    resolve_imported_image_in_store(image.as_deref(), store)
 }
 
 /// Return the display label for an optional VM name.
@@ -569,6 +591,14 @@ impl Drop for CreateVmReservation {
 }
 
 pub(crate) fn build_vm_record(params: &CreateVmParams) -> smolvm::Result<VmRecord> {
+    let store = ImageStore::open()?;
+    build_vm_record_with_image_store(params, &store)
+}
+
+fn build_vm_record_with_image_store(
+    params: &CreateVmParams,
+    store: &ImageStore,
+) -> smolvm::Result<VmRecord> {
     // Validate name before touching the database. The on-disk layout uses
     // a hash-derived directory (see `vm_data_dir`), so the name itself has
     // no impact on socket path length — only character sanity + a generous
@@ -609,7 +639,15 @@ pub(crate) fn build_vm_record(params: &CreateVmParams) -> smolvm::Result<VmRecor
         ..Default::default()
     };
     let imported_image =
-        resolve_imported_image_for_record(&params.image, &params.source_smolmachine)?;
+        resolve_imported_image_for_record(&params.image, &params.source_smolmachine, store)?;
+    let imported_image_info = imported_image
+        .as_ref()
+        .map(smolvm::image_store::ImportedImageRecord::image_info);
+    let runtime_defaults = resolve_image_runtime_defaults(
+        imported_image_info.as_ref(),
+        &env,
+        params.workdir.as_deref(),
+    );
     let mut record = VmRecord::new_with_restart(
         params.name.clone(),
         params.cpus,
@@ -620,9 +658,9 @@ pub(crate) fn build_vm_record(params: &CreateVmParams) -> smolvm::Result<VmRecor
         restart,
     );
     record.init = params.init.clone();
-    record.env = env;
+    record.env = runtime_defaults.env;
     record.secret_refs = params.secret_refs.clone();
-    record.workdir = params.workdir.clone();
+    record.workdir = runtime_defaults.workdir;
     record.storage_gb = params.storage_gb;
     record.overlay_gb = params.overlay_gb;
     record.allowed_cidrs = params.allowed_cidrs.clone();
@@ -635,10 +673,7 @@ pub(crate) fn build_vm_record(params: &CreateVmParams) -> smolvm::Result<VmRecor
     record.gpu_vram_mib = smolvm::data::resources::validate_gpu_vram_mib(params.gpu_vram_mib)
         .map_err(|e| smolvm::Error::config("create machine", format!("gpu_vram: {}", e)))?;
     record.image = params.image.clone();
-    record.image_user = params
-        .image_user
-        .clone()
-        .or_else(|| imported_image.as_ref().and_then(|image| image.user.clone()));
+    record.image_user = params.image_user.clone().or(runtime_defaults.user);
     record.entrypoint = if params.entrypoint.is_empty() {
         imported_image
             .as_ref()
@@ -931,6 +966,9 @@ pub fn start_vm_named(
             features.packed_layers_dir = Some(dir);
         }
     }
+    if features.packed_layers_dir.is_none() {
+        features.set_imported_image_source(record.source_imported_image.as_deref())?;
+    }
 
     let _ = manager
         .ensure_running_with_full_config(mounts, ports, resources, features)
@@ -961,12 +999,13 @@ pub fn start_vm_named(
     // starts, skip both — image manifests/layers persist on the storage disk
     // and the container overlay is remounted (not recreated).
     if !record.init_completed {
-        let uses_packed_layers = record.source_smolmachine.is_some()
+        let uses_host_image_data = record.source_smolmachine.is_some()
+            || record.source_imported_image.is_some()
             || record
                 .image
                 .as_deref()
                 .is_some_and(smolvm::data::image_source::is_local_ref);
-        let image_info = if uses_packed_layers {
+        let image_info = if uses_host_image_data {
             // Layers already mounted via virtiofs — no pull needed.
             None
         } else if let Some(ref image) = record.image {
@@ -1053,7 +1092,7 @@ pub fn start_vm_named(
             let bg_config = smolvm::agent::RunConfig::new(img, cmd)
                 .with_env(exec_env.clone())
                 .with_workdir(record.workdir.clone())
-                .with_user(record.user.clone())
+                .with_user(record.effective_container_user())
                 .with_mounts(mount_bindings)
                 .with_persistent_overlay(Some(name.to_string()));
             if let Err(e) = client.run_container_detached(bg_config) {
@@ -1982,6 +2021,7 @@ pub fn cleanup_orphaned_ephemeral_vms() {
 #[cfg(test)]
 mod init_runner_tests {
     use super::*;
+    use sha2::{Digest, Sha256};
 
     fn sample_image_info(env: Vec<&str>, workdir: Option<&str>, user: Option<&str>) -> ImageInfo {
         ImageInfo {
@@ -1999,6 +2039,138 @@ mod init_runner_tests {
             workdir: workdir.map(str::to_string),
             user: user.map(str::to_string),
         }
+    }
+
+    fn image_ref_id(reference: &str) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(reference.as_bytes());
+        format!("{:x}", hasher.finalize())
+    }
+
+    fn seed_imported_image(store_root: &std::path::Path, reference: &str, key: &str) {
+        use smolvm::image_store::{ImportedImageRecord, IMAGE_OCI_ARCHIVE_FILENAME};
+
+        let image_data_dir = store_root.join("entries").join(key).join("image");
+        std::fs::create_dir_all(&image_data_dir).unwrap();
+        std::fs::write(image_data_dir.join(IMAGE_OCI_ARCHIVE_FILENAME), "archive").unwrap();
+
+        let record = ImportedImageRecord {
+            version: 2,
+            reference: reference.to_string(),
+            key: key.to_string(),
+            source_id: Some("podman-image-id".to_string()),
+            digest: "sha256:config".to_string(),
+            size: 4,
+            created_at: "1".to_string(),
+            last_used_at: "1".to_string(),
+            architecture: "amd64".to_string(),
+            os: "linux".to_string(),
+            layers: vec!["sha256:layer".to_string()],
+            entrypoint: vec!["/entry".to_string()],
+            cmd: vec!["serve".to_string()],
+            env: vec![
+                "FOO=from-image".to_string(),
+                "BAR=from-image".to_string(),
+                "BROKEN".to_string(),
+            ],
+            workdir: Some("/image-workdir".to_string()),
+            user: Some("1000:1000".to_string()),
+        };
+        let refs_dir = store_root.join("refs");
+        std::fs::create_dir_all(&refs_dir).unwrap();
+        let json = serde_json::to_string_pretty(&record).unwrap();
+        std::fs::write(
+            refs_dir.join(format!("{}.json", image_ref_id(reference))),
+            json,
+        )
+        .unwrap();
+    }
+
+    fn test_create_params(name: &str, image: Option<&str>) -> CreateVmParams {
+        CreateVmParams {
+            name: name.to_string(),
+            image: image.map(str::to_string),
+            image_user: None,
+            entrypoint: Vec::new(),
+            cmd: Vec::new(),
+            cpus: smolvm::data::resources::DEFAULT_MICROVM_CPU_COUNT,
+            mem: smolvm::data::resources::DEFAULT_MICROVM_MEMORY_MIB,
+            volume: Vec::new(),
+            port: Vec::new(),
+            net: false,
+            network_backend: None,
+            dns: None,
+            init: Vec::new(),
+            env: Vec::new(),
+            workdir: None,
+            storage_gb: None,
+            overlay_gb: None,
+            allowed_cidrs: None,
+            restart_policy: None,
+            restart_max_retries: None,
+            restart_max_backoff_secs: None,
+            health_cmd: None,
+            health_interval_secs: None,
+            health_timeout_secs: None,
+            health_retries: None,
+            health_startup_grace_secs: None,
+            ssh_agent: false,
+            gpu: false,
+            gpu_vram_mib: None,
+            egress_policy_hosts: None,
+            source_smolmachine: None,
+            secret_refs: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn build_vm_record_preserves_imported_image_source_and_defaults() {
+        let temp = tempfile::tempdir().unwrap();
+        let store_root = temp.path().join("images");
+        let store = ImageStore::open_at(&store_root);
+
+        let reference = "local/imported:latest";
+        let key = "imported-key";
+        seed_imported_image(&store_root, reference, key);
+
+        let mut params = test_create_params("imported-vm", Some(reference));
+        params.env = vec![
+            "BAR=from-explicit".to_string(),
+            "BAZ=from-explicit".to_string(),
+        ];
+
+        let record = build_vm_record_with_image_store(&params, &store).unwrap();
+
+        assert_eq!(record.source_imported_image.as_deref(), Some(key));
+        assert_eq!(record.entrypoint, ["/entry"]);
+        assert_eq!(record.cmd, ["serve"]);
+        assert_eq!(
+            record.env,
+            vec![
+                ("FOO".to_string(), "from-image".to_string()),
+                ("BAR".to_string(), "from-explicit".to_string()),
+                ("BAZ".to_string(), "from-explicit".to_string()),
+            ]
+        );
+        assert_eq!(record.workdir.as_deref(), Some("/image-workdir"));
+        assert_eq!(record.image_user.as_deref(), Some("1000:1000"));
+        assert_eq!(
+            record.effective_container_user().as_deref(),
+            Some("1000:1000")
+        );
+
+        let mut features = smolvm::agent::LaunchFeatures::default();
+        add_imported_image_launch_feature_from_store(
+            &mut features,
+            &store,
+            record.source_imported_image.as_deref(),
+        )
+        .unwrap();
+        let expected_image_dir = store.image_data_dir(key);
+        assert_eq!(
+            features.preloaded_image_dir.as_deref(),
+            Some(expected_image_dir.as_path())
+        );
     }
 
     #[test]

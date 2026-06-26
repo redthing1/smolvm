@@ -60,6 +60,16 @@ use crate::Error as SmolvmError;
 /// lives in `agent::state_probe`.
 use crate::agent::state_probe::resolve_state as resolve_machine_state;
 
+fn literal_env_strings_to_tuples(env: &[String]) -> Vec<(String, String)> {
+    env.iter()
+        .filter_map(|e| {
+            e.split_once('=')
+                .filter(|(key, _)| !key.is_empty())
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+        })
+        .collect()
+}
+
 /// Convert VmRecord to MachineInfo (pure mapping, no I/O).
 fn record_to_info(name: &str, record: &VmRecord) -> MachineInfo {
     let actual_state = resolve_machine_state(name, record);
@@ -166,6 +176,7 @@ fn machine_entry_from_record(record: &VmRecord, manager: AgentManager) -> Machin
         network: record.network,
         secret_refs: record.secret_refs.clone(),
         source_smolmachine: record.source_smolmachine.clone(),
+        source_imported_image: record.source_imported_image.clone(),
     }
 }
 
@@ -308,6 +319,7 @@ pub async fn create_machine(
     let (
         image,
         source_smolmachine,
+        source_imported_image,
         entrypoint,
         cmd,
         env,
@@ -340,14 +352,7 @@ pub async fn create_machine(
             .unwrap_or_else(|_| path.to_path_buf())
             .to_string_lossy()
             .into_owned();
-        let env_parsed: Vec<(String, String)> = manifest
-            .env
-            .iter()
-            .filter_map(|e| {
-                e.split_once('=')
-                    .map(|(k, v)| (k.to_string(), v.to_string()))
-            })
-            .collect();
+        let env_parsed = literal_env_strings_to_tuples(&manifest.env);
         // A .smolmachine is an untrusted, portable artifact: validate its secret
         // refs Untrusted, which rejects every source kind, so a packed
         // from_env/from_file can't read this host's env/files at exec time.
@@ -398,6 +403,7 @@ pub async fn create_machine(
         (
             image,
             Some(canonical),
+            None,
             manifest.entrypoint,
             manifest.cmd,
             env_parsed,
@@ -410,14 +416,34 @@ pub async fn create_machine(
             vm_seed,
         )
     } else {
+        let imported_image = match req.image.as_deref() {
+            Some(image) => crate::image_store::ImageStore::open()
+                .and_then(|store| store.resolve(image))
+                .map_err(|e| ApiError::internal(format!("resolve imported image: {}", e)))?,
+            None => None,
+        };
+        let (source_imported_image, entrypoint, cmd, env, workdir, image_user) =
+            if let Some(image) = imported_image {
+                (
+                    Some(image.key),
+                    image.entrypoint,
+                    image.cmd,
+                    literal_env_strings_to_tuples(&image.env),
+                    image.workdir,
+                    image.user,
+                )
+            } else {
+                (None, vec![], vec![], vec![], None, None)
+            };
         (
             req.image.clone(),
             None,
-            vec![],
-            vec![],
-            vec![],
-            None,
-            None,
+            source_imported_image,
+            entrypoint,
+            cmd,
+            env,
+            workdir,
+            image_user,
             crate::data::resources::DEFAULT_MICROVM_CPU_COUNT,
             crate::data::resources::DEFAULT_MICROVM_MEMORY_MIB,
             req.network,
@@ -581,6 +607,7 @@ pub async fn create_machine(
         image,
         image_user,
         source_smolmachine,
+        source_imported_image,
         entrypoint,
         cmd,
         env,
@@ -711,8 +738,8 @@ pub async fn start_machine(
 ) -> Result<Json<MachineInfo>, ApiError> {
     // Hold the per-machine lifecycle lock across the whole start so a concurrent
     // stop/delete cannot detach the macOS layers volume between our acquire+mount
-    // and the launch, nor launch a guest into the launcher's missing-dir error
-    // (review finding #3). Acquired before the DB read and resolve_state probe
+    // and the launch, nor launch a guest into the launcher's missing-dir error.
+    // Acquired before the DB read and resolve_state probe
     // below so the "is it running?" decision and the launch happen under one held
     // lock; it is the outermost lock (the entry mutex is taken later, inside the
     // spawn_blocking). Linux: the guarded detach/mount are no-ops.
@@ -793,6 +820,7 @@ pub async fn start_machine(
     let storage_gb = record.storage_gb;
     let overlay_gb = record.overlay_gb;
     let source_smolmachine = record.source_smolmachine.clone();
+    let source_imported_image = record.source_imported_image.clone();
     let forkable = query.forkable;
     let (manager, pid) = tokio::task::spawn_blocking(move || {
         let manager = AgentManager::for_vm_with_sizes(&name_clone, storage_gb, overlay_gb)
@@ -802,8 +830,9 @@ pub async fn start_machine(
         let mut features = crate::api::state::build_launch_features(
             Some(&name_clone),
             source_smolmachine.as_deref(),
+            source_imported_image.as_deref(),
         )
-        .map_err(|e| format!("failed to prepare packed layers: {}", e))?;
+        .map_err(|e| format!("failed to prepare host image data: {}", e))?;
         // Forkable start: memfd-back guest RAM and expose a control socket at the
         // machine's known path so it can later be forked via the fork endpoint.
         if forkable {
@@ -844,7 +873,7 @@ pub async fn start_machine(
             super::record_secret_refs_env(&entry)?,
         ));
         let workdir = record.workdir.clone();
-        let user = record.user.clone();
+        let user = record.effective_container_user();
         let mounts_config = {
             let e = entry.lock();
             e.mounts
@@ -996,8 +1025,9 @@ pub async fn fork_machine(
         let mut features = crate::api::state::build_launch_features(
             Some(&clone_b),
             record.source_smolmachine.as_deref(),
+            record.source_imported_image.as_deref(),
         )
-        .map_err(|e| format!("failed to prepare packed layers: {}", e))?;
+        .map_err(|e| format!("failed to prepare host image data: {}", e))?;
         // Boot from the golden's snapshot instead of cold-booting.
         features.snapshot_dir = Some(prep.snapshot_dir);
 
@@ -1065,8 +1095,8 @@ pub async fn stop_machine(
     Path(name): Path<String>,
 ) -> Result<Json<MachineInfo>, ApiError> {
     // Hold the per-machine lifecycle lock across the whole stop so the layers
-    // volume detach below cannot race a concurrent start's acquire+mount+launch
-    // (review finding #3). Acquired before the DB read and actual_state() probe
+    // volume detach below cannot race a concurrent start's acquire+mount+launch.
+    // Acquired before the DB read and actual_state() probe
     // so the liveness check and the detach act on the same held lock — without
     // it, stop could decide "running" off a snapshot a concurrent start has
     // already superseded, then detach a volume that start just mounted. Outermost
@@ -1274,7 +1304,7 @@ pub async fn delete_machine(
 ) -> Result<Json<DeleteResponse>, ApiError> {
     // Hold the per-machine lifecycle lock across the whole delete so the layers
     // volume detach (before the data-dir removal) cannot race a concurrent
-    // start's acquire+mount+launch (review finding #3). Acquired before the DB
+    // start's acquire+mount+launch. Acquired before the DB
     // read so the existence check, shutdown, detach, and removal all happen under
     // one held lock. Outermost lock; the entry mutex is not taken here. Linux:
     // detach is a no-op.

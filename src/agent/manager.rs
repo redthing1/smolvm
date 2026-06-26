@@ -1094,6 +1094,30 @@ impl AgentManager {
         Ok(())
     }
 
+    /// Re-attach imported-image data if a config-change restart dropped launch
+    /// features.
+    ///
+    /// API/embedded hot paths may pass default features when the VM is already
+    /// running because no launch data is needed for a pure reconnect. If that
+    /// request then forces a restart, the machine still must boot from its
+    /// imported image instead of falling back to a registry pull. The persisted
+    /// VM record carries the imported-image key, so recover it here.
+    fn rewire_preloaded_image_if_imported(
+        &self,
+        features: &mut launcher::LaunchFeatures,
+    ) -> Result<()> {
+        if features.packed_layers_dir.is_some() || features.preloaded_image_dir.is_some() {
+            return Ok(());
+        }
+        let Some(name) = self.name.as_deref() else {
+            return Ok(());
+        };
+        let source_imported_image = crate::db::SmolvmDb::open()?
+            .get_vm(name)?
+            .and_then(|record| record.source_imported_image);
+        features.set_imported_image_source(source_imported_image.as_deref())
+    }
+
     /// Ensure the agent is running with the specified mounts, ports, and resources.
     ///
     /// If the agent is running with different configuration, it will be restarted.
@@ -1154,6 +1178,7 @@ impl AgentManager {
         // Re-attach packed layers if a config-change restart dropped them
         // (see `rewire_packed_layers_if_extracted`).
         self.rewire_packed_layers_if_extracted(&mut features)?;
+        self.rewire_preloaded_image_if_imported(&mut features)?;
 
         // Start with new config
         self.start_with_full_config(mounts, ports, resources, features)?;
@@ -1626,6 +1651,7 @@ impl AgentManager {
             ssh_agent_socket: features.ssh_agent_socket,
             dns_filter_hosts: features.dns_filter_hosts,
             packed_layers_dir: features.packed_layers_dir,
+            preloaded_image_dir: features.preloaded_image_dir,
             extra_disks: features.extra_disks,
         };
         let config_path = self
@@ -1807,6 +1833,7 @@ impl AgentManager {
         // Re-attach packed layers if a config-change restart dropped them
         // (see `rewire_packed_layers_if_extracted`).
         self.rewire_packed_layers_if_extracted(&mut features)?;
+        self.rewire_preloaded_image_if_imported(&mut features)?;
 
         self.start_via_subprocess(mounts, ports, resources, features)?;
         Ok(true)

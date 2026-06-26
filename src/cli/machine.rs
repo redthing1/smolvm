@@ -847,17 +847,15 @@ impl RunCmd {
         )?;
 
         let mut params = params;
-        params.egress_policy_hosts = match (
-            params.egress_policy_hosts.take(),
-            cli_egress_policy_hosts,
-        ) {
-            (Some(mut from_smolfile), Some(mut from_cli)) => {
-                from_smolfile.append(&mut from_cli);
-                Some(from_smolfile)
-            }
-            (Some(from_smolfile), None) => Some(from_smolfile),
-            (None, some) => some,
-        };
+        params.egress_policy_hosts =
+            match (params.egress_policy_hosts.take(), cli_egress_policy_hosts) {
+                (Some(mut from_smolfile), Some(mut from_cli)) => {
+                    from_smolfile.append(&mut from_cli);
+                    Some(from_smolfile)
+                }
+                (Some(from_smolfile), None) => Some(from_smolfile),
+                (None, some) => some,
+            };
         // CLI `--secret-env`/`--secret-file` refs merge over any Smolfile
         // `[secrets]` of the same name (CLI wins).
         for (key, r) in parse_cli_secret_refs(&self.secret_env, &self.secret_file)? {
@@ -1032,6 +1030,7 @@ impl RunCmd {
         }
 
         let imported_image = vm_common::resolve_imported_image(image.as_deref())?;
+        let imported_image_info = imported_image.as_ref().map(|image| image.image_info());
 
         let ssh_agent_socket = if self.ssh_agent || params.ssh_agent {
             match std::env::var("SSH_AUTH_SOCK") {
@@ -1071,13 +1070,18 @@ impl RunCmd {
         };
         let uses_packed_layers = packed_layers_dir.is_some();
 
-        let features = smolvm::agent::LaunchFeatures {
+        let mut features = smolvm::agent::LaunchFeatures {
             ssh_agent_socket,
             dns_filter_hosts: params.egress_policy_hosts.clone(),
             packed_layers_dir,
             extra_disks: Vec::new(),
             ..Default::default()
         };
+        if features.packed_layers_dir.is_none() {
+            features.set_imported_image_source(
+                imported_image.as_ref().map(|image| image.key.as_str()),
+            )?;
+        }
 
         let freshly_started = manager
             .ensure_running_with_full_config(mounts.clone(), ports, resources, features)
@@ -1111,6 +1115,8 @@ impl RunCmd {
         // mounted via virtiofs and the guest assembles its rootfs from them.
         let image_info = if uses_packed_layers {
             None
+        } else if imported_image_info.is_some() {
+            imported_image_info
         } else if let Some(ref img) = image {
             match crate::cli::pull_with_progress(
                 &mut client,
@@ -2187,17 +2193,15 @@ impl CreateCmd {
             cli_allow_cidrs,
         )?;
         let mut params = params;
-        params.egress_policy_hosts = match (
-            params.egress_policy_hosts.take(),
-            cli_egress_policy_hosts,
-        ) {
-            (Some(mut from_smolfile), Some(mut from_cli)) => {
-                from_smolfile.append(&mut from_cli);
-                Some(from_smolfile)
-            }
-            (Some(from_smolfile), None) => Some(from_smolfile),
-            (None, some) => some,
-        };
+        params.egress_policy_hosts =
+            match (params.egress_policy_hosts.take(), cli_egress_policy_hosts) {
+                (Some(mut from_smolfile), Some(mut from_cli)) => {
+                    from_smolfile.append(&mut from_cli);
+                    Some(from_smolfile)
+                }
+                (Some(from_smolfile), None) => Some(from_smolfile),
+                (None, some) => some,
+            };
         // CLI `--secret-env`/`--secret-file` refs merge over any Smolfile
         // `[secrets]` of the same name (CLI wins). Only refs are persisted.
         for (key, r) in parse_cli_secret_refs(&self.secret_env, &self.secret_file)? {
